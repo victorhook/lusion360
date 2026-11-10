@@ -816,7 +816,7 @@ impl Command {
         let tip = (anchor + n * d).as_vec3();
         let Some(tip_s) = app.cam.project(tip, view.size) else { return false };
         let (pressed, down, released) = ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.primary_released()));
-        if pressed && (tip_s - mouse).length() < 16.0 {
+        if pressed && (tip_s - mouse).length() < 26.0 {
             self.drag = Some(d);
         }
         if self.drag.is_some() && down {
