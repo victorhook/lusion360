@@ -99,6 +99,7 @@ pub mod bridge {
         fn make_chamfer(solid: &Shape, edges: &CxxVector<Shape>, dist: f64) -> Result<UniquePtr<Op>>;
         fn make_shell(solid: &Shape, faces: &CxxVector<Shape>, thickness: f64) -> Result<UniquePtr<Op>>;
         fn make_transform(s: &Shape, m: &[f64]) -> Result<UniquePtr<Op>>;
+        fn make_mirror(s: &Shape, ox: f64, oy: f64, oz: f64, nx: f64, ny: f64, nz: f64) -> Result<UniquePtr<Op>>;
         fn op_shape(op: &Op) -> UniquePtr<Shape>;
         fn op_modified(op: &Op, s: &Shape) -> UniquePtr<CxxVector<Shape>>;
         fn op_generated(op: &Op, s: &Shape) -> UniquePtr<CxxVector<Shape>>;

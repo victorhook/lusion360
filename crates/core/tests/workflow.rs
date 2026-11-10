@@ -297,3 +297,51 @@ fn export_formats_roundtrip() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn pattern_and_mirror() {
+    let mut doc = Document::default();
+    let mut model = Model::new();
+    let mut s = Sketch::new(PlaneRef::Origin(OriginPlane::XY));
+    rect(&mut s, 5.0, 0.0, 10.0, 5.0);
+    let s1 = doc.insert_feature("S".into(), ROOT, FeatureKind::Sketch(s));
+    model.update(&doc);
+    let pr = profile_ref(&model, &doc, s1, |_| true);
+    doc.insert_feature(
+        "E".into(),
+        ROOT,
+        FeatureKind::Extrude(Extrude { profiles: vec![pr], distance: "2".into(), distance2: String::new(), mode: ExtentMode::OneSide, start_offset: String::new(), op: Operation::NewBody, targets: vec![] }),
+    );
+    model.update(&doc);
+    ok(&model);
+    let bid = *model.current(&doc).bodies.keys().next().unwrap();
+    // 6 copies around Z, separate bodies
+    doc.insert_feature(
+        "P".into(),
+        ROOT,
+        FeatureKind::Pattern(Pattern { bodies: vec![bid], kind: PatternKind::Circular, axis: AxisRef::Z, count: "6".into(), spacing: String::new(), angle: "360".into(), axis2: None, count2: String::new(), spacing2: String::new(), join: false }),
+    );
+    model.update(&doc);
+    ok(&model);
+    assert_eq!(model.current(&doc).bodies.len(), 6);
+    // mirror the original across YZ and join
+    doc.insert_feature("M".into(), ROOT, FeatureKind::Mirror(Mirror { bodies: vec![bid], plane: PlaneRef::Origin(OriginPlane::YZ), join: true }));
+    model.update(&doc);
+    ok(&model);
+    let v = model.current(&doc).bodies[&bid].shape.volume().unwrap();
+    assert!((v - 100.0).abs() < 1e-6, "mirrored+joined volume {v}");
+    // linear grid 3x2, joined
+    let mut doc2 = doc.clone();
+    doc2.features.truncate(2);
+    doc2.marker = 2;
+    doc2.insert_feature(
+        "L".into(),
+        ROOT,
+        FeatureKind::Pattern(Pattern { bodies: vec![bid], kind: PatternKind::Linear, axis: AxisRef::X, count: "3".into(), spacing: "10".into(), angle: String::new(), axis2: Some(AxisRef::Y), count2: "2".into(), spacing2: "10".into(), join: true }),
+    );
+    let mut m2 = Model::new();
+    m2.update(&doc2);
+    ok(&m2);
+    let v = m2.current(&doc2).bodies[&bid].shape.volume().unwrap();
+    assert!((v - 300.0).abs() < 1e-6, "grid volume {v}");
+}

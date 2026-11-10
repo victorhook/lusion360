@@ -186,12 +186,14 @@ pub fn top_bar(app: &mut App, ui: &mut egui::Ui) {
             }
             ui.separator();
             ui.label(RichText::new("MODIFY").small().strong().color(theme::TEXT_DIM));
-            let items: [(CmdKind, &str, &str); 5] = [
+            let items: [(CmdKind, &str, &str); 7] = [
                 (CmdKind::Fillet, "Fillet", "Round edges (F)"),
                 (CmdKind::Chamfer, "Chamfer", "Bevel edges"),
                 (CmdKind::Shell, "Shell", "Hollow out a body"),
                 (CmdKind::Combine, "Combine", "Join / cut / intersect bodies"),
                 (CmdKind::Move, "Move", "Move or copy bodies"),
+                (CmdKind::Pattern, "Pattern", "Circular / linear pattern of bodies"),
+                (CmdKind::Mirror, "Mirror", "Mirror bodies across a plane"),
             ];
             for (k, l, t) in items {
                 if tool_button(ui, k.icon(), l, t).clicked() {
@@ -256,6 +258,8 @@ fn feature_icon(k: &FeatureKind) -> &'static str {
         FeatureKind::Plane(_) => ic::SQUARE_HALF,
         FeatureKind::Combine(_) => ic::UNITE,
         FeatureKind::Move(_) => ic::ARROWS_OUT_CARDINAL,
+        FeatureKind::Pattern(_) => ic::DOTS_NINE,
+        FeatureKind::Mirror(_) => ic::FLIP_HORIZONTAL,
         FeatureKind::ImportShape(_) => ic::FILE_ARROW_DOWN,
         FeatureKind::ImportMesh(_) => ic::TRIANGLE,
     }
@@ -973,6 +977,8 @@ const PALETTE_ITEMS: &[PaletteItem] = &[
     PaletteItem { label: "Offset plane", keys: "construction plane", run: |a| commands::start(a, CmdKind::Plane) },
     PaletteItem { label: "Combine bodies", keys: "boolean join cut", run: |a| commands::start(a, CmdKind::Combine) },
     PaletteItem { label: "Move / copy bodies", keys: "translate rotate", run: |a| commands::start(a, CmdKind::Move) },
+    PaletteItem { label: "Pattern", keys: "array circular linear repeat copy", run: |a| commands::start(a, CmdKind::Pattern) },
+    PaletteItem { label: "Mirror", keys: "symmetry flip", run: |a| commands::start(a, CmdKind::Mirror) },
     PaletteItem { label: "Parameters", keys: "variables", run: |a| a.show_params = true },
     PaletteItem { label: "Import file", keys: "insert step stl", run: |a| a.import_file() },
     PaletteItem { label: "Export", keys: "save step stl obj", run: |a| a.export(None) },

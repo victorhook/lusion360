@@ -128,6 +128,11 @@ impl CameraCtl {
         CameraCtl { cam: Camera::default(), anim: None, scene_radius: 100.0 }
     }
 
+    /// A copy without animation state (for read-only projection).
+    pub fn snapshot(&self) -> CameraCtl {
+        CameraCtl { cam: self.cam, anim: None, scene_radius: self.scene_radius }
+    }
+
     /// Advance animations; returns true while animating.
     pub fn tick(&mut self, dt: f32) -> bool {
         if let Some(a) = &mut self.anim {

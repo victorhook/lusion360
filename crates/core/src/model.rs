@@ -410,6 +410,8 @@ impl Ctx<'_> {
             }
             FeatureKind::Combine(c) => self.combine(f, c, st),
             FeatureKind::Move(m) => self.move_bodies(f, m, st),
+            FeatureKind::Pattern(p) => self.pattern(f, p, st),
+            FeatureKind::Mirror(m) => self.mirror(f, m, st),
             FeatureKind::ImportShape(i) => {
                 let shape = Shape::from_brep_string(&i.brep).map_err(|e| e.0)?;
                 let mut solids = shape.solids();
@@ -763,7 +765,16 @@ impl Ctx<'_> {
 
     fn revolve(&mut self, f: &Feature, r: &Revolve, st: &mut ModelState) -> Result<(), String> {
         let prof = self.resolve_profiles(st, &r.profiles)?;
-        let (o, dir) = match &r.axis {
+        let (o, dir) = self.resolve_axis(st, &r.axis)?;
+        let ang = self.eval_expr("angle", &r.angle)?;
+        let profile = if prof.faces.len() == 1 { prof.faces[0].clone() } else { Shape::compound(&prof.faces) };
+        let op = k::revolve(&profile, o, dir, ang.to_radians()).map_err(|e| e.0)?;
+        let tool = self.name_sweep(f.id, &op, &profile, &prof.edge_names);
+        self.apply_tool(f, r.op, &r.targets, prof.default_target, tool, st)
+    }
+
+    fn resolve_axis(&mut self, st: &ModelState, axis: &AxisRef) -> Result<(DVec3, DVec3), String> {
+        Ok(match axis {
             AxisRef::X => (DVec3::ZERO, DVec3::X),
             AxisRef::Y => (DVec3::ZERO, DVec3::Y),
             AxisRef::Z => (DVec3::ZERO, DVec3::Z),
@@ -777,17 +788,118 @@ impl Ctx<'_> {
                 let body = st.bodies.get(&er.body).ok_or("axis body is missing")?.clone();
                 let e = self.resolve_edge(&body, er)?;
                 let inf = e.edge_info().map_err(|e| e.0)?;
-                if inf.kind != CurveKind::Line {
-                    return Err("revolve axis edge must be straight".into());
+                match inf.kind {
+                    CurveKind::Line => (inf.start, (inf.end - inf.start).normalize()),
+                    CurveKind::Circle => (inf.center, inf.axis.normalize()),
+                    _ => return Err("axis edge must be straight or circular".into()),
                 }
-                (inf.start, (inf.end - inf.start).normalize())
             }
-        };
-        let ang = self.eval_expr("angle", &r.angle)?;
-        let profile = if prof.faces.len() == 1 { prof.faces[0].clone() } else { Shape::compound(&prof.faces) };
-        let op = k::revolve(&profile, o, dir, ang.to_radians()).map_err(|e| e.0)?;
-        let tool = self.name_sweep(f.id, &op, &profile, &prof.edge_names);
-        self.apply_tool(f, r.op, &r.targets, prof.default_target, tool, st)
+        })
+    }
+
+    /// Put `copies` (already named) into the model: fused into `orig` or as new bodies.
+    fn place_copies(&mut self, f: &Feature, orig: &Body, copies: Vec<Named>, join: bool, next: &mut u32, st: &mut ModelState) -> Result<(), String> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        if join {
+            let on = body_named(orig);
+            let tools: Vec<&Shape> = copies.iter().map(|c| &c.shape).collect();
+            let bop = k::boolean(BoolKind::Fuse, &[&on.shape], &tools, true).map_err(|e| e.0)?;
+            let mut inputs = vec![&on];
+            inputs.extend(copies.iter());
+            let res = propagate(&bop, &inputs, &[], bop.shape(), &format!("f{}.new", f.id));
+            st.bodies.insert(orig.id, make_body(orig.id, orig.component, res));
+        } else {
+            for c in copies {
+                let id = BodyId::new(f.id, *next);
+                *next += 1;
+                st.bodies.insert(id, make_body(id, orig.component, c));
+            }
+        }
+        Ok(())
+    }
+
+    fn copy_named(&self, body: &Body, op: &Op, tag: &str) -> Named {
+        let base = body_named(body);
+        let mut n = propagate(op, &[&base], &[], op.shape(), "?");
+        for name in n.names.iter_mut() {
+            *name = format!("{name}@{tag}");
+        }
+        n
+    }
+
+    fn pattern(&mut self, f: &Feature, p: &Pattern, st: &mut ModelState) -> Result<(), String> {
+        let n = self.eval_expr("count", &p.count)?.round() as i64;
+        if !(1..=1000).contains(&n) {
+            return Err("count must be between 1 and 1000".into());
+        }
+        if p.bodies.is_empty() {
+            return Err("no bodies selected".into());
+        }
+        let (o, dir) = self.resolve_axis(st, &p.axis)?;
+        let mut steps: Vec<DMat4> = Vec::new();
+        match p.kind {
+            PatternKind::Linear => {
+                let d = self.eval_expr("spacing", &p.spacing)?;
+                let (n2, d2, dir2) = match &p.axis2 {
+                    Some(a2) => {
+                        let (_, d2v) = self.resolve_axis(st, a2)?;
+                        (self.eval_expr("count 2", &p.count2)?.round().max(1.0) as i64, self.eval_expr("spacing 2", &p.spacing2)?, d2v)
+                    }
+                    None => (1, 0.0, DVec3::ZERO),
+                };
+                for j in 0..n2 {
+                    for i in 0..n {
+                        if i == 0 && j == 0 {
+                            continue;
+                        }
+                        steps.push(DMat4::from_translation(dir * d * i as f64 + dir2 * d2 * j as f64));
+                    }
+                }
+            }
+            PatternKind::Circular => {
+                let total = if p.angle.trim().is_empty() { 360.0 } else { self.eval_expr("angle", &p.angle)? };
+                let full = (total.abs() - 360.0).abs() < 1e-9;
+                let step = if full { total / n as f64 } else { total / (n - 1).max(1) as f64 };
+                for i in 1..n {
+                    let q = DQuat::from_axis_angle(dir, (step * i as f64).to_radians());
+                    steps.push(DMat4::from_translation(o) * DMat4::from_quat(q) * DMat4::from_translation(-o));
+                }
+            }
+        }
+        let mut next = 0;
+        for bid in &p.bodies {
+            let body = st.bodies.get(bid).ok_or("pattern body no longer exists")?.clone();
+            if body.is_mesh() {
+                return Err("mesh bodies cannot be patterned".into());
+            }
+            let mut copies = Vec::new();
+            for (i, m) in steps.iter().enumerate() {
+                let op = k::transform(&body.shape, m).map_err(|e| e.0)?;
+                copies.push(self.copy_named(&body, &op, &format!("{}.{}", f.id, i + 1)));
+            }
+            self.place_copies(f, &body, copies, p.join, &mut next, st)?;
+        }
+        Ok(())
+    }
+
+    fn mirror(&mut self, f: &Feature, m: &Mirror, st: &mut ModelState) -> Result<(), String> {
+        if m.bodies.is_empty() {
+            return Err("no bodies selected".into());
+        }
+        let (frame, _) = self.resolve_plane(st, &m.plane)?;
+        let mut next = 0;
+        for bid in &m.bodies {
+            let body = st.bodies.get(bid).ok_or("mirror body no longer exists")?.clone();
+            if body.is_mesh() {
+                return Err("mesh bodies cannot be mirrored".into());
+            }
+            let op = k::mirror(&body.shape, frame.origin, frame.n).map_err(|e| e.0)?;
+            let copy = self.copy_named(&body, &op, &format!("{}m", f.id));
+            self.place_copies(f, &body, vec![copy], m.join, &mut next, st)?;
+        }
+        Ok(())
     }
 
     fn fillet_chamfer(

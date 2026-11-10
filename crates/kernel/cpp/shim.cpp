@@ -631,6 +631,15 @@ std::unique_ptr<Op> make_transform(const Shape& s, rust::Slice<const double> m) 
   });
 }
 
+std::unique_ptr<Op> make_mirror(const Shape& s, double ox, double oy, double oz, double nx, double ny, double nz) {
+  return guarded("mirror", [&] {
+    gp_Trsf t;
+    t.SetMirror(gp_Ax2(gp_Pnt(ox, oy, oz), gp_Dir(nx, ny, nz)));
+    auto mk = std::make_shared<BRepBuilderAPI_Transform>(s, t, true);
+    return finish(mk, "mirror");
+  });
+}
+
 std::unique_ptr<Shape> op_shape(const Op& op) { return std::make_unique<Shape>(op.result); }
 
 std::unique_ptr<std::vector<Shape>> op_modified(const Op& op, const Shape& s) {

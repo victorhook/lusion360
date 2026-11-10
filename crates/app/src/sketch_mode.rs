@@ -110,6 +110,8 @@ pub enum Snap {
     Point(PId),
     Mid(CId),
     OnCurve(CId),
+    /// a point of existing model geometry projected onto the sketch plane
+    Model(DVec2),
 }
 
 struct Drag {
@@ -141,6 +143,10 @@ pub struct SketchSession {
     /// world units per screen pixel at the sketch plane
     px: f64,
     pub look_pending: bool,
+    /// projected model points to snap to (computed lazily)
+    refs: Option<Vec<DVec2>>,
+    /// value typed while drawing (Fusion-style heads-up input)
+    typed: Option<String>,
 }
 
 // ------------------------------------------------------------------ enter / leave
@@ -180,6 +186,8 @@ pub fn enter_with_before(app: &mut App, fid: FeatureId, before: Document, create
         edit_dim: None,
         px: 0.1,
         look_pending: true,
+        refs: None,
+        typed: None,
     };
     if !created {
         s.tool = SkTool::Select;
@@ -618,7 +626,71 @@ fn dim_anchor(sk: &Sketch, kind: &DimKind) -> (DVec2, DVec2) {
     }
 }
 
+/// Default label offset: outside the geometry, away from the sketch centre.
+fn default_dim_offset(sk: &Sketch, kind: &DimKind, px: f64) -> DVec2 {
+    let (anchor, dir) = dim_anchor(sk, kind);
+    match *kind {
+        DimKind::Radius(c) | DimKind::Diameter(c) => {
+            let r = sk.radius_of(c).unwrap_or(0.0);
+            dir.normalize_or(DVec2::X) * (r + px * 22.0)
+        }
+        DimKind::Angle(..) => dir * px * 40.0,
+        _ => {
+            let center = sk.bounds().map(|(a, b)| (a + b) * 0.5).unwrap_or(anchor);
+            let d = if dir.dot(anchor - center) < 0.0 { -dir } else { dir };
+            d * px * 26.0
+        }
+    }
+}
+
 // ------------------------------------------------------------------ input
+
+/// Model points projected into the sketch plane (cached per session).
+fn model_refs(app: &mut App, fid: FeatureId, frame: &Frame) -> Vec<DVec2> {
+    if let Some(r) = session(app).and_then(|s| s.refs.clone()) {
+        return r;
+    }
+    let st = app.pick_state().clone();
+    let mut out: Vec<DVec2> = Vec::new();
+    for b in st.bodies.values() {
+        if !app.body_visible(&st, b.id) || b.is_mesh() {
+            continue;
+        }
+        let edges = b.shape.edges();
+        if edges.len() > 20000 {
+            continue;
+        }
+        for e in edges {
+            let Ok(i) = e.edge_info() else { continue };
+            match i.kind {
+                lusion_kernel::CurveKind::Line => {
+                    out.push(frame.to2(i.start));
+                    out.push(frame.to2(i.end));
+                    out.push(frame.to2(i.mid));
+                }
+                lusion_kernel::CurveKind::Circle => {
+                    out.push(frame.to2(i.center));
+                    if !i.closed {
+                        out.push(frame.to2(i.start));
+                        out.push(frame.to2(i.end));
+                    }
+                }
+                lusion_kernel::CurveKind::Other => {
+                    out.push(frame.to2(i.start));
+                    out.push(frame.to2(i.end));
+                }
+                _ => {}
+            }
+        }
+    }
+    out.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap().then(a.y.partial_cmp(&b.y).unwrap()));
+    out.dedup_by(|a, b| (*a - *b).length() < 1e-7);
+    let _ = fid;
+    if let Some(s) = session(app) {
+        s.refs = Some(out.clone());
+    }
+    out
+}
 
 pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, ray: Option<Ray>) {
     let Some(fid) = session(app).map(|s| s.fid) else { return };
@@ -660,6 +732,7 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
         None => (None, 0.1),
     };
     let Some(sk) = sketch(app, fid).cloned() else { return };
+    let refs = model_refs(app, fid, &frame);
     let s = session(app).unwrap();
     s.px = px;
     let tool = s.tool;
@@ -672,7 +745,17 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
             if matches!(tool, SkTool::Select | SkTool::Dimension | SkTool::Trim | SkTool::Con(_)) {
                 (p, None)
             } else {
-                compute_snap(&sk, p, px, &exclude)
+                let (q, sn) = compute_snap(&sk, p, px, &exclude);
+                if sn.is_none() || matches!(sn, Some(Snap::OnCurve(_))) {
+                    // model geometry (vertices, edge midpoints, circle centres)
+                    let best = refs.iter().map(|r| (*r, (*r - p).length())).filter(|(_, d)| *d < px * 9.0).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                    match best {
+                        Some((r, _)) => (r, Some(Snap::Model(r))),
+                        None => (q, sn),
+                    }
+                } else {
+                    (q, sn)
+                }
             }
         }
         _ => (p2.unwrap_or_default(), None),
@@ -877,6 +960,22 @@ fn keyboard(app: &mut App, ui: &egui::Ui) {
     if ui.ctx().egui_wants_keyboard_input() {
         return;
     }
+    // typing a number while drawing opens the value box
+    if let Some(s) = session(app) {
+        let drawing = !s.chain.is_empty() && matches!(s.tool, SkTool::Line | SkTool::Rect | SkTool::CenterRect | SkTool::Circle);
+        if drawing && s.typed.is_none() {
+            let started: Option<String> = ui.input(|i| {
+                i.events.iter().find_map(|e| match e {
+                    egui::Event::Text(t) if t.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-') => Some(t.clone()),
+                    _ => None,
+                })
+            });
+            if let Some(t) = started {
+                s.typed = Some(t);
+                return;
+            }
+        }
+    }
     use egui::Key;
     let pressed = |k: Key| ui.input(|i| i.key_pressed(k) && i.modifiers.is_none());
     let tool_keys = [
@@ -998,6 +1097,17 @@ fn point_at(sk: &mut Sketch, p: DVec2, snap: Option<Snap>, cons: &mut Vec<Constr
         Some(Snap::OnCurve(cid)) => {
             let id = sk.add_point(p);
             cons.push(Constraint::PointOnCurve(id, cid));
+            id
+        }
+        Some(Snap::Model(q)) => {
+            // reuse an existing point at that spot, else a fixed reference point
+            if let Some(id) = sk.points.iter().find(|x| (x.pos() - q).length() < 1e-9).map(|x| x.id) {
+                return id;
+            }
+            let id = sk.add_point(q);
+            if let Some(pt) = sk.point_mut(id) {
+                pt.fixed = true;
+            }
             id
         }
         None => sk.add_point(p),
@@ -1134,6 +1244,127 @@ fn draw_click(app: &mut App, fid: FeatureId, p: DVec2, snap: Option<Snap>) {
     if done {
         if let Some(s) = session(app) {
             s.chain.clear();
+        }
+    }
+}
+
+/// Create geometry from a typed value while drawing.
+fn apply_typed(app: &mut App, text: &str) {
+    let Some(s) = session(app) else { return };
+    let fid = s.fid;
+    let tool = s.tool;
+    let Some(&(start, start_id)) = s.chain.last() else { return };
+    let cursor = s.cursor.unwrap_or(start + DVec2::X);
+    let params = app.model.params.clone();
+    let nums: Vec<String> = text.split(|c: char| c == 'x' || c == 'X' || c == ',' || c == '*').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+    let vals: Vec<f64> = match nums.iter().map(|t| params.eval(t)).collect::<Result<Vec<f64>, String>>() {
+        Ok(v) if !v.is_empty() => v,
+        Ok(_) => return,
+        Err(e) => {
+            app.error(format!("Invalid value: {e}"));
+            return;
+        }
+    };
+    let before = app.doc.clone();
+    let Some(sk) = sketch_mut(app, fid) else { return };
+    let mut cons = vec![];
+    let dim = |kind: DimKind, expr: &str, v: f64| Constraint::Dimension { kind, expr: expr.to_string(), value: v, offset: [0.0, 0.0] };
+    let mut finish_chain = false;
+    let mut new_chain_end: Option<(DVec2, Option<PId>)> = None;
+    match tool {
+        SkTool::Line => {
+            let len = vals[0].abs();
+            let dir = (cursor - start).normalize_or(DVec2::X);
+            let end = start + dir * len;
+            let pa = match start_id {
+                Some(id) => id,
+                None => {
+                    let last_end = sk.curves.last().and_then(|c| match c.geom {
+                        CurveGeom::Line { b, .. } if (sk.pos(b) - start).length() < 1e-9 => Some(b),
+                        _ => None,
+                    });
+                    last_end.unwrap_or_else(|| sk.add_point(start))
+                }
+            };
+            let pb = sk.add_point(end);
+            let l = sk.add_line(pa, pb);
+            if dir.y.abs() < 1e-9 {
+                cons.push(Constraint::Horizontal(l));
+            } else if dir.x.abs() < 1e-9 {
+                cons.push(Constraint::Vertical(l));
+            }
+            cons.push(dim(DimKind::Length(l), &nums[0], len));
+            new_chain_end = Some((end, Some(pb)));
+        }
+        SkTool::Circle => {
+            let d = vals[0].abs();
+            let c = match start_id {
+                Some(id) => id,
+                None => sk.add_point(start),
+            };
+            let ci = sk.add_curve(CurveGeom::Circle { c, r: d / 2.0 }, false);
+            cons.push(dim(DimKind::Diameter(ci), &nums[0], d));
+            finish_chain = true;
+        }
+        SkTool::Rect | SkTool::CenterRect => {
+            let w = vals[0].abs();
+            let h = vals.get(1).copied().unwrap_or(w).abs();
+            let sx = if cursor.x >= start.x { 1.0 } else { -1.0 };
+            let sy = if cursor.y >= start.y { 1.0 } else { -1.0 };
+            let (c0, c1) = if tool == SkTool::Rect {
+                (start, start + DVec2::new(sx * w, sy * h))
+            } else {
+                (start - DVec2::new(w, h) * 0.5, start + DVec2::new(w, h) * 0.5)
+            };
+            let p0 = if tool == SkTool::Rect { start_id.unwrap_or_else(|| sk.add_point(c0)) } else { sk.add_point(c0) };
+            let p1 = sk.add_point(DVec2::new(c1.x, c0.y));
+            let p2 = sk.add_point(c1);
+            let p3 = sk.add_point(DVec2::new(c0.x, c1.y));
+            let l0 = sk.add_line(p0, p1);
+            let l1 = sk.add_line(p1, p2);
+            let l2 = sk.add_line(p2, p3);
+            let l3 = sk.add_line(p3, p0);
+            cons.push(Constraint::Horizontal(l0));
+            cons.push(Constraint::Horizontal(l2));
+            cons.push(Constraint::Vertical(l1));
+            cons.push(Constraint::Vertical(l3));
+            cons.push(dim(DimKind::Length(l0), &nums[0], w));
+            cons.push(dim(DimKind::Length(l1), nums.get(1).map(|s| s.as_str()).unwrap_or(&nums[0]), h));
+            if tool == SkTool::CenterRect {
+                let pc = start_id.unwrap_or_else(|| sk.add_point(start));
+                let diag = sk.add_curve(CurveGeom::Line { a: p0, b: p2 }, true);
+                cons.push(Constraint::Midpoint(pc, diag));
+            }
+            finish_chain = true;
+        }
+        _ => return,
+    }
+    // place dimension labels just outside the geometry
+    let px = session(app).map(|s| s.px).unwrap_or(0.1);
+    if let Some(sk) = sketch_mut(app, fid) {
+        for c in cons {
+            let c = match c {
+                Constraint::Dimension { kind, expr, value, .. } => {
+                    let off = default_dim_offset(sk, &kind, px);
+                    Constraint::Dimension { kind, expr, value, offset: off.to_array() }
+                }
+                c => c,
+            };
+            sk.add_constraint(c);
+        }
+    }
+    if !solve(app, &[], true) {
+        app.doc = before;
+        solve(app, &[], true);
+        app.error("That value conflicts with existing constraints");
+        return;
+    }
+    commit(app, before);
+    if let Some(s) = session(app) {
+        if finish_chain {
+            s.chain.clear();
+        } else if let Some(e) = new_chain_end {
+            s.chain = vec![e];
         }
     }
 }
@@ -1351,10 +1582,10 @@ fn dim_click(app: &mut App, fid: FeatureId, hover: Option<SkEnt>, p: DVec2) {
     s.picks.clear();
     let px = s.px;
     let value = sk.measure(&kind);
-    let (anchor, dir) = dim_anchor(&sk, &kind);
+    let (anchor, _) = dim_anchor(&sk, &kind);
     let offset = match at {
         Some(at) => at - anchor,
-        None => dir * px * 30.0,
+        None => default_dim_offset(&sk, &kind, px),
     };
     let before = app.doc.clone();
     let expr = fmt_num(value);
@@ -1544,6 +1775,7 @@ pub fn draw(app: &mut App, scene: &mut Scene, view: &View) {
                 Snap::Point(_) => [1.0, 0.85, 0.3, 1.0],
                 Snap::Mid(_) => [0.4, 1.0, 0.6, 1.0],
                 Snap::OnCurve(_) => [0.9, 0.9, 0.95, 1.0],
+                Snap::Model(_) => [1.0, 0.55, 0.85, 1.0],
             };
             scene.points.push(PointInst { p: to3(cur).to_array(), color: col, size: 11.0 });
         } else if matches!(s.tool, SkTool::Line | SkTool::Rect | SkTool::CenterRect | SkTool::Circle | SkTool::Arc | SkTool::Point) {
@@ -1577,7 +1809,8 @@ pub fn overlay(app: &mut App, ui: &mut egui::Ui, view: &View) {
     let Some(sk) = sketch(app, fid).cloned() else { return };
     let Some(f) = app.display_state().sketches.get(&fid).map(|x| x.frame) else { return };
     let painter = ui.painter_at(view.rect);
-    let proj = |p: DVec2| -> Option<Pos2> { app.cam.project(f.to3(p).as_vec3(), view.size).map(|v| view.to_screen(v)) };
+    let camsnap = app.cam.snapshot();
+    let proj = |p: DVec2| -> Option<Pos2> { camsnap.project(f.to3(p).as_vec3(), view.size).map(|v| view.to_screen(v)) };
     let failed: HashSet<KId> = s.report.failed.iter().map(|x| x.0).collect();
     let dim_col = Color32::from_rgb(230, 236, 245);
     let font = egui::FontId::proportional(13.0);
@@ -1718,6 +1951,52 @@ pub fn overlay(app: &mut App, ui: &mut egui::Ui, view: &View) {
             };
             if let Some(t) = txt {
                 painter.text(sp + egui::vec2(14.0, -16.0), egui::Align2::LEFT_BOTTOM, t, egui::FontId::proportional(12.0), Color32::from_rgb(170, 210, 255));
+            }
+        }
+    }
+    // heads-up value box while drawing
+    let typed = match &mut app.mode {
+        Mode::Sketch(s) => s.typed.take().map(|t| (t, s.tool, s.cursor)),
+        _ => None,
+    };
+    if let Some((mut text, tool, cursor)) = typed {
+        let pos = cursor.and_then(|c| proj(c)).unwrap_or(view.rect.center()) + egui::vec2(18.0, 10.0);
+        let mut keep = true;
+        let mut apply = false;
+        let hint = match tool {
+            SkTool::Line => "length",
+            SkTool::Circle => "diameter",
+            _ => "width x height",
+        };
+        egui::Area::new(egui::Id::new("typed_value")).fixed_pos(pos).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(hint).small().color(theme::TEXT_DIM));
+                    let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(90.0));
+                    if !r.has_focus() && !r.lost_focus() {
+                        r.request_focus();
+                        if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), r.id) {
+                            let end = egui::text::CCursor::new(text.chars().count());
+                            st.cursor.set_char_range(Some(egui::text::CCursorRange::one(end)));
+                            st.store(ui.ctx(), r.id);
+                        }
+                    }
+                    if r.lost_focus() {
+                        apply = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        keep = false;
+                    }
+                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        keep = false;
+                        apply = false;
+                    }
+                });
+            });
+        });
+        if apply {
+            apply_typed(app, &text);
+        } else if keep {
+            if let Mode::Sketch(s) = &mut app.mode {
+                s.typed = Some(text);
             }
         }
     }

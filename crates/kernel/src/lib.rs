@@ -403,6 +403,11 @@ pub fn transform(s: &Shape, m: &DMat4) -> KResult<Op> {
     op(sys::make_transform(s.raw(), &trsf12(m)))
 }
 
+/// Mirror copy across the plane through `origin` with normal `n`.
+pub fn mirror(s: &Shape, origin: DVec3, n: DVec3) -> KResult<Op> {
+    op(sys::make_mirror(s.raw(), origin.x, origin.y, origin.z, n.x, n.y, n.z))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +491,17 @@ mod tests {
         // seam edges of the cylindrical hole only border one face
         assert!(edge_faces.iter().all(|(a, _)| *a >= 0));
         assert_eq!(edge_faces.iter().filter(|(_, b)| *b < 0).count(), 1);
+    }
+
+    #[test]
+    fn mirror_keeps_volume() {
+        let a = prism(&planar_regions(&rect(3., 4.)).unwrap()[0], DVec3::Z).unwrap().shape();
+        let m = mirror(&a, DVec3::ZERO, DVec3::X).unwrap();
+        let b = m.shape();
+        assert!((b.volume().unwrap() - 12.).abs() < 1e-9);
+        let (lo, hi) = b.bbox().unwrap();
+        assert!(hi.x <= 1e-6 && lo.x < -2.9);
+        assert_eq!(m.modified(&a.faces()[0]).len(), 1);
     }
 
     #[test]

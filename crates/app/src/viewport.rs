@@ -463,6 +463,16 @@ fn build_scene(app: &mut App, view: &View) -> Scene {
                 }
             }
         };
+        // whole-body hover/selection: tint on the GPU instead of overlay geometry
+        let sel_body = app.selection.contains(&Pick::Body(vb.id))
+            || app.cmd.as_ref().map(|c| c.selected_picks(app).contains(&Pick::Body(vb.id))).unwrap_or(false);
+        let hov_body = matches!(app.hover, Some(Hit { pick: Pick::Body(b), .. }) if b == vb.id);
+        let tint = |c: [f32; 4], t: [f32; 4], k: f32| [c[0] + (t[0] - c[0]) * k, c[1] + (t[1] - c[1]) * k, c[2] + (t[2] - c[2]) * k, c[3]];
+        if sel_body {
+            color = tint(color, theme::SELECT, 0.45);
+        } else if hov_body {
+            color = tint(color, theme::HOVER, 0.25);
+        }
         if in_sketch {
             color[3] = 0.55;
         }
@@ -517,10 +527,14 @@ fn build_scene(app: &mut App, view: &View) -> Scene {
             sel.extend(c.selected_picks(app));
         }
         for p in sel {
-            highlight(app, &mut scene, &pst, p, true);
+            if !matches!(p, Pick::Body(_)) {
+                highlight(app, &mut scene, &pst, p, true);
+            }
         }
         if let Some(h) = app.hover {
-            highlight(app, &mut scene, &pst, h.pick, false);
+            if !matches!(h.pick, Pick::Body(_)) {
+                highlight(app, &mut scene, &pst, h.pick, false);
+            }
         }
     }
     // timeline hover: highlight what the feature made

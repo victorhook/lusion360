@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Lusion360
+GenericName=Parametric CAD
+Comment=Fast local parametric 3D CAD
+Exec=lusion360 %f
+Icon=lusion360
+Terminal=false
+Categories=Graphics;Engineering;3DGraphics;
+MimeType=application/x-lusion360;model/step;model/stl;model/3mf;model/obj;
+StartupWMClass=lusion360

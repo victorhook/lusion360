@@ -187,6 +187,49 @@ pub struct MoveBodies {
     pub copy: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PatternKind {
+    #[default]
+    Linear,
+    Circular,
+}
+
+/// Copies of bodies along a direction or around an axis.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Pattern {
+    pub bodies: Vec<BodyId>,
+    #[serde(default)]
+    pub kind: PatternKind,
+    /// direction (linear) or rotation axis (circular)
+    pub axis: AxisRef,
+    pub count: String,
+    /// distance between copies (linear)
+    #[serde(default)]
+    pub spacing: String,
+    /// total angle (circular), 360 = full circle
+    #[serde(default)]
+    pub angle: String,
+    /// second direction for grids (linear only)
+    #[serde(default)]
+    pub axis2: Option<AxisRef>,
+    #[serde(default)]
+    pub count2: String,
+    #[serde(default)]
+    pub spacing2: String,
+    /// fuse copies into the original body
+    #[serde(default)]
+    pub join: bool,
+}
+
+/// Mirror bodies across a plane.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Mirror {
+    pub bodies: Vec<BodyId>,
+    pub plane: PlaneRef,
+    #[serde(default)]
+    pub join: bool,
+}
+
 /// A B-rep imported from STEP/BREP, stored inside the document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImportShape {
@@ -216,6 +259,8 @@ pub enum FeatureKind {
     Plane(OffsetPlane),
     Combine(Combine),
     Move(MoveBodies),
+    Pattern(Pattern),
+    Mirror(Mirror),
     ImportShape(ImportShape),
     ImportMesh(ImportMesh),
 }
@@ -232,6 +277,8 @@ impl FeatureKind {
             FeatureKind::Plane(_) => "Plane",
             FeatureKind::Combine(_) => "Combine",
             FeatureKind::Move(_) => "Move",
+            FeatureKind::Pattern(_) => "Pattern",
+            FeatureKind::Mirror(_) => "Mirror",
             FeatureKind::ImportShape(_) => "Import",
             FeatureKind::ImportMesh(_) => "Mesh",
         }

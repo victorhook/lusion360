@@ -23,6 +23,8 @@ pub enum CmdKind {
     Plane,
     Combine,
     Move,
+    Pattern,
+    Mirror,
 }
 
 impl CmdKind {
@@ -37,6 +39,8 @@ impl CmdKind {
             CmdKind::Plane => "Offset Plane",
             CmdKind::Combine => "Combine",
             CmdKind::Move => "Move / Copy",
+            CmdKind::Pattern => "Pattern",
+            CmdKind::Mirror => "Mirror",
         }
     }
     pub fn icon(self) -> &'static str {
@@ -50,6 +54,8 @@ impl CmdKind {
             CmdKind::Plane => ic::SQUARE_HALF,
             CmdKind::Combine => ic::UNITE,
             CmdKind::Move => ic::ARROWS_OUT_CARDINAL,
+            CmdKind::Pattern => ic::DOTS_NINE,
+            CmdKind::Mirror => ic::FLIP_HORIZONTAL,
         }
     }
 }
@@ -166,6 +172,8 @@ pub fn edit(app: &mut App, fid: FeatureId) {
         FeatureKind::Plane(_) => CmdKind::Plane,
         FeatureKind::Combine(_) => CmdKind::Combine,
         FeatureKind::Move(_) => CmdKind::Move,
+        FeatureKind::Pattern(_) => CmdKind::Pattern,
+        FeatureKind::Mirror(_) => CmdKind::Mirror,
         _ => {
             app.info("This feature has no editable parameters");
             return;
@@ -273,7 +281,7 @@ pub fn new_sketch_on(app: &mut App, pick: Pick) {
 
 impl Command {
     pub fn wants_planes(&self) -> bool {
-        matches!(self.kind, CmdKind::NewSketch | CmdKind::Plane)
+        matches!(self.kind, CmdKind::NewSketch | CmdKind::Plane) || (self.kind == CmdKind::Mirror && self.stage == 1)
     }
 
     pub fn filter(&self) -> Filter {
@@ -314,6 +322,24 @@ impl Command {
             }
             CmdKind::Combine | CmdKind::Move => {
                 f.bodies = true;
+            }
+            CmdKind::Pattern => {
+                if self.stage == 0 {
+                    f.bodies = true;
+                } else {
+                    f.edges = true;
+                    f.sketch_lines = true;
+                    f.axes = true;
+                }
+            }
+            CmdKind::Mirror => {
+                if self.stage == 0 {
+                    f.bodies = true;
+                } else {
+                    f.faces = true;
+                    f.planar_only = true;
+                    f.planes = true;
+                }
             }
         }
         f
@@ -367,6 +393,24 @@ impl Command {
                 v.extend(c.tools.iter().map(|b| Pick::Body(*b)));
             }
             FeatureKind::Move(m) => v.extend(m.bodies.iter().map(|b| Pick::Body(*b))),
+            FeatureKind::Pattern(p) => {
+                v.extend(p.bodies.iter().map(|b| Pick::Body(*b)));
+                match &p.axis {
+                    AxisRef::X => v.push(Pick::Axis(0)),
+                    AxisRef::Y => v.push(Pick::Axis(1)),
+                    AxisRef::Z => v.push(Pick::Axis(2)),
+                    AxisRef::SketchLine { sketch, curve } => v.push(Pick::SketchLine { sketch: *sketch, curve: *curve }),
+                    AxisRef::Edge(e) => v.extend(edge_pick(st, e)),
+                }
+            }
+            FeatureKind::Mirror(m) => {
+                v.extend(m.bodies.iter().map(|b| Pick::Body(*b)));
+                match &m.plane {
+                    PlaneRef::Origin(o) => v.push(Pick::Origin(*o)),
+                    PlaneRef::Plane(f) => v.push(Pick::Plane(*f)),
+                    PlaneRef::Face(f) => v.extend(face_pick(st, f)),
+                }
+            }
             _ => {}
         }
         v
@@ -556,6 +600,68 @@ impl Command {
                             c.tools.push(b);
                         }
                     }
+                }
+            }
+            CmdKind::Pattern | CmdKind::Mirror => {
+                if self.stage == 1 {
+                    if self.kind == CmdKind::Pattern {
+                        let axis = match hit.pick {
+                            Pick::Axis(0) => Some(AxisRef::X),
+                            Pick::Axis(1) => Some(AxisRef::Y),
+                            Pick::Axis(_) => Some(AxisRef::Z),
+                            Pick::SketchLine { sketch, curve } => Some(AxisRef::SketchLine { sketch, curve }),
+                            Pick::Edge { body, edge } => edge_ref(&st, body, edge).map(AxisRef::Edge),
+                            _ => None,
+                        };
+                        if let (Some(a), Some(FeatureKind::Pattern(p))) = (axis, self.feature_mut(app)) {
+                            p.axis = a;
+                        }
+                    } else {
+                        let plane = match hit.pick {
+                            Pick::Origin(o) => Some(PlaneRef::Origin(o)),
+                            Pick::Plane(f) => Some(PlaneRef::Plane(f)),
+                            Pick::Face { body, face } => face_ref(&st, body, face).map(PlaneRef::Face),
+                            _ => None,
+                        };
+                        if let (Some(pl), Some(FeatureKind::Mirror(m))) = (plane, self.feature_mut(app)) {
+                            m.plane = pl;
+                        }
+                    }
+                    return;
+                }
+                let b = match hit.pick {
+                    Pick::Body(b) | Pick::Face { body: b, .. } => b,
+                    _ => return,
+                };
+                if self.fid.is_none() {
+                    let kind = if self.kind == CmdKind::Pattern {
+                        FeatureKind::Pattern(Pattern {
+                            bodies: vec![b],
+                            kind: PatternKind::Circular,
+                            axis: AxisRef::Z,
+                            count: "6".into(),
+                            spacing: "20".into(),
+                            angle: "360".into(),
+                            axis2: None,
+                            count2: "2".into(),
+                            spacing2: "20".into(),
+                            join: false,
+                        })
+                    } else {
+                        FeatureKind::Mirror(Mirror { bodies: vec![b], plane: PlaneRef::Origin(OriginPlane::YZ), join: false })
+                    };
+                    self.insert(app, kind);
+                    return;
+                }
+                let list = match self.feature_mut(app) {
+                    Some(FeatureKind::Pattern(p)) => &mut p.bodies,
+                    Some(FeatureKind::Mirror(m)) => &mut m.bodies,
+                    _ => return,
+                };
+                if let Some(i) = list.iter().position(|t| *t == b) {
+                    list.remove(i);
+                } else {
+                    list.push(b);
                 }
             }
             CmdKind::Move => {
@@ -1002,6 +1108,105 @@ fn dialog_body(c: &mut Command, app: &mut App, ui: &mut egui::Ui) -> Option<Stri
                 }
             }
             Some(if c.stage == 0 { "Pick the target body." } else { "Pick tool bodies." }.into())
+        }
+        CmdKind::Pattern => {
+            let Some(fid) = fid else { return Some("Select bodies to pattern.".into()) };
+            let Some(FeatureKind::Pattern(p)) = app.doc.feature(fid).map(|f| &f.kind) else { return None };
+            let mut p = p.clone();
+            ui.horizontal(|ui| {
+                ui.add_sized([92.0, 22.0], egui::Label::new("Bodies"));
+                if ui.selectable_label(c.stage == 0, format!("{} selected", p.bodies.len())).clicked() {
+                    c.stage = 0;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add_sized([92.0, 22.0], egui::Label::new("Type"));
+                ui.selectable_value(&mut p.kind, PatternKind::Circular, format!("{} Circular", ic::CIRCLE_DASHED));
+                ui.selectable_value(&mut p.kind, PatternKind::Linear, format!("{} Linear", ic::DOTS_THREE));
+            });
+            ui.horizontal(|ui| {
+                ui.add_sized([92.0, 22.0], egui::Label::new(if p.kind == PatternKind::Circular { "Axis" } else { "Direction" }));
+                let label = match &p.axis {
+                    AxisRef::X => "X",
+                    AxisRef::Y => "Y",
+                    AxisRef::Z => "Z",
+                    AxisRef::SketchLine { .. } => "Sketch line",
+                    AxisRef::Edge(_) => "Edge",
+                };
+                if ui.selectable_label(c.stage == 1, label).on_hover_text("Click, then pick an edge / line / axis").clicked() {
+                    c.stage = 1;
+                }
+                for (l, a) in [("X", AxisRef::X), ("Y", AxisRef::Y), ("Z", AxisRef::Z)] {
+                    if ui.small_button(l).clicked() {
+                        p.axis = a;
+                    }
+                }
+            });
+            expr_field(ui, app, "Count", &mut p.count, "");
+            if p.kind == PatternKind::Circular {
+                expr_field(ui, app, "Total angle", &mut p.angle, "deg");
+            } else {
+                expr_field(ui, app, "Spacing", &mut p.spacing, "mm");
+                let mut grid = p.axis2.is_some();
+                if ui.checkbox(&mut grid, "Second direction (grid)").changed() {
+                    p.axis2 = if grid { Some(AxisRef::Y) } else { None };
+                }
+                if let Some(a2) = &mut p.axis2 {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([92.0, 22.0], egui::Label::new("Direction 2"));
+                        for (l, a) in [("X", AxisRef::X), ("Y", AxisRef::Y), ("Z", AxisRef::Z)] {
+                            if ui.selectable_label(*a2 == a, l).clicked() {
+                                *a2 = a;
+                            }
+                        }
+                    });
+                    expr_field(ui, app, "Count 2", &mut p.count2, "");
+                    expr_field(ui, app, "Spacing 2", &mut p.spacing2, "mm");
+                }
+            }
+            ui.checkbox(&mut p.join, "Join copies into the original");
+            if let Some(FeatureKind::Pattern(x)) = app.doc.feature_mut(fid).map(|f| &mut f.kind) {
+                if *x != p {
+                    *x = p;
+                }
+            }
+            Some(if c.stage == 0 { "Click bodies to add/remove." } else { "Pick the axis/direction." }.into())
+        }
+        CmdKind::Mirror => {
+            let Some(fid) = fid else { return Some("Select bodies to mirror.".into()) };
+            let Some(FeatureKind::Mirror(m)) = app.doc.feature(fid).map(|f| &f.kind) else { return None };
+            let mut m = m.clone();
+            ui.horizontal(|ui| {
+                ui.add_sized([92.0, 22.0], egui::Label::new("Bodies"));
+                if ui.selectable_label(c.stage == 0, format!("{} selected", m.bodies.len())).clicked() {
+                    c.stage = 0;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add_sized([92.0, 22.0], egui::Label::new("Plane"));
+                let label = match &m.plane {
+                    PlaneRef::Origin(OriginPlane::XY) => "XY",
+                    PlaneRef::Origin(OriginPlane::XZ) => "XZ",
+                    PlaneRef::Origin(OriginPlane::YZ) => "YZ",
+                    PlaneRef::Plane(_) => "Plane",
+                    PlaneRef::Face(_) => "Face",
+                };
+                if ui.selectable_label(c.stage == 1, label).on_hover_text("Click, then pick a plane or planar face").clicked() {
+                    c.stage = 1;
+                }
+                for (l, o) in [("XY", OriginPlane::XY), ("XZ", OriginPlane::XZ), ("YZ", OriginPlane::YZ)] {
+                    if ui.small_button(l).clicked() {
+                        m.plane = PlaneRef::Origin(o);
+                    }
+                }
+            });
+            ui.checkbox(&mut m.join, "Join with the original");
+            if let Some(FeatureKind::Mirror(x)) = app.doc.feature_mut(fid).map(|f| &mut f.kind) {
+                if *x != m {
+                    *x = m;
+                }
+            }
+            Some(if c.stage == 0 { "Click bodies to add/remove." } else { "Pick the mirror plane." }.into())
         }
         CmdKind::Move => {
             let Some(fid) = fid else { return Some("Select bodies to move.".into()) };

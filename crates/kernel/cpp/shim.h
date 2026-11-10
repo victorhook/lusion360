@@ -73,6 +73,7 @@ std::unique_ptr<Op> make_fillet(const Shape& solid, const std::vector<Shape>& ed
 std::unique_ptr<Op> make_chamfer(const Shape& solid, const std::vector<Shape>& edges, double dist);
 std::unique_ptr<Op> make_shell(const Shape& solid, const std::vector<Shape>& faces, double thickness);
 std::unique_ptr<Op> make_transform(const Shape& s, rust::Slice<const double> m);
+std::unique_ptr<Op> make_mirror(const Shape& s, double ox, double oy, double oz, double nx, double ny, double nz);
 std::unique_ptr<Shape> op_shape(const Op& op);
 std::unique_ptr<std::vector<Shape>> op_modified(const Op& op, const Shape& s);
 std::unique_ptr<std::vector<Shape>> op_generated(const Op& op, const Shape& s);
