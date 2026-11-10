@@ -481,7 +481,13 @@ MeshOut shape_mesh(const Shape& s, double lin, double ang) {
       const TopoDS_Edge& e = TopoDS::Edge(edges(ei));
       uint8_t smooth = 0;
       int ai = anc.FindIndex(e);
-      if (ai > 0 && anc(ai).Extent() == 2) {
+      if (ai > 0 && anc(ai).Extent() == 1) {
+        // seam of a closed surface (cylinder, sphere...): not a real edge visually
+        try {
+          if (BRep_Tool::IsClosed(e, TopoDS::Face(anc(ai).First()))) smooth = 1;
+        } catch (...) {
+        }
+      } else if (ai > 0 && anc(ai).Extent() == 2) {
         const TopoDS_Face& f1 = TopoDS::Face(anc(ai).First());
         const TopoDS_Face& f2 = TopoDS::Face(anc(ai).Last());
         try {
