@@ -479,6 +479,28 @@ fn build_scene(app: &mut App, view: &View) -> Scene {
         let edge_color = if app.light_bg { [0.1, 0.1, 0.12, 1.0] } else { theme::BODY_EDGE };
         scene.bodies.push(BodyDraw { mesh: vb.mesh.clone(), color, edge_color, show_edges: app.show_edges, face_hl: vec![], edge_hl: vec![] });
     }
+    // soft contact shadow on the ground plane
+    if let Some((lo, hi)) = bounds {
+        let eye = cam.eye();
+        if !in_sketch && eye.z > lo.z && !st.bodies.is_empty() {
+            let c = (lo + hi) * 0.5;
+            let ext = (hi - lo) * 0.5;
+            let z = lo.z - (hi - lo).length() * 0.002;
+            let m = ext.x.max(ext.y) * 0.35 + 3.0;
+            let strength = if app.light_bg { 0.30 } else { 0.55 };
+            let n = 64;
+            let pt = |k: usize, rx: f32, ry: f32, a: f32| {
+                let t = k as f32 / n as f32 * std::f32::consts::TAU;
+                FillVert { p: [c.x + rx * t.cos(), c.y + ry * t.sin(), z], color: [0.0, 0.0, 0.0, a] }
+            };
+            let center = FillVert { p: [c.x, c.y, z], color: [0.0, 0.0, 0.0, strength] };
+            for k in 0..n {
+                let (i0, i1) = (pt(k, ext.x, ext.y, strength), pt(k + 1, ext.x, ext.y, strength));
+                let (o0, o1) = (pt(k, ext.x + m, ext.y + m, 0.0), pt(k + 1, ext.x + m, ext.y + m, 0.0));
+                scene.fills.extend_from_slice(&[center, i0, i1, i0, o0, o1, i0, o1, i1]);
+            }
+        }
+    }
     // grid
     if !in_sketch {
         grid(app, &mut scene, &origin_plane_frame(OriginPlane::XY), 1.0);

@@ -111,6 +111,10 @@ pub fn dialog(app: &mut App, ctx: &egui::Context) {
         app.slicers = Some(detect_slicers());
     }
     let slicers = app.slicers.clone().unwrap_or_default();
+    // default: open in the first slicer found (Bambu Studio preferred)
+    if app.slicer_pref.is_none() {
+        app.slicer_pref = Some(slicers.first().map(|s| s.name.clone()).unwrap_or_else(|| "none".into()));
+    }
     let st = app.display_state().clone();
     let bodies: Vec<BodyId> = match &d.bodies {
         Some(b) => b.clone(),
@@ -139,7 +143,7 @@ pub fn dialog(app: &mut App, ctx: &egui::Context) {
                     }
                 }
             }
-            ui.label(RichText::new(format!("{} bodies", bodies.len())).strong());
+            ui.label(RichText::new(if bodies.len() == 1 { "1 body".to_string() } else { format!("{} bodies", bodies.len()) }).strong());
             if lo.x <= hi.x {
                 let s = hi - lo;
                 ui.label(RichText::new(format!("Size: {:.1} × {:.1} × {:.1} mm", s.x, s.y, s.z)).color(theme::TEXT_DIM));
@@ -152,10 +156,13 @@ pub fn dialog(app: &mut App, ctx: &egui::Context) {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label("Open in:");
-                let cur = app.slicer_pref.clone().unwrap_or_else(|| "Don't open".into());
+                let cur = match app.slicer_pref.as_deref() {
+                    None | Some("none") => "Don't open".to_string(),
+                    Some(s) => s.to_string(),
+                };
                 egui::ComboBox::from_id_salt("slicer").selected_text(cur).show_ui(ui, |ui| {
-                    if ui.selectable_label(app.slicer_pref.is_none(), "Don't open").clicked() {
-                        app.slicer_pref = None;
+                    if ui.selectable_label(app.slicer_pref.as_deref() == Some("none"), "Don't open").clicked() {
+                        app.slicer_pref = Some("none".into());
                     }
                     for s in &slicers {
                         if ui.selectable_label(app.slicer_pref.as_deref() == Some(s.name.as_str()), &s.name).clicked() {
@@ -210,7 +217,7 @@ pub fn dialog(app: &mut App, ctx: &egui::Context) {
 }
 
 fn open_in_slicer(app: &mut App, slicers: &[Slicer], path: &std::path::Path) {
-    let Some(pref) = app.slicer_pref.clone() else { return };
+    let Some(pref) = app.slicer_pref.clone().filter(|p| p != "none") else { return };
     let cmd: Vec<String> = if pref == "System default" {
         if cfg!(windows) {
             vec!["cmd".into(), "/C".into(), "start".into(), "".into()]

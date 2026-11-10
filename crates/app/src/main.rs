@@ -22,7 +22,8 @@ fn main() -> eframe::Result<()> {
             .with_app_id("lusion360")
             .with_inner_size([1480.0, 920.0])
             .with_min_inner_size([900.0, 600.0])
-            .with_drag_and_drop(true),
+            .with_drag_and_drop(true)
+            .with_icon(egui::IconData { rgba: include_bytes!("../assets/icon128.rgba").to_vec(), width: 128, height: 128 }),
         multisampling: render::MSAA as u16,
         depth_buffer: 24,
         renderer: eframe::Renderer::Wgpu,

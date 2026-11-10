@@ -238,6 +238,10 @@ pub fn status_bar(app: &mut App, ui: &mut egui::Ui) {
                 let st = app.display_state();
                 let nb = st.bodies.len();
                 ui.label(RichText::new(format!("{nb} bodies")).small().color(theme::TEXT_DIM));
+                if let Some(info) = selection_info(app) {
+                    ui.separator();
+                    ui.label(RichText::new(info).small().color(theme::ACCENT));
+                }
                 if let Some(h) = app.hover {
                     ui.separator();
                     ui.label(RichText::new(format!("{:.2}, {:.2}, {:.2}", h.point.x, h.point.y, h.point.z)).small().monospace().color(theme::TEXT_DIM));
@@ -245,6 +249,55 @@ pub fn status_bar(app: &mut App, ui: &mut egui::Ui) {
             });
         });
     });
+}
+
+/// Quick measurements of the current selection.
+fn selection_info(app: &App) -> Option<String> {
+    let st = app.display_state();
+    match app.selection.as_slice() {
+        [Pick::Face { body, face }] => {
+            let f = st.bodies.get(body)?.shape.faces().get(*face as usize)?.face_info().ok()?;
+            let kind = match f.kind {
+                lusion_kernel::SurfaceKind::Plane => "Plane".to_string(),
+                lusion_kernel::SurfaceKind::Cylinder => format!("Cylinder Ø{}", fmt_num(f.radius * 2.0)),
+                lusion_kernel::SurfaceKind::Cone => "Cone".into(),
+                lusion_kernel::SurfaceKind::Sphere => format!("Sphere R{}", fmt_num(f.radius)),
+                lusion_kernel::SurfaceKind::Torus => "Torus".into(),
+                lusion_kernel::SurfaceKind::Other => "Surface".into(),
+            };
+            Some(format!("{kind} · area {} mm²", fmt_num((f.area * 100.0).round() / 100.0)))
+        }
+        [Pick::Edge { body, edge }] => {
+            let e = st.bodies.get(body)?.shape.edges().get(*edge as usize)?.edge_info().ok()?;
+            let r = (e.length * 1000.0).round() / 1000.0;
+            Some(match e.kind {
+                lusion_kernel::CurveKind::Circle => format!("Arc R{} · length {} mm", fmt_num(e.radius), fmt_num(r)),
+                _ => format!("Edge length {} mm", fmt_num(r)),
+            })
+        }
+        [Pick::Body(b)] => {
+            let body = st.bodies.get(b)?;
+            if body.is_mesh() {
+                return Some(format!("Mesh · {} triangles", body.mesh.as_ref()?.indices.len() / 3));
+            }
+            let v = body.shape.volume().ok()?;
+            let (lo, hi) = body.shape.bbox()?;
+            let d = hi - lo;
+            Some(format!("Volume {} cm³ · {}×{}×{} mm", fmt_num((v / 1000.0 * 100.0).round() / 100.0), fmt_num(d.x.round()), fmt_num(d.y.round()), fmt_num(d.z.round())))
+        }
+        [Pick::Face { body: b1, face: f1 }, Pick::Face { body: b2, face: f2 }] => {
+            let a = st.bodies.get(b1)?.shape.faces().get(*f1 as usize)?.face_info().ok()?;
+            let b = st.bodies.get(b2)?.shape.faces().get(*f2 as usize)?.face_info().ok()?;
+            if a.kind == lusion_kernel::SurfaceKind::Plane && b.kind == lusion_kernel::SurfaceKind::Plane && a.normal.cross(b.normal).length() < 1e-6 {
+                let d = (b.origin - a.origin).dot(a.normal).abs();
+                Some(format!("Distance between planes {} mm", fmt_num((d * 1000.0).round() / 1000.0)))
+            } else {
+                let ang = a.normal.angle_between(b.normal).to_degrees();
+                Some(format!("Angle {}°", fmt_num((ang * 100.0).round() / 100.0)))
+            }
+        }
+        _ => None,
+    }
 }
 
 fn feature_icon(k: &FeatureKind) -> &'static str {
@@ -289,9 +342,11 @@ pub fn timeline(app: &mut App, ui: &mut egui::Ui) {
                 ui.horizontal(|ui| {
                     let marker = app.doc.marker;
                     let mut action: Option<(FeatureId, &str)> = None;
+                    let mut rects: Vec<egui::Rect> = Vec::new();
+                    let mut marker_resp: Option<egui::Response> = None;
                     for (i, f) in app.doc.features.clone().iter().enumerate() {
                         if i == marker {
-                            marker_bar(ui);
+                            marker_resp = Some(marker_bar(ui, editing));
                         }
                         let status = app.model.feature_status(i).cloned();
                         let rolled = i >= marker;
@@ -314,6 +369,7 @@ pub fn timeline(app: &mut App, ui: &mut egui::Ui) {
                             b = b.stroke(egui::Stroke::new(1.5, theme::ACCENT));
                         }
                         let r = ui.add(b);
+                        rects.push(r.rect);
                         let mut tip = format!("{} ({})", f.name, f.kind.type_name());
                         if let Some(s) = &status {
                             if let Some(e) = &s.error {
@@ -373,7 +429,18 @@ pub fn timeline(app: &mut App, ui: &mut egui::Ui) {
                         });
                     }
                     if marker >= app.doc.features.len() {
-                        marker_bar(ui);
+                        marker_resp = Some(marker_bar(ui, editing));
+                    }
+                    // drag the marker to roll the timeline back/forward
+                    if let Some(mr) = marker_resp {
+                        if mr.dragged() {
+                            if let Some(p) = ui.ctx().pointer_interact_pos() {
+                                let idx = rects.iter().filter(|r| r.center().x < p.x).count();
+                                if idx != app.doc.marker {
+                                    set_marker = Some(idx);
+                                }
+                            }
+                        }
                     }
                     if let Some((fid, a)) = action {
                         feature_action(app, fid, a);
@@ -389,10 +456,21 @@ pub fn timeline(app: &mut App, ui: &mut egui::Ui) {
     });
 }
 
-fn marker_bar(ui: &mut egui::Ui) {
-    let (r, _) = ui.allocate_exact_size(egui::vec2(6.0, 28.0), egui::Sense::hover());
-    ui.painter().rect_filled(egui::Rect::from_center_size(r.center(), egui::vec2(3.0, 30.0)), 1.5, theme::ACCENT);
-    ui.painter().circle_filled(egui::pos2(r.center().x, r.top() - 1.0), 4.0, theme::ACCENT);
+fn marker_bar(ui: &mut egui::Ui, locked: bool) -> egui::Response {
+    let sense = if locked { egui::Sense::hover() } else { egui::Sense::drag() };
+    let (r, resp) = ui.allocate_exact_size(egui::vec2(10.0, 28.0), sense);
+    let hot = resp.hovered() || resp.dragged();
+    let col = if hot { egui::Color32::from_rgb(0x7c, 0xbd, 0xff) } else { theme::ACCENT };
+    ui.painter().rect_filled(egui::Rect::from_center_size(r.center(), egui::vec2(if hot { 4.0 } else { 3.0 }, 30.0)), 1.5, col);
+    ui.painter().circle_filled(egui::pos2(r.center().x, r.top() - 1.0), if hot { 5.5 } else { 4.0 }, col);
+    if !locked {
+        if hot {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        resp.on_hover_text("Drag to roll the timeline back / forward")
+    } else {
+        resp
+    }
 }
 
 pub fn feature_action(app: &mut App, fid: FeatureId, a: &str) {

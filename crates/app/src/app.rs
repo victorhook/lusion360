@@ -698,6 +698,36 @@ impl App {
         if fire(KS::new(M::NONE, Key::Home)) || fire(KS::new(M::NONE, Key::F6)) {
             self.home_view();
         }
+        let model_idle = matches!(self.mode, Mode::Model) && self.cmd.is_none();
+        if model_idle && fire(KS::new(M::NONE, Key::E)) {
+            crate::commands::start(self, crate::commands::CmdKind::Extrude);
+        }
+        if model_idle && fire(KS::new(M::NONE, Key::Escape)) {
+            self.selection.clear();
+        }
+        if model_idle && fire(KS::new(M::NONE, Key::Delete)) {
+            let st = self.display_state().clone();
+            let bodies: Vec<BodyId> = self
+                .selection
+                .iter()
+                .filter_map(|p| match p {
+                    Pick::Body(b) | Pick::Face { body: b, .. } | Pick::Edge { body: b, .. } => Some(*b),
+                    _ => None,
+                })
+                .filter(|b| st.bodies.contains_key(b))
+                .collect();
+            if !bodies.is_empty() {
+                let before = self.doc.clone();
+                for b in bodies {
+                    self.doc.bodies.entry(b).or_default().visible = Some(false);
+                }
+                self.commit(before);
+                self.selection.clear();
+                self.info("Hidden — show again from the browser");
+            } else if let Some(fid) = self.timeline_sel {
+                crate::panels::feature_action(self, fid, "delete");
+            }
+        }
         if fire(KS::new(M::NONE, Key::F)) && matches!(self.mode, Mode::Model) && self.cmd.is_none() {
             // F: fillet in model mode (Fusion), handled with selection
             crate::commands::start(self, crate::commands::CmdKind::Fillet);

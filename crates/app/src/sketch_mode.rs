@@ -78,6 +78,7 @@ pub enum SkTool {
     Point,
     Dimension,
     Trim,
+    Fillet,
     Con(ConKind),
 }
 
@@ -93,6 +94,7 @@ impl SkTool {
             SkTool::Point => "Click to place points.",
             SkTool::Dimension => "Click a line, circle, two points, point + line or two lines. Click again to place.",
             SkTool::Trim => "Click the part of a curve to remove.",
+            SkTool::Fillet => "Click a corner where two lines meet to round it.",
             SkTool::Con(_) => "Pick the entities to constrain.",
         }
     }
@@ -143,6 +145,8 @@ pub struct SketchSession {
     /// world units per screen pixel at the sketch plane
     px: f64,
     pub look_pending: bool,
+    /// camera before entering the sketch (restored on finish)
+    cam_before: Option<crate::camera::Camera>,
     /// projected model points to snap to (computed lazily)
     refs: Option<Vec<DVec2>>,
     /// value typed while drawing (Fusion-style heads-up input)
@@ -186,6 +190,7 @@ pub fn enter_with_before(app: &mut App, fid: FeatureId, before: Document, create
         edit_dim: None,
         px: 0.1,
         look_pending: true,
+        cam_before: Some(app.cam.cam),
         refs: None,
         typed: None,
     };
@@ -199,6 +204,12 @@ pub fn enter_with_before(app: &mut App, fid: FeatureId, before: Document, create
 
 pub fn finish(app: &mut App) {
     let Mode::Sketch(s) = std::mem::replace(&mut app.mode, Mode::Model) else { return };
+    if let Some(c) = s.cam_before {
+        // back to where we were, but keep any ortho/persp change
+        let mut to = c;
+        to.ortho = app.cam.cam.ortho;
+        app.cam.animate_to(to);
+    }
     if let Some(idx) = app.doc.feature_index(s.fid) {
         if s.prev_marker > idx {
             app.doc.marker = s.prev_marker.min(app.doc.features.len());
@@ -504,6 +515,77 @@ fn trim(sk: &mut Sketch, cid: CId, at: DVec2) -> bool {
     }
 }
 
+/// Round the corner at `pid` (shared by two lines) with a tangent arc.
+/// Returns the id of the new radius dimension.
+fn sketch_fillet(sk: &mut Sketch, pid: PId) -> Option<KId> {
+    let lines: Vec<(CId, PId)> = sk
+        .curves
+        .iter()
+        .filter_map(|c| match c.geom {
+            CurveGeom::Line { a, b } if a == pid => Some((c.id, b)),
+            CurveGeom::Line { a, b } if b == pid => Some((c.id, a)),
+            _ => None,
+        })
+        .collect();
+    let [(l1, o1), (l2, o2)] = lines[..] else { return None };
+    let p = sk.pos(pid);
+    let (a, b) = (sk.pos(o1), sk.pos(o2));
+    let (u1, u2) = ((a - p).normalize_or_zero(), (b - p).normalize_or_zero());
+    let theta = u1.angle_to(u2).abs();
+    if !(0.05..std::f64::consts::PI - 0.05).contains(&theta) {
+        return None;
+    }
+    let max_d = (a - p).length().min((b - p).length()) * 0.45;
+    let r_guess = max_d * (theta / 2.0).tan();
+    let r = {
+        // a "nice" default radius
+        let m = 10f64.powf(r_guess.log10().floor());
+        ((r_guess / m).floor().max(1.0)) * m
+    };
+    let d = r / (theta / 2.0).tan();
+    let t1 = p + u1 * d;
+    let t2 = p + u2 * d;
+    let bis = (u1 + u2).normalize_or_zero();
+    let c = p + bis * (r / (theta / 2.0).sin());
+    let pt1 = sk.add_point(t1);
+    let pt2 = sk.add_point(t2);
+    let pc = sk.add_point(c);
+    // re-point the lines at the tangent points
+    for (l, np) in [(l1, pt1), (l2, pt2)] {
+        if let Some(x) = sk.curves.iter_mut().find(|x| x.id == l) {
+            if let CurveGeom::Line { a, b } = &mut x.geom {
+                if *a == pid {
+                    *a = np;
+                } else if *b == pid {
+                    *b = np;
+                }
+            }
+        }
+    }
+    // arc runs counter-clockwise from one tangent point to the other
+    let ccw = (t1 - c).perp_dot(t2 - c) > 0.0;
+    let (sa, sb) = if ccw { (pt1, pt2) } else { (pt2, pt1) };
+    let arc = sk.add_curve(CurveGeom::Arc { c: pc, a: sa, b: sb }, false);
+    sk.add_constraint(Constraint::Tangent(l1, arc));
+    sk.add_constraint(Constraint::Tangent(l2, arc));
+    // keep the old corner as a "virtual sharp" on both lines, so overall
+    // dimensions keep measuring to the corner (like Fusion)
+    sk.add_constraint(Constraint::PointOnCurve(pid, l1));
+    sk.add_constraint(Constraint::PointOnCurve(pid, l2));
+    for k in sk.constraints.iter_mut() {
+        if let Constraint::Dimension { kind, .. } = &mut k.c {
+            match *kind {
+                DimKind::Length(l) if l == l1 => *kind = DimKind::Distance(o1, pid),
+                DimKind::Length(l) if l == l2 => *kind = DimKind::Distance(o2, pid),
+                _ => {}
+            }
+        }
+    }
+    let value = r;
+    let kid = sk.add_constraint(Constraint::Dimension { kind: DimKind::Radius(arc), expr: fmt_num(r), value, offset: ((c - p).normalize_or(DVec2::X) * -r * 1.6).to_array() });
+    Some(kid)
+}
+
 fn replace_line(sk: &mut Sketch, cid: CId, a: PId, b: PId) {
     let old = sk.curve(cid).map(|c| c.points()).unwrap_or_default();
     if let Some(x) = sk.curves.iter_mut().find(|x| x.id == cid) {
@@ -742,7 +824,7 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
     let (cursor, snap) = match p2 {
         Some(p) if !navigating => {
             let exclude: Vec<PId> = s.drag.as_ref().map(|d| d.points.iter().map(|x| x.0).collect()).unwrap_or_default();
-            if matches!(tool, SkTool::Select | SkTool::Dimension | SkTool::Trim | SkTool::Con(_)) {
+            if matches!(tool, SkTool::Select | SkTool::Dimension | SkTool::Trim | SkTool::Fillet | SkTool::Con(_)) {
                 (p, None)
             } else {
                 let (q, sn) = compute_snap(&sk, p, px, &exclude);
@@ -781,7 +863,7 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
     s.snap = snap;
     let mut hover = None;
     if let (Some(p), false) = (p2, navigating) {
-        if matches!(tool, SkTool::Select | SkTool::Dimension | SkTool::Con(_) | SkTool::Trim) {
+        if matches!(tool, SkTool::Select | SkTool::Dimension | SkTool::Con(_) | SkTool::Trim | SkTool::Fillet) {
             hover = dim_label_hit(app, fid, view).map(SkEnt::Con);
             if hover.is_none() && tool != SkTool::Trim {
                 hover = nearest_point(&sk, p, px * 8.0, &[]).map(SkEnt::Point);
@@ -796,6 +878,18 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
     // ---- drags (select tool)
     if tool == SkTool::Select {
         if resp.drag_started_by(PointerButton::Primary) {
+            // pick what was under the pointer when the button went down
+            let press = ui.input(|i| i.pointer.press_origin()).map(|o| Vec2::new(o.x - view.rect.min.x, o.y - view.rect.min.y));
+            let press2 = press.and_then(|m| {
+                let r = app.cam.ray(m, view.size);
+                r.plane(frame.origin.as_vec3(), frame.n.as_vec3()).filter(|t| *t > 0.0).map(|t| frame.to2(r.at(t).as_dvec3()))
+            });
+            let hover_at_press = press2.and_then(|pp| {
+                let lbl = press.and_then(|m| dim_label_hit(app, fid, &View { mouse: Some(m), ..*view })).map(SkEnt::Con);
+                lbl.or_else(|| nearest_point(&sk, pp, px * 8.0, &[]).map(SkEnt::Point)).or_else(|| nearest_curve(&sk, pp, px * 6.0).map(SkEnt::Curve))
+            });
+            let hover = hover_at_press.or(hover);
+            let p2 = press2.or(p2);
             if let (Some(h), Some(p)) = (hover, p2) {
                 let before = app.doc.clone();
                 let drag = match h {
@@ -925,6 +1019,25 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
                 draw_click(app, fid, cursor, snap);
             }
             SkTool::Dimension => dim_click(app, fid, hover, p),
+            SkTool::Fillet => {
+                if let Some(SkEnt::Point(pid)) = hover {
+                    let before = app.doc.clone();
+                    let kid = sketch_mut(app, fid).and_then(|sk| sketch_fillet(sk, pid));
+                    match kid {
+                        Some(kid) => {
+                            if !solve(app, &[], true) {
+                                app.doc = before;
+                                solve(app, &[], true);
+                                app.error("Could not fillet that corner (conflicting constraints?)");
+                            } else {
+                                commit(app, before);
+                                start_dim_edit(app, kid);
+                            }
+                        }
+                        None => app.error("Pick a corner shared by exactly two lines"),
+                    }
+                }
+            }
             SkTool::Trim => {
                 if let Some(SkEnt::Curve(cid)) = hover {
                     let before = app.doc.clone();
@@ -986,6 +1099,7 @@ fn keyboard(app: &mut App, ui: &egui::Ui) {
         (Key::P, SkTool::Point),
         (Key::D, SkTool::Dimension),
         (Key::T, SkTool::Trim),
+        (Key::G, SkTool::Fillet),
     ];
     for (k, t) in tool_keys {
         if pressed(k) {
@@ -2097,6 +2211,7 @@ pub fn toolbar(app: &mut App, ui: &mut egui::Ui) {
     ui.separator();
     tool_btn(ui, SkTool::Dimension, ic::RULER, "Dimension (D)");
     tool_btn(ui, SkTool::Trim, ic::SCISSORS, "Trim (T)");
+    tool_btn(ui, SkTool::Fillet, ic::BEZIER_CURVE, "Sketch fillet: round a corner (G)");
     ui.menu_button(RichText::new(format!("{} Constrain", ic::LINK)).size(14.0), |ui| {
         for k in ConKind::ALL {
             if ui.button(format!("{}   {}", k.glyph(), k.label())).clicked() {
