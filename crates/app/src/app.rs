@@ -635,6 +635,10 @@ impl eframe::App for App {
         if self.cam.tick(dt) {
             ctx.request_repaint();
         }
+        if self.meshes.busy() {
+            // poll background tessellation
+            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+        }
 
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title()));
         self.handle_close(&ctx);

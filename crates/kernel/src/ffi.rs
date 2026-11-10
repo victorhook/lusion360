@@ -49,6 +49,7 @@ pub mod bridge {
 
         fn shape_null() -> UniquePtr<Shape>;
         fn shape_clone(s: &Shape) -> UniquePtr<Shape>;
+        fn shape_deep_copy(s: &Shape) -> UniquePtr<Shape>;
         fn shape_is_null(s: &Shape) -> bool;
         fn shape_type(s: &Shape) -> u32;
         fn shape_hash(s: &Shape) -> u64;
@@ -69,6 +70,7 @@ pub mod bridge {
         fn edge_info(e: &Shape) -> Result<EdgeInfo>;
         fn shape_mesh(s: &Shape, lin_defl: f64, ang_defl: f64) -> Result<MeshOut>;
         fn edge_polyline(e: &Shape, lin_defl: f64, ang_defl: f64) -> Vec<f64>;
+        fn face_loops(f: &Shape, lin_defl: f64, ang_defl: f64, sizes: &mut Vec<u32>) -> Vec<f64>;
         fn point_distance(s: &Shape, x: f64, y: f64, z: f64) -> f64;
 
         fn make_line_edge(ax: f64, ay: f64, az: f64, bx: f64, by: f64, bz: f64) -> Result<UniquePtr<Shape>>;

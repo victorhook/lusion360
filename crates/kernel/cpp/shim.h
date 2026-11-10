@@ -34,6 +34,7 @@ public:
 // ---- shape basics ----
 std::unique_ptr<Shape> shape_null();
 std::unique_ptr<Shape> shape_clone(const Shape& s);
+std::unique_ptr<Shape> shape_deep_copy(const Shape& s);
 bool shape_is_null(const Shape& s);
 uint32_t shape_type(const Shape& s);
 uint64_t shape_hash(const Shape& s);
@@ -55,6 +56,7 @@ SurfaceInfo face_info(const Shape& f);
 EdgeInfo edge_info(const Shape& e);
 MeshOut shape_mesh(const Shape& s, double lin_defl, double ang_defl);
 rust::Vec<double> edge_polyline(const Shape& e, double lin_defl, double ang_defl);
+rust::Vec<double> face_loops(const Shape& f, double lin_defl, double ang_defl, rust::Vec<uint32_t>& sizes);
 double point_distance(const Shape& s, double x, double y, double z);
 
 // ---- sketch geometry ----

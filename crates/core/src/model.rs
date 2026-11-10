@@ -1076,20 +1076,7 @@ pub fn compute_profiles(s: &Sketch, frame: &Frame, sid: FeatureId) -> Result<Vec
     let scale = s.bounds().map(|(a, b)| (b - a).length()).unwrap_or(1.0).max(1e-3);
     let mut out = Vec::new();
     for face in regions {
-        let mesh = match face.mesh(scale * 0.002, 0.25) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let p2: Vec<DVec2> = mesh
-            .positions
-            .chunks(3)
-            .map(|c| frame.to2(DVec3::new(c[0] as f64, c[1] as f64, c[2] as f64)))
-            .collect();
-        let tris: Vec<[DVec2; 3]> = mesh
-            .indices
-            .chunks(3)
-            .map(|t| [p2[t[0] as usize], p2[t[1] as usize], p2[t[2] as usize]])
-            .collect();
+        let tris = triangulate_face(&face, frame, scale);
         let hint = tris
             .iter()
             .max_by(|a, b| tri_area(a).partial_cmp(&tri_area(b)).unwrap())
@@ -1119,6 +1106,40 @@ pub fn compute_profiles(s: &Sketch, frame: &Frame, sid: FeatureId) -> Result<Vec
         out.push(Profile { face, curves, hint, tris, area, edge_names });
     }
     Ok(out)
+}
+
+/// Triangulate a planar region in sketch coordinates (earcut on its boundary
+/// loops; falls back to OCCT meshing).
+fn triangulate_face(face: &Shape, frame: &Frame, scale: f64) -> Vec<[DVec2; 3]> {
+    let loops = face.face_loops(scale * 0.002, 0.2);
+    if !loops.is_empty() && loops.iter().all(|l| l.len() >= 3) {
+        let mut data: Vec<f64> = Vec::new();
+        let mut holes: Vec<usize> = Vec::new();
+        let mut pts: Vec<DVec2> = Vec::new();
+        for (i, l) in loops.iter().enumerate() {
+            if i > 0 {
+                holes.push(pts.len());
+            }
+            for p in l {
+                let q = frame.to2(*p);
+                pts.push(q);
+                data.push(q.x);
+                data.push(q.y);
+            }
+        }
+        if let Ok(idx) = earcutr::earcut(&data, &holes, 2) {
+            if !idx.is_empty() {
+                return idx.chunks(3).map(|t| [pts[t[0]], pts[t[1]], pts[t[2]]]).collect();
+            }
+        }
+    }
+    match face.mesh(scale * 0.004, 0.3) {
+        Ok(mesh) => {
+            let p2: Vec<DVec2> = mesh.positions.chunks(3).map(|c| frame.to2(DVec3::new(c[0] as f64, c[1] as f64, c[2] as f64))).collect();
+            mesh.indices.chunks(3).map(|t| [p2[t[0] as usize], p2[t[1] as usize], p2[t[2] as usize]]).collect()
+        }
+        Err(_) => vec![],
+    }
 }
 
 fn tri_area(t: &[DVec2; 3]) -> f64 {

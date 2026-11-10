@@ -1,6 +1,7 @@
 #include "lusion-kernel/cpp/shim.h"
 #include "lusion-kernel/src/ffi.rs.h"
 
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <sstream>
@@ -16,6 +17,7 @@
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepAlgoAPI_Fuse.hxx>
 #include <BRepBndLib.hxx>
+#include <BRepBuilderAPI_Copy.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeVertex.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
@@ -33,6 +35,8 @@
 #include <BRepPrimAPI_MakePrism.hxx>
 #include <BRepPrimAPI_MakeRevol.hxx>
 #include <BRepTools.hxx>
+#include <BRepTools_WireExplorer.hxx>
+#include <TopoDS_Wire.hxx>
 #include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
 #include <Bnd_Box.hxx>
@@ -134,6 +138,12 @@ gp_Trsf trsf_from(rust::Slice<const double> m) {
 std::unique_ptr<Shape> shape_null() { return std::make_unique<Shape>(); }
 std::unique_ptr<Shape> shape_clone(const Shape& s) { return std::make_unique<Shape>(s); }
 bool shape_is_null(const Shape& s) { return s.IsNull(); }
+
+std::unique_ptr<Shape> shape_deep_copy(const Shape& s) {
+  if (s.IsNull()) return std::make_unique<Shape>();
+  BRepBuilderAPI_Copy cp(s, true, false);
+  return std::make_unique<Shape>(cp.Shape());
+}
 
 uint32_t shape_type(const Shape& s) {
   if (s.IsNull()) return 99;
@@ -373,6 +383,44 @@ rust::Vec<double> edge_polyline(const Shape& shape, double lin, double ang) {
     }
   } catch (...) {
     out.clear();
+  }
+  return out;
+}
+
+// Boundary loops of a face as polylines (outer loop first), in wire order.
+rust::Vec<double> face_loops(const Shape& shape, double lin, double ang, rust::Vec<uint32_t>& sizes) {
+  rust::Vec<double> out;
+  try {
+    if (shape.IsNull() || shape.ShapeType() != TopAbs_FACE) return out;
+    const TopoDS_Face& face = TopoDS::Face(shape);
+    TopoDS_Wire outer = BRepTools::OuterWire(face);
+    std::vector<TopoDS_Wire> wires;
+    if (!outer.IsNull()) wires.push_back(outer);
+    for (TopExp_Explorer ex(face, TopAbs_WIRE); ex.More(); ex.Next())
+      if (outer.IsNull() || !ex.Current().IsSame(outer)) wires.push_back(TopoDS::Wire(ex.Current()));
+    for (auto& w : wires) {
+      uint32_t count = 0;
+      for (BRepTools_WireExplorer we(w, face); we.More(); we.Next()) {
+        const TopoDS_Edge& e = we.Current();
+        if (BRep_Tool::Degenerated(e)) continue;
+        BRepAdaptor_Curve c(e);
+        GCPnts_TangentialDeflection approx(c, ang, lin);
+        std::vector<gp_Pnt> pts;
+        for (int i = 1; i <= approx.NbPoints(); ++i) pts.push_back(approx.Value(i));
+        if (e.Orientation() == TopAbs_REVERSED) std::reverse(pts.begin(), pts.end());
+        // drop the last point: the next edge starts there
+        for (size_t i = 0; i + 1 < pts.size(); ++i) {
+          out.push_back(pts[i].X());
+          out.push_back(pts[i].Y());
+          out.push_back(pts[i].Z());
+          ++count;
+        }
+      }
+      sizes.push_back(count);
+    }
+  } catch (...) {
+    out.clear();
+    sizes.clear();
   }
   return out;
 }

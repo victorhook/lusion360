@@ -170,6 +170,10 @@ impl Shape {
     fn raw(&self) -> &sys::Shape {
         self.inner.as_ref().expect("null shape pointer")
     }
+    /// Independent copy (geometry included) — safe to hand to another thread.
+    pub fn deep_copy(&self) -> Shape {
+        wrap(sys::shape_deep_copy(self.raw()))
+    }
     pub fn is_null(&self) -> bool {
         sys::shape_is_null(self.raw())
     }
@@ -234,6 +238,19 @@ impl Shape {
     }
     pub fn edge_polyline(&self, lin: f64, ang: f64) -> Vec<DVec3> {
         sys::edge_polyline(self.raw(), lin, ang).chunks(3).map(|c| DVec3::new(c[0], c[1], c[2])).collect()
+    }
+    /// Boundary loops of a face (outer first) as ordered polylines.
+    pub fn face_loops(&self, lin: f64, ang: f64) -> Vec<Vec<DVec3>> {
+        let mut sizes = Vec::new();
+        let flat = sys::face_loops(self.raw(), lin, ang, &mut sizes);
+        let mut out = Vec::with_capacity(sizes.len());
+        let mut i = 0usize;
+        for n in sizes {
+            let n = n as usize;
+            out.push((i..i + n).map(|k| DVec3::new(flat[3 * k], flat[3 * k + 1], flat[3 * k + 2])).collect());
+            i += n;
+        }
+        out
     }
     pub fn distance_to_point(&self, p: DVec3) -> f64 {
         sys::point_distance(self.raw(), p.x, p.y, p.z)
@@ -502,6 +519,24 @@ mod tests {
         let (lo, hi) = b.bbox().unwrap();
         assert!(hi.x <= 1e-6 && lo.x < -2.9);
         assert_eq!(m.modified(&a.faces()[0]).len(), 1);
+    }
+
+    #[test]
+    fn deep_copy_preserves_order() {
+        let a = prism(&planar_regions(&rect(10., 6.)).unwrap()[0], DVec3::Z * 3.).unwrap().shape();
+        let f = fillet(&a, &a.edges()[..3], 1.0).unwrap().shape();
+        let c = f.deep_copy();
+        let (fa, fc) = (f.faces(), c.faces());
+        assert_eq!(fa.len(), fc.len());
+        for (x, y) in fa.iter().zip(fc.iter()) {
+            let (ix, iy) = (x.face_info().unwrap(), y.face_info().unwrap());
+            assert!((ix.center - iy.center).length() < 1e-9);
+        }
+        let (ea, ec) = (f.edges(), c.edges());
+        for (x, y) in ea.iter().zip(ec.iter()) {
+            assert!((x.edge_info().unwrap().mid - y.edge_info().unwrap().mid).length() < 1e-9);
+        }
+        assert!(!fa[0].same(&fc[0]));
     }
 
     #[test]
