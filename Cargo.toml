@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = ["crates/kernel", "crates/core", "crates/meshio", "crates/app"]
+default-members = ["crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+glam = { version = "0.34", features = ["serde", "bytemuck"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+log = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+base64 = "0.22"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
