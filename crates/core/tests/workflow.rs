@@ -410,3 +410,30 @@ fn text_emboss() {
     ok(&model);
     assert!(!model.current(&doc).bodies.is_empty());
 }
+
+#[test]
+fn multiple_extrusions_from_one_sketch() {
+    let mut doc = Document::default();
+    let mut model = Model::new();
+    let mut s = Sketch::new(PlaneRef::Origin(OriginPlane::XY));
+    rect(&mut s, 0.0, 0.0, 20.0, 20.0);
+    let c = s.add_point(DVec2::new(10.0, 10.0));
+    s.add_curve(CurveGeom::Circle { c, r: 4.0 }, false);
+    let s1 = doc.insert_feature("S".into(), ROOT, FeatureKind::Sketch(s));
+    model.update(&doc);
+    let outer = profile_ref(&model, &doc, s1, |p| p.curves.len() == 5);
+    let disk = profile_ref(&model, &doc, s1, |p| p.curves.len() == 1);
+    let ex = |profiles, d: &str, start: &str, op| {
+        FeatureKind::Extrude(Extrude { profiles, distance: d.into(), distance2: String::new(), mode: ExtentMode::OneSide, start_offset: start.into(), op, targets: vec![] })
+    };
+    // plate 0..3, then a pin from the same sketch starting at 3 going to 13
+    doc.insert_feature("Plate".into(), ROOT, ex(vec![outer], "3", "", Operation::NewBody));
+    doc.insert_feature("Pin".into(), ROOT, ex(vec![disk], "10", "3", Operation::NewBody));
+    model.update(&doc);
+    ok(&model);
+    let st = model.current(&doc);
+    assert_eq!(st.bodies.len(), 2);
+    let zs: Vec<(f64, f64)> = st.bodies.values().map(|b| { let (lo, hi) = b.shape.bbox().unwrap(); (lo.z, hi.z) }).collect();
+    assert!(zs.iter().any(|(lo, hi)| (lo - 0.0).abs() < 1e-6 && (hi - 3.0).abs() < 1e-6));
+    assert!(zs.iter().any(|(lo, hi)| (lo - 3.0).abs() < 1e-6 && (hi - 13.0).abs() < 1e-6));
+}
