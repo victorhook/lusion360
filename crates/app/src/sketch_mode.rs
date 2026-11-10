@@ -195,6 +195,18 @@ pub fn finish(app: &mut App) {
         if s.prev_marker > idx {
             app.doc.marker = s.prev_marker.min(app.doc.features.len());
         }
+        // an untouched new sketch is discarded (and its creation undone)
+        let empty = sketch(app, s.fid).map(|sk| sk.curves.is_empty() && sk.points.len() <= 1).unwrap_or(false);
+        if empty {
+            if let Some(prev) = app.undo.last() {
+                if prev.feature(s.fid).is_none() {
+                    app.doc = app.undo.pop().unwrap();
+                }
+            }
+            if app.doc.feature(s.fid).is_some() {
+                app.doc.delete_feature(s.fid);
+            }
+        }
     }
     app.model.update(&app.doc);
 }
@@ -1650,7 +1662,7 @@ pub fn overlay(app: &mut App, ui: &mut egui::Ui, view: &View) {
         }
         if let Some(lp) = proj(label_p) {
             let txt = match kind {
-                DimKind::Diameter(_) => format!("⌀{}", fmt_num(*value)),
+                DimKind::Diameter(_) => format!("Ø{}", fmt_num(*value)),
                 DimKind::Radius(_) => format!("R{}", fmt_num(*value)),
                 DimKind::Angle(..) => format!("{}°", fmt_num(*value)),
                 _ => fmt_num(*value),
@@ -1699,7 +1711,7 @@ pub fn overlay(app: &mut App, ui: &mut egui::Ui, view: &View) {
         if let Some(sp) = proj(c) {
             let txt = match s.tool {
                 SkTool::Line => Some(format!("{} mm", fmt_num((c - *last).length()))),
-                SkTool::Circle => Some(format!("⌀{} mm", fmt_num(2.0 * (c - *last).length()))),
+                SkTool::Circle => Some(format!("Ø{} mm", fmt_num(2.0 * (c - *last).length()))),
                 SkTool::Rect => Some(format!("{} × {}", fmt_num((c.x - last.x).abs()), fmt_num((c.y - last.y).abs()))),
                 SkTool::CenterRect => Some(format!("{} × {}", fmt_num(2.0 * (c.x - last.x).abs()), fmt_num(2.0 * (c.y - last.y).abs()))),
                 _ => None,

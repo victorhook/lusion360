@@ -62,6 +62,8 @@ pub struct Command {
     pub prev_marker: usize,
     pub stage: u8,
     drag: Option<f64>,
+    /// automatic Join/Cut switching (until the user picks an operation)
+    auto_op: Option<Operation>,
 }
 
 // ------------------------------------------------------------------ refs <-> picks
@@ -126,7 +128,7 @@ pub fn start(app: &mut App, kind: CmdKind) {
     if let Mode::Sketch(_) = app.mode {
         crate::sketch_mode::finish(app);
     }
-    let mut c = Command { kind, fid: None, editing: false, before: app.doc.clone(), prev_marker: app.doc.marker, stage: 0, drag: None };
+    let mut c = Command { kind, fid: None, editing: false, before: app.doc.clone(), prev_marker: app.doc.marker, stage: 0, drag: None, auto_op: None };
     let sel = std::mem::take(&mut app.selection);
     app.cmd = None;
     // pre-selection
@@ -179,7 +181,7 @@ pub fn edit(app: &mut App, fid: FeatureId) {
     let prev_marker = app.doc.marker;
     app.doc.marker = idx + 1;
     app.selection.clear();
-    app.cmd = Some(Command { kind, fid: Some(fid), editing: true, before, prev_marker, stage: 0, drag: None });
+    app.cmd = Some(Command { kind, fid: Some(fid), editing: true, before, prev_marker, stage: 0, drag: None, auto_op: None });
 }
 
 pub fn ok(app: &mut App) {
@@ -187,7 +189,43 @@ pub fn ok(app: &mut App) {
     if c.editing && c.prev_marker > app.doc.marker {
         app.doc.marker = c.prev_marker;
     }
+    if !c.editing {
+        // like Fusion: sketches consumed by a feature get hidden
+        let used: Vec<FeatureId> = match c.fid.and_then(|f| app.doc.feature(f)).map(|f| &f.kind) {
+            Some(FeatureKind::Extrude(e)) => e.profiles.iter().filter_map(sketch_of).collect(),
+            Some(FeatureKind::Revolve(r)) => r.profiles.iter().filter_map(sketch_of).collect(),
+            _ => vec![],
+        };
+        for sid in used {
+            if let Some(f) = app.doc.feature_mut(sid) {
+                f.visible = false;
+            }
+        }
+    }
     app.commit(c.before);
+}
+
+fn sketch_of(p: &ProfileRef) -> Option<FeatureId> {
+    match p {
+        ProfileRef::Sketch { sketch, .. } => Some(*sketch),
+        _ => None,
+    }
+}
+
+/// If we look straight down the extrude direction, tilt the camera so the
+/// extrusion is visible.
+fn tilt_view_for(app: &mut App, n: DVec3) {
+    let cam = app.cam.cam;
+    let fwd = cam.forward();
+    if fwd.dot(n.as_vec3()).abs() < 0.92 {
+        return;
+    }
+    let nf = (fwd + cam.up() * 0.85 + cam.right() * 0.55).normalize();
+    let world_up = if nf.cross(Vec3::Z).length() > 0.2 { Vec3::Z } else { cam.up() };
+    let right = nf.cross(world_up).normalize();
+    let up = right.cross(nf);
+    let rot = glam::Quat::from_mat3(&glam::Mat3::from_cols(right, up, -nf)).normalize();
+    app.cam.set_orientation(rot);
 }
 
 pub fn cancel(app: &mut App) {
@@ -376,6 +414,7 @@ impl Command {
                         _ => true,
                     };
                     let op = if is_face || on_body { Operation::Join } else { Operation::NewBody };
+                    self.auto_op = Some(op);
                     let kind = if self.kind == CmdKind::Extrude {
                         FeatureKind::Extrude(Extrude {
                             profiles: vec![pr],
@@ -399,6 +438,10 @@ impl Command {
                         FeatureKind::Revolve(Revolve { profiles: vec![pr], axis, angle: "360".into(), op, targets: vec![] })
                     };
                     self.insert(app, kind);
+                    app.model.update(&app.doc);
+                    if let Some((_, n, _)) = self.extrude_axis(app) {
+                        tilt_view_for(app, n);
+                    }
                     return;
                 }
                 let list = match self.feature_mut(app) {
@@ -538,6 +581,16 @@ impl Command {
         }
     }
 
+    /// Fusion-style: pulling into the body cuts, pulling out joins.
+    fn apply_auto_op(&self, app: &App, e: &mut Extrude) {
+        let Some(base) = self.auto_op else { return };
+        if base == Operation::NewBody || e.mode != ExtentMode::OneSide {
+            return;
+        }
+        let d = app.model.params.eval(&e.distance).unwrap_or(0.0);
+        e.op = if d < 0.0 { Operation::Cut } else { Operation::Join };
+    }
+
     /// Anchor + direction of the extrude drag arrow.
     fn extrude_axis(&self, app: &App) -> Option<(DVec3, DVec3, f64)> {
         let Some(FeatureKind::Extrude(e)) = self.feature(app) else { return None };
@@ -587,6 +640,16 @@ impl Command {
                     let txt = lusion_core::expr::fmt_num(v);
                     if ex.distance != txt {
                         ex.distance = txt;
+                    }
+                }
+                let mut ex2 = match self.feature(app) {
+                    Some(FeatureKind::Extrude(e)) => e.clone(),
+                    _ => return true,
+                };
+                self.apply_auto_op(app, &mut ex2);
+                if let Some(FeatureKind::Extrude(ex)) = self.feature_mut(app) {
+                    if ex.op != ex2.op {
+                        ex.op = ex2.op;
                     }
                 }
             }
@@ -676,8 +739,14 @@ pub fn command_panel(app: &mut App, ui: &mut egui::Ui) {
         return;
     }
     let mut finish: Option<bool> = None;
-    egui::Panel::right("command_panel").resizable(false).exact_size(300.0).show(ui, |ui| {
-        ui.add_space(6.0);
+    let frame = egui::Frame::new()
+        .fill(egui::Color32::from_rgba_unmultiplied(0x25, 0x29, 0x2f, 245))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(0x3a, 0x42, 0x4d)))
+        .corner_radius(10)
+        .shadow(egui::epaint::Shadow { offset: [0, 6], blur: 18, spread: 0, color: egui::Color32::from_black_alpha(110) })
+        .inner_margin(12);
+    egui::Area::new(egui::Id::new("command_panel")).anchor(egui::Align2::RIGHT_TOP, [-16.0, 285.0]).order(egui::Order::Foreground).show(ui.ctx(), |ui| frame.show(ui, |ui| {
+        ui.set_width(290.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new(c.kind.icon()).size(20.0).color(theme::ACCENT));
             ui.label(RichText::new(if c.editing { format!("Edit {}", c.kind.title()) } else { c.kind.title().to_string() }).size(16.0).strong());
@@ -717,7 +786,7 @@ pub fn command_panel(app: &mut App, ui: &mut egui::Ui) {
             }
         });
         ui.label(RichText::new("Enter = OK · Esc = Cancel").small().color(theme::TEXT_DIM));
-    });
+    }));
     let wants_kb = ui.ctx().egui_wants_keyboard_input();
     ui.input(|i| {
         if i.key_pressed(egui::Key::Escape) {
@@ -784,7 +853,12 @@ fn dialog_body(c: &mut Command, app: &mut App, ui: &mut egui::Ui) -> Option<Stri
                 expr_field(ui, app, "Distance 2", &mut e.distance2, "mm");
             }
             expr_field(ui, app, "Start offset", &mut e.start_offset, "mm");
+            let op_before = e.op;
             op_selector(ui, &mut e.op);
+            if e.op != op_before {
+                c.auto_op = None;
+            }
+            c.apply_auto_op(app, &mut e);
             if let Some(FeatureKind::Extrude(x)) = app.doc.feature_mut(fid).map(|f| &mut f.kind) {
                 if *x != e {
                     *x = e;

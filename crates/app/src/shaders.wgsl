@@ -104,6 +104,26 @@ fn fs_mesh(i: MeshOut, @builtin(front_facing) front: bool) -> @location(0) vec4<
     return vec4<f32>(to_output(c), d.color.a);
 }
 
+// ---------------------------------------------------------------- silhouette (inverted hull)
+
+@vertex
+fn vs_outline(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>) -> FillOut {
+    var o: FillOut;
+    let c = g.view_proj * vec4<f32>(p, 1.0);
+    let cn = g.view_proj * vec4<f32>(p + normalize(n) * 0.001 * g.fwd.w, 1.0);
+    var dir = cn.xy / cn.w - c.xy / c.w;
+    let l = length(dir * g.viewport.xy);
+    if (l > 1e-6) {
+        dir = dir * g.viewport.xy / l;
+    } else {
+        dir = vec2<f32>(0.0, 0.0);
+    }
+    let off = dir * d.params.x / g.viewport.xy * 2.0;
+    o.pos = vec4<f32>(c.xy + off * c.w, c.z, c.w);
+    o.color = d.color;
+    return o;
+}
+
 // ---------------------------------------------------------------- unlit triangles (fills)
 
 struct FillOut {

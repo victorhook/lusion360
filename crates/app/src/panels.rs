@@ -325,6 +325,9 @@ pub fn timeline(app: &mut App, ui: &mut egui::Ui) {
                         }
                         tip += "\nDouble-click to edit · right-click for more";
                         let r = r.on_hover_text(tip);
+                        if r.hovered() {
+                            app.timeline_hover = Some(f.id);
+                        }
                         if r.clicked() {
                             app.timeline_sel = Some(f.id);
                         }
@@ -770,6 +773,38 @@ fn project(app: &mut App, ui: &mut egui::Ui) {
 // ------------------------------------------------------------------ dialogs
 
 pub fn dialogs(app: &mut App, ctx: &egui::Context) {
+    if let Some(p) = app.recovery.clone() {
+        let mut done = false;
+        egui::Window::new(format!("{} Recover unsaved work?", ic::LIFEBUOY)).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+            let age = std::fs::metadata(&p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).map(|d| d.as_secs() / 60);
+            ui.label("Lusion360 found an autosaved design that was never saved (the app may have crashed).");
+            if let Some(m) = age {
+                ui.label(RichText::new(format!("Autosaved {m} min ago")).color(theme::TEXT_DIM));
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button(RichText::new(format!("{} Recover", ic::ARROW_COUNTER_CLOCKWISE)).strong()).clicked() {
+                    match lusion_core::io::load_native(&p) {
+                        Ok(d) => {
+                            app.new_doc();
+                            app.doc = d;
+                            app.fit_pending = true;
+                            app.info("Recovered autosaved design — save it to keep it");
+                        }
+                        Err(e) => app.error(format!("Recovery failed: {e:#}")),
+                    }
+                    done = true;
+                }
+                if ui.button("Discard").clicked() {
+                    let _ = std::fs::remove_file(&p);
+                    done = true;
+                }
+            });
+        });
+        if done {
+            app.recovery = None;
+        }
+    }
     // unsaved changes
     if let Some(action) = app.confirm_discard.clone() {
         let mut close = false;

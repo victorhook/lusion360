@@ -99,6 +99,10 @@ pub struct App {
     pub print: Option<crate::print::PrintDialog>,
     pub slicers: Option<Vec<crate::print::Slicer>>,
     pub slicer_pref: Option<String>,
+    pub timeline_hover: Option<FeatureId>,
+    pub last_autosave: Instant,
+    pub autosaved_doc: Option<Document>,
+    pub recovery: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -170,6 +174,10 @@ impl App {
             about: false,
             print: None,
             slicers: None,
+            timeline_hover: None,
+            last_autosave: Instant::now(),
+            autosaved_doc: None,
+            recovery: autosave_path().filter(|p| p.exists()),
             slicer_pref: cc.storage.and_then(|s| s.get_string("slicer")).filter(|s| !s.is_empty()),
         };
         if let Some(p) = initial {
@@ -280,12 +288,8 @@ impl App {
         if let Some(n) = self.doc.body_props(id).name {
             return n;
         }
-        let fname = self.doc.feature(id.feature()).map(|f| f.name.clone()).unwrap_or_else(|| "Body".into());
-        if id.index() == 0 {
-            format!("Body · {fname}")
-        } else {
-            format!("Body {} · {fname}", id.index() + 1)
-        }
+        let n = self.display_state().bodies.keys().position(|b| *b == id).map(|i| i + 1).unwrap_or(1);
+        format!("Body{n}")
     }
 
     pub fn body_component(&self, st: &ModelState, id: BodyId) -> CompId {
@@ -327,6 +331,7 @@ impl App {
                 }
             }
             PendingAction::Quit => {
+                self.clear_autosave();
                 self.allow_close = true;
             }
         }
@@ -407,6 +412,7 @@ impl App {
                 self.saved_doc = self.doc.clone();
                 self.path = Some(path.clone());
                 self.push_recent(&path);
+                self.clear_autosave();
                 self.info(format!("Saved {}", path.display()));
                 true
             }
@@ -520,6 +526,54 @@ impl App {
     }
 }
 
+/// Where crash-recovery snapshots go.
+pub fn autosave_path() -> Option<PathBuf> {
+    let base = if cfg!(windows) {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    } else {
+        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+    }?;
+    Some(base.join("lusion360").join("autosave.l360"))
+}
+
+impl App {
+    /// Snapshot unsaved work every 20 s (in a background thread).
+    fn autosave(&mut self) {
+        if self.last_autosave.elapsed().as_secs() < 20 || self.recovery.is_some() {
+            return;
+        }
+        self.last_autosave = Instant::now();
+        let Some(path) = autosave_path() else { return };
+        if !self.dirty() {
+            if self.autosaved_doc.is_some() {
+                let _ = std::fs::remove_file(&path);
+                self.autosaved_doc = None;
+            }
+            return;
+        }
+        if self.autosaved_doc.as_ref() == Some(&self.doc) {
+            return;
+        }
+        let doc = self.doc.clone();
+        self.autosaved_doc = Some(doc.clone());
+        std::thread::spawn(move || {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Err(e) = io::save_native(&doc, &path) {
+                log::warn!("autosave failed: {e:#}");
+            }
+        });
+    }
+
+    pub fn clear_autosave(&mut self) {
+        if let Some(p) = autosave_path() {
+            let _ = std::fs::remove_file(p);
+        }
+        self.autosaved_doc = None;
+    }
+}
+
 pub fn open_dialog() -> Option<PathBuf> {
     let all = io::all_open_extensions();
     let mut mesh: Vec<&str> = lusion_meshio::supported_import_extensions().to_vec();
@@ -541,6 +595,8 @@ impl eframe::App for App {
         self.frame_ms = self.frame_ms * 0.9 + dt * 1000.0 * 0.1;
         self.last_frame = now;
 
+        self.timeline_hover = None;
+        self.autosave();
         // keep the model up to date
         self.model.update(&self.doc);
         self.meshes.tick();

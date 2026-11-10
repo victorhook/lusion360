@@ -265,3 +265,35 @@ fn cut_through_and_press_pull() {
     assert!((ring.shape.volume().unwrap() - expect).abs() < 1e-3);
     let _ = DVec3::ZERO;
 }
+
+#[test]
+fn export_formats_roundtrip() {
+    let doc = lusion_core::io::load_native(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/bracket.l360")));
+    let doc = match doc {
+        Ok(d) => d,
+        Err(_) => return, // demo not generated
+    };
+    let mut model = Model::new();
+    model.update(&doc);
+    ok(&model);
+    let st = model.current(&doc);
+    let bodies: Vec<_> = st.bodies.values().collect();
+    let dir = std::env::temp_dir().join(format!("l360-export-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for ext in ["step", "stl", "3mf", "obj", "brep"] {
+        let p = dir.join(format!("bracket.{ext}"));
+        lusion_core::io::export(&p, &bodies, &["Bracket".into()]).unwrap();
+        assert!(std::fs::metadata(&p).unwrap().len() > 100, "{ext} too small");
+        // re-open what we wrote
+        let d2 = lusion_core::io::open_any(&p).unwrap();
+        let mut m2 = Model::new();
+        m2.update(&d2);
+        assert!(!m2.current(&d2).bodies.is_empty(), "{ext} reimport empty");
+        if ext == "step" || ext == "brep" {
+            let v1 = bodies[0].shape.volume().unwrap();
+            let v2: f64 = m2.current(&d2).bodies.values().map(|b| b.shape.volume().unwrap()).sum();
+            assert!((v1 - v2).abs() / v1 < 1e-6, "{ext}: {v1} vs {v2}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

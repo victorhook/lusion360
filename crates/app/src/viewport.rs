@@ -383,29 +383,42 @@ pub fn highlight(app: &mut App, scene: &mut Scene, st: &ModelState, pick: Pick, 
 
 fn grid(app: &App, scene: &mut Scene, frame: &lusion_core::sketch::Frame, strength: f32) {
     let d = app.cam.cam.distance.max(1e-3);
-    let step = 10f32.powf((d / 6.0).log10().floor());
-    let n = 40i32;
-    // centre the grid near the camera target projected onto the plane
+    let step = 10f32.powf((d / 3.0).log10().floor()) * 0.5;
+    let step = step.max(0.01);
+    let n = 24i32;
     let t = frame.to2(app.cam.cam.target.as_dvec3());
-    let cx = (t.x as f32 / (step * 10.0)).round() * step * 10.0;
-    let cy = (t.y as f32 / (step * 10.0)).round() * step * 10.0;
-    let base = if app.light_bg { [0.25, 0.28, 0.33] } else { [0.62, 0.68, 0.76] };
+    let snap = step * 10.0;
+    let cx = (t.x as f32 / snap).round() * snap;
+    let cy = (t.y as f32 / snap).round() * snap;
+    let base = if app.light_bg { [0.22, 0.25, 0.30] } else { [0.62, 0.68, 0.76] };
+    let ext = n as f32 * step;
     for i in -n..=n {
-        let major = i.rem_euclid(10) == ((cx / step).round() as i32).rem_euclid(10) && false || ((cx / step).round() as i32 + i) % 10 == 0;
-        let a = if major { 0.22 } else { 0.08 } * strength;
-        let fade = 1.0 - (i.abs() as f32 / n as f32).powi(2);
-        let col = [base[0], base[1], base[2], a * fade];
-        let x = cx + i as f32 * step;
-        let p0 = frame.to3(glam::DVec2::new(x as f64, (cy - n as f32 * step) as f64)).as_vec3();
-        let p1 = frame.to3(glam::DVec2::new(x as f64, (cy + n as f32 * step) as f64)).as_vec3();
-        push_line(&mut scene.lines, p0, p1, col, 1.0);
-        let majory = ((cy / step).round() as i32 + i) % 10 == 0;
-        let a = if majory { 0.22 } else { 0.08 } * strength;
-        let col = [base[0], base[1], base[2], a * fade];
-        let y = cy + i as f32 * step;
-        let p0 = frame.to3(glam::DVec2::new((cx - n as f32 * step) as f64, y as f64)).as_vec3();
-        let p1 = frame.to3(glam::DVec2::new((cx + n as f32 * step) as f64, y as f64)).as_vec3();
-        push_line(&mut scene.lines, p0, p1, col, 1.0);
+        let fade = (1.0 - (i.abs() as f32 / n as f32)).powf(1.5);
+        for axis in 0..2 {
+            let c0 = if axis == 0 { cx } else { cy };
+            let v = c0 + i as f32 * step;
+            let major = ((v / step).round() as i64).rem_euclid(10) == 0;
+            let a = if major { 0.16 } else { 0.055 } * strength * fade;
+            if a < 0.004 {
+                continue;
+            }
+            let col = [base[0], base[1], base[2], a];
+            // fade the far ends by splitting into segments
+            let segs = 6;
+            for k in 0..segs {
+                let u0 = -ext + 2.0 * ext * k as f32 / segs as f32;
+                let u1 = -ext + 2.0 * ext * (k + 1) as f32 / segs as f32;
+                let um = (u0 + u1) * 0.5;
+                let f2 = (1.0 - (um / ext).abs()).powf(1.2);
+                let col = [col[0], col[1], col[2], col[3] * f2];
+                let (p0, p1) = if axis == 0 {
+                    (glam::DVec2::new(v as f64, (cy + u0) as f64), glam::DVec2::new(v as f64, (cy + u1) as f64))
+                } else {
+                    (glam::DVec2::new((cx + u0) as f64, v as f64), glam::DVec2::new((cx + u1) as f64, v as f64))
+                };
+                push_line(&mut scene.lines, frame.to3(p0).as_vec3(), frame.to3(p1).as_vec3(), col, 1.0);
+            }
+        }
     }
 }
 
@@ -510,6 +523,33 @@ fn build_scene(app: &mut App, view: &View) -> Scene {
             highlight(app, &mut scene, &pst, h.pick, false);
         }
     }
+    // timeline hover: highlight what the feature made
+    if let Some(fid) = app.timeline_hover {
+        let prefix = format!("f{fid}.");
+        let ids: Vec<BodyId> = st.bodies.keys().copied().collect();
+        for id in ids {
+            let b = &st.bodies[&id];
+            if !app.body_visible(&st, id) {
+                continue;
+            }
+            let faces: Vec<u32> = b.face_names.iter().enumerate().filter(|(_, n)| n.starts_with(&prefix)).map(|(i, _)| i as u32).collect();
+            if let Some(m) = app.meshes.get(b) {
+                for f in faces {
+                    push_face_fill(&mut scene, &m, f, [1.0, 0.72, 0.28, 0.45]);
+                }
+            }
+        }
+        if let Some(ss) = st.sketches.get(&fid) {
+            for c in &ss.sketch.curves {
+                let pts: Vec<Vec3> = ss.sketch.curve_polyline(c, 0.05).iter().map(|p| ss.frame.to3(*p).as_vec3()).collect();
+                push_polyline(&mut scene.overlay_lines, &pts, [1.0, 0.72, 0.28, 1.0], 2.5);
+            }
+        }
+        if let Some(f) = st.planes.get(&fid) {
+            let s = plane_size(app) as f64;
+            push_square(&mut scene, f, glam::DVec2::ZERO, s * 0.5, [1.0, 0.72, 0.28, 0.25], [1.0, 0.72, 0.28, 1.0]);
+        }
+    }
     if let Some(c) = app.cmd.take() {
         c.draw(app, &mut scene, view);
         app.cmd = Some(c);
@@ -595,6 +635,18 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         }
     }
 
+    if resp.hovered() {
+        let icon = match &app.mode {
+            Mode::Sketch(s) if s.tool != crate::sketch_mode::SkTool::Select => egui::CursorIcon::Crosshair,
+            _ if app.hover.is_some() => egui::CursorIcon::PointingHand,
+            _ => egui::CursorIcon::Default,
+        };
+        if resp.dragged_by(PointerButton::Secondary) || resp.dragged_by(PointerButton::Middle) {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else {
+            ui.ctx().set_cursor_icon(icon);
+        }
+    }
     let scene = build_scene(app, &view);
     ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, ViewportCallback { scene: Arc::new(scene) }));
 
@@ -607,6 +659,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         app.cmd = Some(c);
     }
     view_controls(app, ui, &view);
+    welcome(app, ui, &view);
     axis_triad(app, ui, &view);
     hover_tooltip(app, ui, &view);
 }
@@ -724,41 +777,162 @@ fn context_menu(app: &mut App, resp: &egui::Response) {
     });
 }
 
+const CUBE_FACES: [(Vec3, &str, f32, f32); 6] = [
+    (Vec3::Z, "TOP", 0.0, 90.0),
+    (Vec3::NEG_Z, "BOTTOM", 0.0, -90.0),
+    (Vec3::NEG_Y, "FRONT", 0.0, 0.0),
+    (Vec3::Y, "BACK", 180.0, 0.0),
+    (Vec3::X, "RIGHT", 90.0, 0.0),
+    (Vec3::NEG_X, "LEFT", -90.0, 0.0),
+];
+
+fn view_cube(app: &mut App, ui: &mut egui::Ui, view: &View) {
+    let size = 34.0;
+    let center = view.rect.right_top() + EVec2::new(-74.0, 72.0);
+    let cam = app.cam.cam;
+    let proj = |p: Vec3| center + EVec2::new(p.dot(cam.right()), -p.dot(cam.up())) * size;
+    let area = egui::Rect::from_center_size(center, egui::vec2(size * 3.4, size * 3.4));
+    let resp = ui.interact(area, ui.id().with("view_cube"), Sense::click());
+    let mouse = resp.hover_pos();
+    let painter = ui.painter_at(view.rect);
+    // back-to-front
+    let mut faces: Vec<(Vec3, &str, f32, f32)> = CUBE_FACES.to_vec();
+    faces.sort_by(|a, b| a.0.dot(cam.forward()).partial_cmp(&b.0.dot(cam.forward())).unwrap().reverse());
+    let mut hovered: Option<(f32, f32)> = None;
+    let mut polys = Vec::new();
+    for (n, label, yaw, pitch) in faces {
+        let facing = -n.dot(cam.forward());
+        if facing <= 0.02 {
+            continue;
+        }
+        let (u, v) = if n.z.abs() > 0.5 { (Vec3::X, Vec3::Y * n.z.signum()) } else { (Vec3::Z.cross(n), Vec3::Z) };
+        let pts: Vec<Pos2> = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+            .iter()
+            .map(|(a, b)| proj(n + u * *a + v * *b))
+            .collect();
+        let inside = mouse.map(|m| point_in_poly(m, &pts)).unwrap_or(false);
+        if inside {
+            hovered = Some((yaw, pitch));
+        }
+        polys.push((pts, label, facing, inside, proj(n)));
+    }
+    // only the front-most hovered face counts
+    let mut hover_label = None;
+    if mouse.is_some() {
+        for (pts, label, _, inside, _) in polys.iter().rev() {
+            if *inside {
+                hover_label = Some(*label);
+                let _ = pts;
+                break;
+            }
+        }
+    }
+    for (pts, label, facing, _, c) in &polys {
+        let hot = hover_label == Some(*label);
+        let shade = (150.0 + 70.0 * facing) as u8;
+        let fill = if hot { theme::ACCENT } else { Color32::from_rgba_unmultiplied(shade / 3 + 20, shade / 3 + 24, shade / 3 + 30, 235) };
+        painter.add(egui::Shape::convex_polygon(pts.clone(), fill, egui::Stroke::new(1.0, Color32::from_rgb(90, 100, 115))));
+        if *facing > 0.35 {
+            painter.text(*c, egui::Align2::CENTER_CENTER, *label, egui::FontId::proportional(9.0 + 2.0 * facing), Color32::from_gray((170.0 + 85.0 * facing) as u8));
+        }
+    }
+    if resp.clicked() {
+        if let Some(l) = hover_label {
+            if let Some((_, _, yaw, pitch)) = CUBE_FACES.iter().find(|f| f.1 == l) {
+                app.cam.set_orientation(crate::camera::Camera::view_rot(yaw.to_radians(), pitch.to_radians()));
+            }
+        }
+    }
+    let _ = hovered;
+}
+
+fn point_in_poly(p: Pos2, pts: &[Pos2]) -> bool {
+    let mut inside = false;
+    let n = pts.len();
+    let mut j = n - 1;
+    for i in 0..n {
+        let (a, b) = (pts[i], pts[j]);
+        if (a.y > p.y) != (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
 fn view_controls(app: &mut App, ui: &mut egui::Ui, view: &View) {
-    let w = 34.0;
-    let pos = view.rect.right_top() + EVec2::new(-(w + 10.0), 10.0);
+    view_cube(app, ui, view);
+    let w = 30.0;
+    let pos = view.rect.right_top() + EVec2::new(-(w + 2.0) * 4.0 - 26.0, 140.0);
     egui::Area::new(egui::Id::new("view_controls")).fixed_pos(pos).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
-        egui::Frame::new().fill(Color32::from_rgba_unmultiplied(30, 33, 38, 210)).corner_radius(8).inner_margin(4).show(ui, |ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
-            let mut b = |ui: &mut egui::Ui, icon: &str, tip: &str| {
-                ui.add_sized([w - 8.0, 26.0], egui::Button::new(egui::RichText::new(icon).size(16.0)).frame(false)).on_hover_text(tip).clicked()
-            };
-            if b(ui, crate::icons::HOUSE, "Home view (Home / F6)") {
-                app.home_view();
-            }
-            if b(ui, crate::icons::CORNERS_OUT, "Fit all") {
-                app.fit_all(true);
-            }
-            ui.separator();
-            let views: [(&str, &str, f32, f32); 4] = [("T", "Top", 0.0, 90.0), ("F", "Front", 0.0, 0.0), ("R", "Right", 90.0, 0.0), ("I", "Iso", 45.0, 30.0)];
-            for (l, tip, yaw, pitch) in views {
-                if ui.add_sized([w - 8.0, 22.0], egui::Button::new(egui::RichText::new(l).strong()).frame(false)).on_hover_text(tip).clicked() {
-                    let rot = crate::camera::Camera::view_rot(yaw.to_radians(), pitch.to_radians());
-                    app.cam.set_orientation(rot);
+        egui::Frame::new().fill(Color32::from_rgba_unmultiplied(30, 33, 38, 200)).corner_radius(8).inner_margin(3).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+                let b = |ui: &mut egui::Ui, icon: &str, tip: &str| {
+                    ui.add_sized([w, 24.0], egui::Button::new(egui::RichText::new(icon).size(15.0)).frame(false)).on_hover_text(tip).clicked()
+                };
+                if b(ui, crate::icons::HOUSE, "Home view (Home / F6)") {
+                    app.home_view();
                 }
-            }
-            ui.separator();
-            let icon = if app.cam.cam.ortho { crate::icons::CUBE } else { crate::icons::PERSPECTIVE };
-            if b(ui, icon, if app.cam.cam.ortho { "Orthographic (click for perspective)" } else { "Perspective (click for orthographic)" }) {
-                app.cam.cam.ortho = !app.cam.cam.ortho;
-            }
-            if let Mode::Sketch(s) = &app.mode {
-                let fid = s.fid;
-                if b(ui, crate::icons::FRAME_CORNERS, "Look at sketch") {
-                    crate::sketch_mode::look_at(app, fid);
+                if b(ui, crate::icons::CORNERS_OUT, "Fit all") {
+                    app.fit_all(true);
                 }
-            }
+                let icon = if app.cam.cam.ortho { crate::icons::CUBE } else { crate::icons::PERSPECTIVE };
+                if b(ui, icon, if app.cam.cam.ortho { "Orthographic (click for perspective)" } else { "Perspective (click for orthographic)" }) {
+                    app.cam.cam.ortho = !app.cam.cam.ortho;
+                }
+                if let Mode::Sketch(s) = &app.mode {
+                    let fid = s.fid;
+                    if b(ui, crate::icons::FRAME_CORNERS, "Look at sketch") {
+                        crate::sketch_mode::look_at(app, fid);
+                    }
+                }
+            });
         });
+    });
+}
+
+fn welcome(app: &mut App, ui: &mut egui::Ui, view: &View) {
+    if !app.doc.features.is_empty() || app.cmd.is_some() || !matches!(app.mode, Mode::Model) {
+        return;
+    }
+    let pos = view.rect.center() - EVec2::new(170.0, 150.0);
+    egui::Area::new(egui::Id::new("welcome")).fixed_pos(pos).order(egui::Order::Middle).show(ui.ctx(), |ui| {
+        egui::Frame::new()
+            .fill(Color32::from_rgba_unmultiplied(28, 31, 36, 235))
+            .stroke(egui::Stroke::new(1.0, Color32::from_rgb(55, 62, 72)))
+            .corner_radius(12)
+            .inner_margin(18)
+            .show(ui, |ui| {
+                ui.set_width(300.0);
+                ui.label(egui::RichText::new(format!("{} Lusion360", crate::icons::CUBE)).size(22.0).strong().color(theme::ACCENT));
+                ui.label(egui::RichText::new("Fast, local, parametric.").color(theme::TEXT_DIM));
+                ui.add_space(10.0);
+                let big = |ui: &mut egui::Ui, icon: &str, t: &str| {
+                    ui.add_sized([300.0, 34.0], egui::Button::new(egui::RichText::new(format!("{icon}   {t}")).size(15.0))).clicked()
+                };
+                if big(ui, crate::icons::PENCIL_SIMPLE_LINE, "Start a sketch") {
+                    crate::commands::start(app, crate::commands::CmdKind::NewSketch);
+                }
+                if big(ui, crate::icons::FOLDER_OPEN, "Open design or 3D file…") {
+                    app.request(crate::app::PendingAction::Open(None));
+                }
+                if big(ui, crate::icons::DOWNLOAD_SIMPLE, "Import STEP / STL / 3MF / OBJ…") {
+                    app.import_file();
+                }
+                if !app.recent.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("Recent").small().color(theme::TEXT_DIM));
+                    for p in app.recent.clone().into_iter().take(5) {
+                        let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        if ui.link(name).on_hover_text(p.display().to_string()).clicked() {
+                            app.request(crate::app::PendingAction::Open(Some(p)));
+                        }
+                    }
+                }
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Tip: drop files onto the window · press S to search commands").small().color(theme::TEXT_DIM));
+            });
     });
 }
 

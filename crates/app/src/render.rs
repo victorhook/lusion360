@@ -148,6 +148,7 @@ pub struct Renderer {
     bg: wgpu::RenderPipeline,
     mesh: wgpu::RenderPipeline,
     mesh_overlay: wgpu::RenderPipeline,
+    outline: wgpu::RenderPipeline,
     fill: wgpu::RenderPipeline,
     line: wgpu::RenderPipeline,
     line_top: wgpu::RenderPipeline,
@@ -172,6 +173,7 @@ pub struct Renderer {
 enum Cmd {
     Bg,
     Mesh { key: usize, draw: u32, range: Option<Range<u32>>, overlay: bool },
+    Outline { key: usize, draw: u32 },
     Edges { key: usize, draw: u32, range: Range<u32> },
     Fills { draw: u32, n: u32 },
     Lines { draw: u32, n: u32 },
@@ -288,7 +290,29 @@ impl Renderer {
         let bg = mk("bg", "vs_bg", "fs_bg", &[], T::TriangleList, false, C::Always);
         let mesh = mk("mesh", "vs_mesh", "fs_mesh", &[Some(mesh_layout.clone())], T::TriangleList, true, C::Less);
         let mesh_overlay =
-            mk("mesh overlay", "vs_mesh", "fs_mesh", &[Some(mesh_layout)], T::TriangleList, false, C::LessEqual);
+            mk("mesh overlay", "vs_mesh", "fs_mesh", &[Some(mesh_layout.clone())], T::TriangleList, false, C::LessEqual);
+        let outline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("outline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_outline"), compilation_options: Default::default(), buffers: &[Some(mesh_layout)] },
+            primitive: wgpu::PrimitiveState { topology: T::TriangleList, cull_mode: Some(wgpu::Face::Front), ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(C::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState { count: MSAA, mask: !0, alpha_to_coverage_enabled: false },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_fill"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format: target, blend, write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         let fill = mk("fill", "vs_fill", "fs_fill", &[Some(fill_layout)], T::TriangleList, false, C::LessEqual);
         let line = mk("line", "vs_line", "fs_line", &[Some(line_layout.clone())], T::TriangleList, false, C::LessEqual);
         let line_top = mk("line top", "vs_line", "fs_line", &[Some(line_layout)], T::TriangleList, false, C::Always);
@@ -299,6 +323,7 @@ impl Renderer {
             bg,
             mesh,
             mesh_overlay,
+            outline,
             fill,
             line,
             line_top,
@@ -430,6 +455,10 @@ impl Renderer {
         for b in &scene.bodies {
             let key = Arc::as_ptr(&b.mesh) as usize;
             if b.color[3] >= 0.999 {
+                if b.show_edges {
+                    let o = push(b.edge_color, [1.3, 0.0, 0.0, 0.0]);
+                    plan.push(Cmd::Outline { key, draw: o });
+                }
                 let d = push(b.color, [1.0, 0.0, 1.0, 0.0]);
                 plan.push(Cmd::Mesh { key, draw: d, range: None, overlay: false });
             }
@@ -531,6 +560,17 @@ impl Renderer {
                     rp.set_vertex_buffer(0, m.vbuf.slice(..));
                     rp.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                     rp.draw_indexed(range.clone().unwrap_or(0..m.n_idx), 0, 0..1);
+                }
+                Cmd::Outline { key, draw } => {
+                    let Some(m) = self.meshes.get(key) else { continue };
+                    if m.n_idx == 0 {
+                        continue;
+                    }
+                    rp.set_pipeline(&self.outline);
+                    rp.set_bind_group(1, &self.draws_bg, &[(*draw as u64 * DRAW_STRIDE) as u32]);
+                    rp.set_vertex_buffer(0, m.vbuf.slice(..));
+                    rp.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    rp.draw_indexed(0..m.n_idx, 0, 0..1);
                 }
                 Cmd::Edges { key, draw, range } => {
                     let Some(m) = self.meshes.get(key) else { continue };
