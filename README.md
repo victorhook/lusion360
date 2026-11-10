@@ -10,7 +10,8 @@ No cloud, no login, no telemetry. Designs are plain JSON files (`.l360`) you can
 ## Features
 
 **Modelling**
-- **Sketches** on origin planes, construction planes or any planar face. Tools: line (chained), rectangle, centre rectangle, circle, 3-point arc, point, trim, construction toggle.
+- **Sketches** on origin planes, construction planes or any planar face. Tools: line (chained), rectangle, centre rectangle, circle, 3-point arc, point, **sketch fillet** (rounds corners and keeps virtual sharps, so the overall dimensions still hold), trim, **text** (for embossed or engraved labels), construction toggle.
+- **Type while drawing**, like Fusion: start a line and type `40`, start a rectangle and type `60x40`, or start a circle and type the diameter. The matching dimensions are added automatically.
 - **Constraints**: coincident, point-on-curve, horizontal/vertical, parallel, perpendicular, equal, tangent, concentric, midpoint, fix. Lines that are nearly horizontal or vertical get H/V automatically while you draw. The sketch shows its remaining degrees of freedom: free geometry is blue, fully constrained geometry is white.
 - **Dimensions** (length, distance, horizontal/vertical, point-to-line, radius, diameter, angle). Each one takes an **expression**, e.g. `width/2 + 3`, `1.5 in`, `sin(30deg)*r`.
 - **Snapping** to sketch points, midpoints and curves, plus **model geometry** (edge endpoints, midpoints and circle centres projected onto the sketch plane).
@@ -47,7 +48,8 @@ No cloud, no login, no telemetry. Designs are plain JSON files (`.l360`) you can
 | Command search | `S` |
 | Extrude | Double-click a profile/face, or the toolbar |
 | Fillet | `F` |
-| Sketch tools | `L` line, `R` rectangle, `C` circle, `A` arc, `P` point, `D` dimension, `T` trim, `X` construction, `Del` delete |
+| Sketch tools | `L` line, `R` rectangle, `C` circle, `A` arc, `P` point, `D` dimension, `T` trim, `G` corner fillet, `X` construction, `Del` delete |
+| While drawing | Type a number (or `60x40` for rectangles) + Enter |
 | Finish sketch / cancel | `Esc` (steps back: tool → selection → finish) |
 | Undo / redo | Ctrl+Z / Ctrl+Y |
 | Save / open / new / import / export | Ctrl+S / Ctrl+O / Ctrl+N / Ctrl+I / Ctrl+E |
@@ -96,9 +98,9 @@ Persistent naming: every face is named after the feature and the sketch curve or
 ## Known limitations / roadmap
 
 - Projected model geometry snaps to positions but is not linked: if the model changes, the sketch point stays where it was.
-- No sketch fillet/offset/spline tools yet. No sweep/loft/hole/thread features yet.
+- No sketch offset/spline tools yet. No sweep/loft/hole/thread features yet. Text uses one bundled font (DejaVu Sans Bold).
 - No assembly joints; components are organisational only.
 - Mesh bodies (STL/3MF imports) can be viewed, exported, hidden and recoloured, but not used in booleans.
 - Windows builds are untested.
 
-License: MIT OR Apache-2.0. OpenCASCADE is LGPL-2.1 with exception. Phosphor icons are MIT.
+License: MIT OR Apache-2.0. OpenCASCADE is LGPL-2.1 with exception. Phosphor icons are MIT. DejaVu fonts use the Bitstream Vera license.
