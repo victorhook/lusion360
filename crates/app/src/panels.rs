@@ -1023,7 +1023,7 @@ fn params_window(app: &mut App, ctx: &egui::Context) {
     let mut open = true;
     let mut params = app.doc.parameters.clone();
     let mut remove: Option<usize> = None;
-    egui::Window::new(format!("{} Parameters", ic::FUNCTION)).open(&mut open).default_width(460.0).show(ctx, |ui| {
+    egui::Window::new(format!("{} Parameters", ic::FUNCTION)).open(&mut open).default_width(520.0).default_pos(ctx.content_rect().center() - egui::vec2(260.0, 160.0)).show(ctx, |ui| {
         ui.label(RichText::new("Use parameter names in any dimension or feature value, e.g. `width / 2 + 3`.").small().color(theme::TEXT_DIM));
         ui.add_space(4.0);
         egui::Grid::new("params").num_columns(5).striped(true).spacing([8.0, 4.0]).show(ui, |ui| {
@@ -1034,14 +1034,14 @@ fn params_window(app: &mut App, ctx: &egui::Context) {
             ui.label("");
             ui.end_row();
             for (i, p) in params.iter_mut().enumerate() {
-                ui.add(egui::TextEdit::singleline(&mut p.name).desired_width(90.0));
-                ui.add(egui::TextEdit::singleline(&mut p.expr).desired_width(120.0));
+                ui.add_sized([100.0, 22.0], egui::TextEdit::singleline(&mut p.name));
+                ui.add_sized([130.0, 22.0], egui::TextEdit::singleline(&mut p.expr));
                 match (app.model.params.values.get(&p.name), app.model.params.errors.get(&p.name)) {
                     (_, Some(e)) => ui.label(RichText::new(ic::WARNING).color(theme::ERR)).on_hover_text(e),
                     (Some(v), _) => ui.label(fmt_num(*v)),
                     _ => ui.label("—"),
                 };
-                ui.add(egui::TextEdit::singleline(&mut p.comment).desired_width(110.0));
+                ui.add_sized([150.0, 22.0], egui::TextEdit::singleline(&mut p.comment));
                 if ui.small_button(ic::TRASH).clicked() {
                     remove = Some(i);
                 }

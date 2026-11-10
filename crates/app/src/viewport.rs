@@ -965,7 +965,7 @@ fn welcome(app: &mut App, ui: &mut egui::Ui, view: &View) {
     let pos = view.rect.center() - EVec2::new(170.0, 150.0);
     egui::Area::new(egui::Id::new("welcome")).fixed_pos(pos).order(egui::Order::Middle).show(ui.ctx(), |ui| {
         egui::Frame::new()
-            .fill(Color32::from_rgba_unmultiplied(28, 31, 36, 235))
+            .fill(Color32::from_rgb(28, 31, 36))
             .stroke(egui::Stroke::new(1.0, Color32::from_rgb(55, 62, 72)))
             .corner_radius(12)
             .inner_margin(18)
