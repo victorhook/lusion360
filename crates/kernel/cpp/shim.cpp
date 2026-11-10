@@ -188,7 +188,13 @@ std::unique_ptr<Shape> make_compound(const std::vector<Shape>& shapes) {
 rust::Vec<double> shape_bbox(const Shape& s) {
   rust::Vec<double> out;
   Bnd_Box box;
-  if (!s.IsNull()) BRepBndLib::Add(s, box);
+  if (!s.IsNull()) {
+    try {
+      BRepBndLib::AddOptimal(s, box, false, false);
+    } catch (...) {
+      BRepBndLib::Add(s, box);
+    }
+  }
   if (box.IsVoid()) return out;
   double x0, y0, z0, x1, y1, z1;
   box.Get(x0, y0, z0, x1, y1, z1);
