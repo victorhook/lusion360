@@ -7,6 +7,7 @@ pub mod io;
 pub mod model;
 pub mod sketch;
 pub mod tess;
+pub mod text;
 
 pub use doc::*;
 pub use model::{Body, Model, ModelState, SolvedSketch};

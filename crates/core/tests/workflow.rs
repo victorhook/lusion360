@@ -381,3 +381,32 @@ fn shell_and_chamfer() {
     let v = model.current(&doc).bodies[&bid].shape.volume().unwrap();
     assert!(v > 0.0 && v < 30.0 * 20.0 * 10.0 * 0.5, "shelled volume {v}");
 }
+
+#[test]
+fn text_emboss() {
+    let mut doc = Document::default();
+    let mut model = Model::new();
+    let mut s = Sketch::new(PlaneRef::Origin(OriginPlane::XY));
+    let a = s.add_point(DVec2::new(0.0, 0.0));
+    s.add_text(a, "Hi8", "10");
+    let s1 = doc.insert_feature("S".into(), ROOT, FeatureKind::Sketch(s));
+    model.update(&doc);
+    ok(&model);
+    let ss = &model.current(&doc).sketches[&s1];
+    // H, i (stem + dot), 8 (outer + two holes = outer region + 2 hole regions)
+    assert!(ss.profiles.len() >= 4, "profiles {}", ss.profiles.len());
+    let refs: Vec<ProfileRef> = ss
+        .profiles
+        .iter()
+        .map(|p| ProfileRef::Sketch { sketch: s1, curves: p.curves.clone(), hint: p.hint.to_array() })
+        .collect();
+    // extrude only the solid glyph regions: the hole regions of "8" are inside another region
+    doc.insert_feature(
+        "E".into(),
+        ROOT,
+        FeatureKind::Extrude(Extrude { profiles: refs, distance: "2".into(), distance2: String::new(), mode: ExtentMode::OneSide, start_offset: String::new(), op: Operation::NewBody, targets: vec![] }),
+    );
+    model.update(&doc);
+    ok(&model);
+    assert!(!model.current(&doc).bodies.is_empty());
+}

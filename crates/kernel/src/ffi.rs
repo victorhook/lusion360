@@ -11,6 +11,8 @@ pub mod bridge {
         edge_points: Vec<f32>,
         /// `edge_points` vertex offsets; edge i = [edge_ranges[i], edge_ranges[i+1])
         edge_ranges: Vec<u32>,
+        /// 1 if the edge joins two faces smoothly (tangent / nearly flat)
+        edge_smooth: Vec<u8>,
     }
 
     #[derive(Debug, Clone, Copy, Default)]

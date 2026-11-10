@@ -15,6 +15,8 @@ pub struct BodyMesh {
     pub tri_face: Vec<u32>,
     /// polyline per B-rep edge (edge order)
     pub edges: Vec<Vec<[f32; 3]>>,
+    /// per edge: joins two faces smoothly (drawn faint)
+    pub edge_smooth: Vec<bool>,
     pub bbox: ([f32; 3], [f32; 3]),
 }
 
@@ -31,7 +33,8 @@ impl BodyMesh {
             edges.push((a..b).map(|i| [m.edge_points[3 * i], m.edge_points[3 * i + 1], m.edge_points[3 * i + 2]]).collect());
         }
         let bbox = bounds(&positions);
-        Ok(BodyMesh { positions, normals, indices: m.indices, tri_face: m.tri_face, edges, bbox })
+        let edge_smooth = m.edge_smooth.iter().map(|s| *s != 0).collect();
+        Ok(BodyMesh { positions, normals, indices: m.indices, tri_face: m.tri_face, edges, edge_smooth, bbox })
     }
 
     pub fn from_import(m: &ImportMesh) -> BodyMesh {
@@ -51,6 +54,7 @@ impl BodyMesh {
             indices: tm.indices,
             tri_face: vec![0; n],
             edges: vec![],
+            edge_smooth: vec![],
             bbox,
         }
     }
@@ -63,6 +67,7 @@ impl BodyMesh {
             indices: tm.indices.clone(),
             tri_face: vec![0; n],
             edges: vec![],
+            edge_smooth: vec![],
             bbox: bounds(&tm.positions),
         }
     }

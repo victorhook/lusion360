@@ -564,7 +564,7 @@ impl Ctx<'_> {
                 self.warnings.push(e.clone());
             }
         }
-        let profiles = match compute_profiles(&solved, &frame, f.id) {
+        let profiles = match compute_profiles(&solved, &frame, f.id, self.params) {
             Ok(p) => p,
             Err(e) => {
                 self.warnings.push(format!("profile detection failed: {e}"));
@@ -1014,6 +1014,33 @@ impl Ctx<'_> {
     }
 }
 
+/// Profiles that make up the filled glyphs of text `tid` (excludes counters
+/// like the inside of an "o"), by even-odd depth among the glyph contours.
+pub fn text_fill_profiles(ss: &SolvedSketch, tid: u32, params: &ParamValues) -> Vec<usize> {
+    let Some(t) = ss.sketch.texts.iter().find(|t| t.id == tid) else { return vec![] };
+    let contours = ss.sketch.text_outlines(t, params);
+    let inside = |p: DVec2, poly: &[DVec2]| {
+        let mut c = false;
+        let n = poly.len();
+        let mut j = n - 1;
+        for i in 0..n {
+            let (a, b) = (poly[i], poly[j]);
+            if (a.y > p.y) != (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x {
+                c = !c;
+            }
+            j = i;
+        }
+        c
+    };
+    ss.profiles
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.curves.contains(&tid))
+        .filter(|(_, p)| contours.iter().filter(|c| inside(p.hint, c)).count() % 2 == 1)
+        .map(|(i, _)| i)
+        .collect()
+}
+
 pub fn find_profile<'a>(ss: &'a SolvedSketch, curves: &[u32], hint: DVec2) -> Option<&'a Profile> {
     let mut want: Vec<u32> = curves.to_vec();
     want.sort_unstable();
@@ -1040,7 +1067,7 @@ pub fn find_profile<'a>(ss: &'a SolvedSketch, curves: &[u32], hint: DVec2) -> Op
 }
 
 /// Closed regions of a solved sketch.
-pub fn compute_profiles(s: &Sketch, frame: &Frame, sid: FeatureId) -> Result<Vec<Profile>, String> {
+pub fn compute_profiles(s: &Sketch, frame: &Frame, sid: FeatureId, params: &ParamValues) -> Result<Vec<Profile>, String> {
     let mut edges = Vec::new();
     for c in s.curves.iter().filter(|c| !c.construction) {
         let e = match c.geom {
@@ -1069,6 +1096,22 @@ pub fn compute_profiles(s: &Sketch, frame: &Frame, sid: FeatureId) -> Result<Vec
             Err(_) => continue,
         }
     }
+    // text outlines become closed polygons of line edges
+    let mut text_segs: Vec<(u32, DVec2, DVec2)> = Vec::new();
+    for t in &s.texts {
+        for c in s.text_outlines(t, params) {
+            for i in 0..c.len() {
+                let (a, b) = (c[i], c[(i + 1) % c.len()]);
+                if (a - b).length() < 1e-9 {
+                    continue;
+                }
+                if let Ok(e) = k::line(frame.to3(a), frame.to3(b)) {
+                    edges.push(e);
+                    text_segs.push((t.id, a, b));
+                }
+            }
+        }
+    }
     if edges.is_empty() {
         return Ok(vec![]);
     }
@@ -1093,10 +1136,17 @@ pub fn compute_profiles(s: &Sketch, frame: &Frame, sid: FeatureId) -> Result<Vec
                 .filter(|c| !c.construction)
                 .map(|c| (c.id, s.curve_distance(c, m2)))
                 .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-            if let Some((cid, d)) = best {
-                if d < scale * 1e-5 + 1e-6 {
+            let tol = scale * 1e-5 + 1e-6;
+            match best {
+                Some((cid, d)) if d < tol => {
                     curves.push(cid);
                     edge_names.insert(e.hash(), format!("s{sid}.c{cid}"));
+                }
+                _ => {
+                    if let Some((tid, _, _)) = text_segs.iter().find(|(_, a, b)| crate::sketch::dist_point_segment(m2, *a, *b) < tol) {
+                        curves.push(*tid);
+                        edge_names.insert(e.hash(), format!("s{sid}.t{tid}"));
+                    }
                 }
             }
         }

@@ -399,10 +399,12 @@ impl Renderer {
         }
         let mut segs: Vec<LineSeg> = Vec::new();
         let mut edge_ranges = Vec::with_capacity(m.edges.len());
-        for e in &m.edges {
+        for (i, e) in m.edges.iter().enumerate() {
             let s = segs.len() as u32;
+            let smooth = m.edge_smooth.get(i).copied().unwrap_or(false);
+            let (color, width) = if smooth { ([1.0, 1.0, 1.0, 0.16], 0.8) } else { ([1.0; 4], 1.0) };
             for w in e.windows(2) {
-                segs.push(LineSeg { p0: w[0], p1: w[1], color: [1.0; 4], width: 1.0 });
+                segs.push(LineSeg { p0: w[0], p1: w[1], color, width });
             }
             edge_ranges.push(s..segs.len() as u32);
         }

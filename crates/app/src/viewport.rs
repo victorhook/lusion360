@@ -536,6 +536,15 @@ fn build_scene(app: &mut App, view: &View) -> Scene {
                 push_polyline(&mut scene.lines, &pts, theme::SK_INACTIVE, 1.6);
             }
         }
+        for t in &ss.sketch.texts {
+            for c in ss.sketch.text_outlines(t, &app.model.params) {
+                let mut pts: Vec<Vec3> = c.iter().map(|p| ss.frame.to3(*p).as_vec3()).collect();
+                if let Some(f0) = pts.first().copied() {
+                    pts.push(f0);
+                }
+                push_polyline(&mut scene.lines, &pts, theme::SK_INACTIVE, 1.2);
+            }
+        }
         if !in_sketch {
             for p in &ss.profiles {
                 push_tris2(&mut scene, &ss.frame, &p.tris, theme::PROFILE);

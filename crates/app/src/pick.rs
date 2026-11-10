@@ -173,3 +173,47 @@ pub fn seg_dist(p: Vec2, a: Vec2, b: Vec2) -> (f32, f32) {
     let t = if l2 < 1e-12 { 0.0 } else { ((p - a).dot(d) / l2).clamp(0.0, 1.0) };
     ((p - (a + d * t)).length(), t)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::camera::Ray;
+
+    #[test]
+    fn bvh_hits_bracket_top() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/bracket.l360");
+        let Ok(doc) = lusion_core::io::load_native(std::path::Path::new(path)) else { return };
+        let mut m = lusion_core::model::Model::new();
+        m.update(&doc);
+        let b = m.current(&doc).bodies.values().next().unwrap();
+        let mesh = BodyMesh::from_shape(&b.shape).unwrap();
+        let bvh = Bvh::build(&mesh);
+        let mut misses = 0;
+        let mut brute_misses = 0;
+        for i in 0..20 {
+            for j in 0..10 {
+                let x = -35.0 + i as f32 * 3.5;
+                let y = -22.0 + j as f32 * 4.5;
+                let o = Vec3::new(120.0, -150.0, 110.0);
+                let ray = Ray { o, d: (Vec3::new(x, y, 6.0) - o).normalize() };
+                let hit = bvh.raycast(&mesh, &ray);
+                // brute force
+                let mut best: Option<f32> = None;
+                for t in 0..mesh.indices.len() / 3 {
+                    let [a, b2, c] = tri(&mesh, t as u32);
+                    if let Some(d) = ray_tri(ray.o, ray.d, a, b2, c) {
+                        best = Some(best.map_or(d, |x: f32| x.min(d)));
+                    }
+                }
+                if best.is_none() {
+                    brute_misses += 1;
+                }
+                if hit.map(|h| h.0) != best {
+                    misses += 1;
+                }
+            }
+        }
+        assert!(brute_misses < 10, "brute force misses {brute_misses}");
+        assert_eq!(misses, 0, "bvh disagrees with brute force");
+    }
+}

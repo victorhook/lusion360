@@ -70,6 +70,8 @@ pub struct Command {
     drag: Option<f64>,
     /// automatic Join/Cut switching (until the user picks an operation)
     auto_op: Option<Operation>,
+    /// guard against re-expanding text picks
+    expanding: bool,
 }
 
 // ------------------------------------------------------------------ refs <-> picks
@@ -134,7 +136,7 @@ pub fn start(app: &mut App, kind: CmdKind) {
     if let Mode::Sketch(_) = app.mode {
         crate::sketch_mode::finish(app);
     }
-    let mut c = Command { kind, fid: None, editing: false, before: app.doc.clone(), prev_marker: app.doc.marker, stage: 0, drag: None, auto_op: None };
+    let mut c = Command { kind, fid: None, editing: false, before: app.doc.clone(), prev_marker: app.doc.marker, stage: 0, drag: None, auto_op: None, expanding: false };
     let sel = std::mem::take(&mut app.selection);
     app.cmd = None;
     // pre-selection
@@ -189,7 +191,7 @@ pub fn edit(app: &mut App, fid: FeatureId) {
     let prev_marker = app.doc.marker;
     app.doc.marker = idx + 1;
     app.selection.clear();
-    app.cmd = Some(Command { kind, fid: Some(fid), editing: true, before, prev_marker, stage: 0, drag: None, auto_op: None });
+    app.cmd = Some(Command { kind, fid: Some(fid), editing: true, before, prev_marker, stage: 0, drag: None, auto_op: None, expanding: false });
 }
 
 pub fn ok(app: &mut App) {
@@ -441,6 +443,42 @@ impl Command {
                         r.axis = a;
                     }
                     return;
+                }
+                // clicking any letter of a text selects the whole text
+                if let (Pick::Profile { sketch, index }, false) = (hit.pick, self.expanding) {
+                    if let Some(ss) = st.sketches.get(&sketch) {
+                        let p = &ss.profiles[index];
+                        let tids: Vec<u32> = ss.sketch.texts.iter().map(|t| t.id).filter(|t| p.curves.contains(t)).collect();
+                        if let Some(&tid) = tids.first() {
+                            let all = lusion_core::model::text_fill_profiles(ss, tid, &app.model.params);
+                            if all.len() > 1 {
+                                let refs: Vec<ProfileRef> = all.iter().filter_map(|i| profile_ref(&st, sketch, *i)).collect();
+                                let first = refs[0].clone();
+                                if self.fid.is_none() {
+                                    self.expanding = true;
+                                    self.on_pick(app, Hit { pick: Pick::Profile { sketch, index: all[0] }, ..hit });
+                                    self.expanding = false;
+                                }
+                                let list = match self.feature_mut(app) {
+                                    Some(FeatureKind::Extrude(e)) => &mut e.profiles,
+                                    Some(FeatureKind::Revolve(r)) => &mut r.profiles,
+                                    _ => return,
+                                };
+                                let already = refs.iter().all(|r| list.iter().any(|x| same_profile(x, r)));
+                                if already && list.len() > refs.len() {
+                                    list.retain(|x| !refs.iter().any(|r| same_profile(x, r)));
+                                } else {
+                                    for r in refs {
+                                        if !list.iter().any(|x| same_profile(x, &r)) {
+                                            list.push(r);
+                                        }
+                                    }
+                                }
+                                let _ = first;
+                                return;
+                            }
+                        }
+                    }
                 }
                 let pr = match hit.pick {
                     Pick::Profile { sketch, index } => profile_ref(&st, sketch, index),

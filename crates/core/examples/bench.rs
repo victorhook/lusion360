@@ -39,7 +39,7 @@ fn main() {
         for r in &regions { let _ = r.mesh(2.0, 0.6); }
         println!("  mesh regions: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
         let t = Instant::now();
-        let p = lusion_core::model::compute_profiles(&s2, &f, 1).unwrap();
+        let p = lusion_core::model::compute_profiles(&s2, &f, 1, &Default::default()).unwrap();
         println!("  profiles: {:.1} ms ({})", t.elapsed().as_secs_f64() * 1e3, p.len());
     }
     let sid = doc.insert_feature("S".into(), ROOT, FeatureKind::Sketch(s));

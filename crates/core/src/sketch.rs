@@ -146,6 +146,16 @@ pub struct SkConstraint {
     pub c: Constraint,
 }
 
+/// Text placed at a sketch point (baseline-left corner).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkText {
+    pub id: u32,
+    pub anchor: PId,
+    pub text: String,
+    /// capital-letter height (expression, mm)
+    pub height: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Sketch {
     pub plane: PlaneRef,
@@ -155,6 +165,8 @@ pub struct Sketch {
     pub curves: Vec<SkCurve>,
     #[serde(default)]
     pub constraints: Vec<SkConstraint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub texts: Vec<SkText>,
     #[serde(default = "one")]
     pub next_id: u32,
 }
@@ -218,7 +230,7 @@ impl SolveReport {
 
 impl Sketch {
     pub fn new(plane: PlaneRef) -> Self {
-        Sketch { plane, points: vec![], curves: vec![], constraints: vec![], next_id: 1 }
+        Sketch { plane, points: vec![], curves: vec![], constraints: vec![], texts: vec![], next_id: 1 }
     }
     fn alloc(&mut self) -> u32 {
         let id = self.next_id;
@@ -249,6 +261,17 @@ impl Sketch {
     }
     pub fn add_line(&mut self, a: PId, b: PId) -> CId {
         self.add_curve(CurveGeom::Line { a, b }, false)
+    }
+    pub fn add_text(&mut self, anchor: PId, text: &str, height: &str) -> u32 {
+        let id = self.alloc();
+        self.texts.push(SkText { id, anchor, text: text.into(), height: height.into() });
+        id
+    }
+    /// Outlines of a text entity in sketch coordinates.
+    pub fn text_outlines(&self, t: &SkText, params: &ParamValues) -> Vec<Vec<DVec2>> {
+        let h = params.eval(&t.height).unwrap_or(5.0).abs().max(0.01);
+        let o = self.pos(t.anchor);
+        crate::text::outlines(&t.text, h).into_iter().map(|c| c.into_iter().map(|p| p + o).collect()).collect()
     }
     pub fn add_constraint(&mut self, c: Constraint) -> KId {
         let id = self.alloc();
@@ -286,6 +309,8 @@ impl Sketch {
         self.points.retain(|p| !dead_p.contains(&p.id) && !(orphans.contains(&p.id) && !used.contains(&p.id)));
         let dead_k: HashSet<KId> = cons.iter().copied().collect();
         let live_p: HashSet<PId> = self.points.iter().map(|p| p.id).collect();
+        // texts are addressed like curves (by id); their anchor must survive
+        self.texts.retain(|t| !dead_c.contains(&t.id) && live_p.contains(&t.anchor));
         let live_c: HashSet<CId> = self.curves.iter().map(|c| c.id).collect();
         self.constraints.retain(|k| {
             !dead_k.contains(&k.id)
@@ -618,6 +643,14 @@ impl Sketch {
         for p in &self.points {
             lo = lo.min(p.pos());
             hi = hi.max(p.pos());
+        }
+        for t in &self.texts {
+            for c in self.text_outlines(t, &ParamValues::default()) {
+                for p in c {
+                    lo = lo.min(p);
+                    hi = hi.max(p);
+                }
+            }
         }
         (lo.x <= hi.x).then_some((lo, hi))
     }

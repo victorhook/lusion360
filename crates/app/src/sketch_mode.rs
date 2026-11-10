@@ -79,6 +79,7 @@ pub enum SkTool {
     Dimension,
     Trim,
     Fillet,
+    Text,
     Con(ConKind),
 }
 
@@ -95,6 +96,7 @@ impl SkTool {
             SkTool::Dimension => "Click a line, circle, two points, point + line or two lines. Click again to place.",
             SkTool::Trim => "Click the part of a curve to remove.",
             SkTool::Fillet => "Click a corner where two lines meet to round it.",
+            SkTool::Text => "Click where the text should start (baseline, left).",
             SkTool::Con(_) => "Pick the entities to constrain.",
         }
     }
@@ -105,6 +107,7 @@ pub enum SkEnt {
     Point(PId),
     Curve(CId),
     Con(KId),
+    Text(u32),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -151,6 +154,8 @@ pub struct SketchSession {
     refs: Option<Vec<DVec2>>,
     /// value typed while drawing (Fusion-style heads-up input)
     typed: Option<String>,
+    /// text being edited: (id, text, height, newly created)
+    text_edit: Option<(u32, String, String, bool)>,
 }
 
 // ------------------------------------------------------------------ enter / leave
@@ -193,6 +198,7 @@ pub fn enter_with_before(app: &mut App, fid: FeatureId, before: Document, create
         cam_before: Some(app.cam.cam),
         refs: None,
         typed: None,
+        text_edit: None,
     };
     if !created {
         s.tool = SkTool::Select;
@@ -622,6 +628,17 @@ fn attach(sk: &mut Sketch, p: PId, own: CId) {
 
 // ------------------------------------------------------------------ picking in 2D
 
+fn text_hit(sk: &Sketch, p: DVec2, params: &lusion_core::expr::ParamValues) -> Option<u32> {
+    sk.texts.iter().find_map(|t| {
+        let h = params.eval(&t.height).unwrap_or(5.0).abs();
+        let (lo, hi) = lusion_core::text::bounds(&t.text, h)?;
+        let o = sk.pos(t.anchor);
+        let pad = h * 0.1;
+        let (lo, hi) = (lo + o - DVec2::splat(pad), hi + o + DVec2::splat(pad));
+        (p.x >= lo.x && p.x <= hi.x && p.y >= lo.y && p.y <= hi.y).then_some(t.id)
+    })
+}
+
 fn nearest_point(sk: &Sketch, p: DVec2, tol: f64, exclude: &[PId]) -> Option<PId> {
     sk.points
         .iter()
@@ -871,6 +888,9 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
             if hover.is_none() {
                 hover = nearest_curve(&sk, p, px * 6.0).map(SkEnt::Curve);
             }
+            if hover.is_none() && tool != SkTool::Trim && tool != SkTool::Fillet {
+                hover = text_hit(&sk, p, &app.model.params).map(SkEnt::Text);
+            }
         }
     }
     session(app).unwrap().hover = hover;
@@ -886,7 +906,9 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
             });
             let hover_at_press = press2.and_then(|pp| {
                 let lbl = press.and_then(|m| dim_label_hit(app, fid, &View { mouse: Some(m), ..*view })).map(SkEnt::Con);
-                lbl.or_else(|| nearest_point(&sk, pp, px * 8.0, &[]).map(SkEnt::Point)).or_else(|| nearest_curve(&sk, pp, px * 6.0).map(SkEnt::Curve))
+                lbl.or_else(|| nearest_point(&sk, pp, px * 8.0, &[]).map(SkEnt::Point))
+                    .or_else(|| nearest_curve(&sk, pp, px * 6.0).map(SkEnt::Curve))
+                    .or_else(|| text_hit(&sk, pp, &app.model.params).map(SkEnt::Text))
             });
             let hover = hover_at_press.or(hover);
             let p2 = press2.or(p2);
@@ -910,6 +932,10 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
                             }
                         }
                     }
+                    SkEnt::Text(tid) => sk.texts.iter().find(|t| t.id == tid).and_then(|t| {
+                        let fixed = sk.point(t.anchor).map(|q| q.fixed).unwrap_or(true);
+                        (!fixed).then(|| Drag { points: vec![(t.anchor, sk.pos(t.anchor))], radius: None, label: None, start: p, before, moved: false })
+                    }),
                     SkEnt::Con(kid) => sk.constraints.iter().find(|k| k.id == kid).and_then(|k| match &k.c {
                         Constraint::Dimension { offset, .. } => Some(Drag { points: vec![], radius: None, label: Some((kid, *offset)), start: p, before, moved: false }),
                         _ => None,
@@ -985,6 +1011,12 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
             start_dim_edit(app, kid);
             return;
         }
+        if let Some(SkEnt::Text(tid)) = hover {
+            if let Some(t) = sk.texts.iter().find(|t| t.id == tid) {
+                session(app).unwrap().text_edit = Some((tid, t.text.clone(), t.height.clone(), false));
+            }
+            return;
+        }
         if tool == SkTool::Line {
             session(app).unwrap().chain.clear();
             return;
@@ -1019,6 +1051,24 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
                 draw_click(app, fid, cursor, snap);
             }
             SkTool::Dimension => dim_click(app, fid, hover, p),
+            SkTool::Text => {
+                let before = app.doc.clone();
+                let tid = sketch_mut(app, fid).map(|skm| {
+                    let mut cons = vec![];
+                    let a = point_at(skm, cursor, snap, &mut cons);
+                    for c in cons {
+                        skm.add_constraint(c);
+                    }
+                    skm.add_text(a, "Text", "5")
+                });
+                solve(app, &[], true);
+                commit(app, before);
+                if let Some(tid) = tid {
+                    let s = session(app).unwrap();
+                    s.text_edit = Some((tid, "Text".into(), "5".into(), true));
+                    s.tool = SkTool::Select;
+                }
+            }
             SkTool::Fillet => {
                 if let Some(SkEnt::Point(pid)) = hover {
                     let before = app.doc.clone();
@@ -1185,7 +1235,7 @@ pub fn delete_selection(app: &mut App) {
     for e in sel {
         match e {
             SkEnt::Point(p) => pts.push(p),
-            SkEnt::Curve(c) => cs.push(c),
+            SkEnt::Curve(c) | SkEnt::Text(c) => cs.push(c),
             SkEnt::Con(k) => ks.push(k),
         }
     }
@@ -1633,6 +1683,7 @@ fn dim_click(app: &mut App, fid: FeatureId, hover: Option<SkEnt>, p: DVec2) {
             start_dim_edit(app, kid);
             return;
         }
+        Some(SkEnt::Text(_)) => return,
         None => {
             // click in empty space: place a pending single-line dimension
             if let [SkEnt::Curve(c)] = picks[..] {
@@ -1837,6 +1888,18 @@ pub fn draw(app: &mut App, scene: &mut Scene, view: &View) {
         let col = sk_color(s, SkEnt::Point(p.id), fixed, false, false);
         let size = if s.hover == Some(SkEnt::Point(p.id)) { 10.0 } else if p.fixed { 8.0 } else { 6.5 };
         scene.points.push(PointInst { p: f.to3(p.pos()).as_vec3().to_array(), color: col, size });
+    }
+    // texts
+    let params = app.model.params.clone();
+    for t in &sk.texts {
+        let col = sk_color(s, SkEnt::Text(t.id), s.report.fixed_points.contains(&t.anchor), false, false);
+        for c in sk.text_outlines(t, &params) {
+            let mut pts: Vec<Vec3> = c.iter().map(|p| f.to3(*p).as_vec3()).collect();
+            if let Some(first) = pts.first().copied() {
+                pts.push(first);
+            }
+            push_polyline(&mut scene.overlay_lines, &pts, col, 1.6);
+        }
     }
     // rubber band preview
     if let Some(cur) = s.cursor {
@@ -2068,6 +2131,84 @@ pub fn overlay(app: &mut App, ui: &mut egui::Ui, view: &View) {
             }
         }
     }
+    // text editor popup
+    let te = match &mut app.mode {
+        Mode::Sketch(s) => s.text_edit.take(),
+        _ => None,
+    };
+    if let Some((tid, mut text, mut height, is_new)) = te {
+        let anchor = sk.texts.iter().find(|t| t.id == tid).map(|t| sk.pos(t.anchor));
+        let pos = anchor.and_then(|a| proj(a)).unwrap_or(view.rect.center()) + egui::vec2(10.0, 16.0);
+        let mut keep = true;
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Area::new(egui::Id::new("text_edit")).fixed_pos(pos).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.label(RichText::new(format!("{} Text", ic::TEXT_T)).strong());
+                let r = ui.add(egui::TextEdit::multiline(&mut text).desired_rows(1).desired_width(200.0));
+                if is_new && !ui.memory(|m| m.has_focus(r.id)) && text == "Text" {
+                    r.request_focus();
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Height");
+                    ui.add(egui::TextEdit::singleline(&mut height).desired_width(60.0));
+                    ui.label(RichText::new("mm").color(theme::TEXT_DIM));
+                });
+                ui.horizontal(|ui| {
+                    if ui.button(format!("{} OK", ic::CHECK)).clicked() {
+                        apply = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command) {
+                    apply = true;
+                }
+            });
+        });
+        if apply || cancel {
+            keep = false;
+        }
+        let fid = match &app.mode {
+            Mode::Sketch(s) => s.fid,
+            _ => return,
+        };
+        if apply && !text.trim().is_empty() {
+            let before = app.doc.clone();
+            if let Some(skm) = sketch_mut(app, fid) {
+                if let Some(t) = skm.texts.iter_mut().find(|t| t.id == tid) {
+                    t.text = text.clone();
+                    t.height = if height.trim().is_empty() { "5".into() } else { height.clone() };
+                }
+            }
+            commit(app, before);
+        } else if (cancel && is_new) || (apply && text.trim().is_empty()) {
+            if let Some(skm) = sketch_mut(app, fid) {
+                skm.delete(&[], &[tid], &[]);
+            }
+        }
+        if keep {
+            // live preview while typing
+            let height_ok = app.model.params.eval(&height).is_ok();
+            if let Some(skm) = sketch_mut(app, fid) {
+                if let Some(t) = skm.texts.iter_mut().find(|t| t.id == tid) {
+                    if !text.is_empty() {
+                        t.text = text.clone();
+                    }
+                    if height_ok {
+                        t.height = height.clone();
+                    }
+                }
+            }
+            if let Mode::Sketch(s) = &mut app.mode {
+                s.text_edit = Some((tid, text, height, is_new));
+            }
+        }
+    }
     // heads-up value box while drawing
     let typed = match &mut app.mode {
         Mode::Sketch(s) => s.typed.take().map(|t| (t, s.tool, s.cursor)),
@@ -2212,6 +2353,7 @@ pub fn toolbar(app: &mut App, ui: &mut egui::Ui) {
     tool_btn(ui, SkTool::Dimension, ic::RULER, "Dimension (D)");
     tool_btn(ui, SkTool::Trim, ic::SCISSORS, "Trim (T)");
     tool_btn(ui, SkTool::Fillet, ic::BEZIER_CURVE, "Sketch fillet: round a corner (G)");
+    tool_btn(ui, SkTool::Text, ic::TEXT_T, "Text — for embossed / engraved labels");
     ui.menu_button(RichText::new(format!("{} Constrain", ic::LINK)).size(14.0), |ui| {
         for k in ConKind::ALL {
             if ui.button(format!("{}   {}", k.glyph(), k.label())).clicked() {

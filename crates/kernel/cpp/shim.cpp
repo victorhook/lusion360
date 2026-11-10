@@ -469,9 +469,27 @@ MeshOut shape_mesh(const Shape& s, double lin, double ang) {
         out.tri_face.push_back((uint32_t)(fi - 1));
       }
     }
+    // classify smooth edges (tangent or nearly flat, < ~25 deg)
+    try {
+      BRepLib::EncodeRegularity(s, 0.44);
+    } catch (...) {
+    }
+    TopTools_IndexedDataMapOfShapeListOfShape anc;
+    TopExp::MapShapesAndUniqueAncestors(s, TopAbs_EDGE, TopAbs_FACE, anc);
     out.edge_ranges.push_back(0);
     for (int ei = 1; ei <= edges.Extent(); ++ei) {
       const TopoDS_Edge& e = TopoDS::Edge(edges(ei));
+      uint8_t smooth = 0;
+      int ai = anc.FindIndex(e);
+      if (ai > 0 && anc(ai).Extent() == 2) {
+        const TopoDS_Face& f1 = TopoDS::Face(anc(ai).First());
+        const TopoDS_Face& f2 = TopoDS::Face(anc(ai).Last());
+        try {
+          if (BRep_Tool::HasContinuity(e, f1, f2) && BRep_Tool::Continuity(e, f1, f2) != GeomAbs_C0) smooth = 1;
+        } catch (...) {
+        }
+      }
+      out.edge_smooth.push_back(smooth);
       if (!BRep_Tool::Degenerated(e)) {
         try {
           BRepAdaptor_Curve c(e);
