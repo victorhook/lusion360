@@ -1,0 +1,433 @@
+{
+  "format": 1,
+  "parameters": [
+    {
+      "name": "width",
+      "expr": "80",
+      "comment": "plate width"
+    },
+    {
+      "name": "thick",
+      "expr": "6",
+      "comment": "plate thickness"
+    }
+  ],
+  "components": [
+    {
+      "id": 0,
+      "name": "Bracket",
+      "parent": null,
+      "visible": true,
+      "color": null
+    }
+  ],
+  "features": [
+    {
+      "id": 1,
+      "name": "Base sketch",
+      "component": 0,
+      "visible": true,
+      "kind": {
+        "Sketch": {
+          "plane": {
+            "Origin": "XY"
+          },
+          "points": [
+            {
+              "id": 1,
+              "x": 0.0,
+              "y": 0.0,
+              "fixed": true
+            },
+            {
+              "id": 2,
+              "x": -40.0,
+              "y": -25.0
+            },
+            {
+              "id": 3,
+              "x": 40.0,
+              "y": -25.0
+            },
+            {
+              "id": 4,
+              "x": 40.0,
+              "y": 25.0
+            },
+            {
+              "id": 5,
+              "x": -40.0,
+              "y": 25.0
+            },
+            {
+              "id": 16,
+              "x": -30.0,
+              "y": -15.0
+            },
+            {
+              "id": 18,
+              "x": 30.0,
+              "y": -15.0
+            },
+            {
+              "id": 20,
+              "x": -30.0,
+              "y": 15.0
+            },
+            {
+              "id": 22,
+              "x": 30.0,
+              "y": 15.0
+            }
+          ],
+          "curves": [
+            {
+              "id": 6,
+              "geom": {
+                "Line": {
+                  "a": 2,
+                  "b": 3
+                }
+              }
+            },
+            {
+              "id": 7,
+              "geom": {
+                "Line": {
+                  "a": 3,
+                  "b": 4
+                }
+              }
+            },
+            {
+              "id": 8,
+              "geom": {
+                "Line": {
+                  "a": 4,
+                  "b": 5
+                }
+              }
+            },
+            {
+              "id": 9,
+              "geom": {
+                "Line": {
+                  "a": 5,
+                  "b": 2
+                }
+              }
+            },
+            {
+              "id": 17,
+              "geom": {
+                "Circle": {
+                  "c": 16,
+                  "r": 2.5
+                }
+              }
+            },
+            {
+              "id": 19,
+              "geom": {
+                "Circle": {
+                  "c": 18,
+                  "r": 2.5
+                }
+              }
+            },
+            {
+              "id": 21,
+              "geom": {
+                "Circle": {
+                  "c": 20,
+                  "r": 2.5
+                }
+              }
+            },
+            {
+              "id": 23,
+              "geom": {
+                "Circle": {
+                  "c": 22,
+                  "r": 2.5
+                }
+              }
+            }
+          ],
+          "constraints": [
+            {
+              "id": 10,
+              "c": {
+                "Horizontal": 6
+              }
+            },
+            {
+              "id": 11,
+              "c": {
+                "Horizontal": 8
+              }
+            },
+            {
+              "id": 12,
+              "c": {
+                "Vertical": 7
+              }
+            },
+            {
+              "id": 13,
+              "c": {
+                "Vertical": 9
+              }
+            },
+            {
+              "id": 14,
+              "c": {
+                "Dimension": {
+                  "kind": {
+                    "Length": 6
+                  },
+                  "expr": "width",
+                  "value": 0.0,
+                  "offset": [
+                    0.0,
+                    6.0
+                  ]
+                }
+              }
+            },
+            {
+              "id": 15,
+              "c": {
+                "Dimension": {
+                  "kind": {
+                    "Length": 7
+                  },
+                  "expr": "50",
+                  "value": 0.0,
+                  "offset": [
+                    0.0,
+                    6.0
+                  ]
+                }
+              }
+            }
+          ],
+          "next_id": 24
+        }
+      }
+    },
+    {
+      "id": 2,
+      "name": "Plate",
+      "component": 0,
+      "visible": true,
+      "kind": {
+        "Extrude": {
+          "profiles": [
+            {
+              "Sketch": {
+                "sketch": 1,
+                "curves": [
+                  6,
+                  7,
+                  8,
+                  9,
+                  17,
+                  19,
+                  21,
+                  23
+                ],
+                "hint": [
+                  9.220067342122396,
+                  -4.6057554880778
+                ]
+              }
+            }
+          ],
+          "distance": "thick",
+          "distance2": "",
+          "mode": "OneSide",
+          "start_offset": "",
+          "op": "NewBody",
+          "targets": []
+        }
+      }
+    },
+    {
+      "id": 3,
+      "name": "Boss sketch",
+      "component": 0,
+      "visible": true,
+      "kind": {
+        "Sketch": {
+          "plane": {
+            "Face": {
+              "body": 2097152,
+              "name": "f2.end",
+              "hint": [
+                0.0,
+                0.0,
+                0.0
+              ]
+            }
+          },
+          "points": [
+            {
+              "id": 1,
+              "x": 0.0,
+              "y": 0.0
+            }
+          ],
+          "curves": [
+            {
+              "id": 2,
+              "geom": {
+                "Circle": {
+                  "c": 1,
+                  "r": 12.0
+                }
+              }
+            }
+          ],
+          "constraints": [
+            {
+              "id": 3,
+              "c": {
+                "Dimension": {
+                  "kind": {
+                    "Diameter": 2
+                  },
+                  "expr": "24",
+                  "value": 0.0,
+                  "offset": [
+                    0.0,
+                    6.0
+                  ]
+                }
+              }
+            }
+          ],
+          "next_id": 4
+        }
+      }
+    },
+    {
+      "id": 4,
+      "name": "Boss",
+      "component": 0,
+      "visible": true,
+      "kind": {
+        "Extrude": {
+          "profiles": [
+            {
+              "Sketch": {
+                "sketch": 3,
+                "curves": [
+                  2
+                ],
+                "hint": [
+                  -1.8285001118977864,
+                  3.287236213684082
+                ]
+              }
+            }
+          ],
+          "distance": "15",
+          "distance2": "",
+          "mode": "OneSide",
+          "start_offset": "",
+          "op": "Join",
+          "targets": []
+        }
+      }
+    },
+    {
+      "id": 5,
+      "name": "Corners",
+      "component": 0,
+      "visible": true,
+      "kind": {
+        "Fillet": {
+          "edges": [
+            {
+              "body": 2097152,
+              "name": "f2.side(s1.c8)|f2.side(s1.c9)",
+              "hint": [
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            {
+              "body": 2097152,
+              "name": "f2.side(s1.c6)|f2.side(s1.c9)",
+              "hint": [
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            {
+              "body": 2097152,
+              "name": "f2.side(s1.c7)|f2.side(s1.c8)",
+              "hint": [
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            {
+              "body": 2097152,
+              "name": "f2.side(s1.c6)|f2.side(s1.c7)",
+              "hint": [
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            {
+              "body": 2097152,
+              "name": "f2.side(s1.c17)|f2.side(s1.c17)",
+              "hint": [
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            {
+              "body": 2097152,
+              "name": "f2.side(s1.c19)|f2.side(s1.c19)",
+              "hint": [
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            {
+              "body": 2097152,
+              "name": "f2.side(s1.c21)|f2.side(s1.c21)",
+              "hint": [
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            {
+              "body": 2097152,
+              "name": "f2.side(s1.c23)|f2.side(s1.c23)",
+              "hint": [
+                0.0,
+                0.0,
+                0.0
+              ]
+            }
+          ],
+          "radius": "5"
+        }
+      }
+    }
+  ],
+  "marker": 5,
+  "bodies": {},
+  "next_id": 6
+}

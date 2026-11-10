@@ -1,0 +1,25 @@
+[package]
+name = "lusion360"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lusion360"
+path = "src/main.rs"
+
+[dependencies]
+lusion-core = { path = "../core" }
+lusion-kernel = { path = "../kernel" }
+lusion-meshio = { path = "../meshio" }
+glam.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+log.workspace = true
+bytemuck.workspace = true
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland", "persistence"] }
+egui = "0.37"
+egui-wgpu = "0.37"
+rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
+env_logger = "0.11"
