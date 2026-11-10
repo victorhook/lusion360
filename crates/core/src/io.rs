@@ -66,9 +66,19 @@ pub fn import_into(doc: &mut Document, path: &Path, component: CompId) -> Result
             Ok(1)
         }
         e if lusion_meshio::supported_import_extensions().contains(&e) => {
-            let meshes = lusion_meshio::load_mesh_file(path)?;
+            let mut meshes = lusion_meshio::load_mesh_file(path)?;
             if meshes.is_empty() {
                 bail!("{} contains no triangles", path.display());
+            }
+            // files with very many objects (e.g. OBJ groups) become one body
+            if meshes.len() > 32 {
+                let mut merged = lusion_meshio::TriMesh { name: stem(path), ..Default::default() };
+                for m in meshes {
+                    let base = merged.positions.len() as u32;
+                    merged.positions.extend_from_slice(&m.positions);
+                    merged.indices.extend(m.indices.iter().map(|i| i + base));
+                }
+                meshes = vec![merged];
             }
             let n = meshes.len();
             for m in meshes {
