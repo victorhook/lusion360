@@ -814,6 +814,10 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
         look_at(app, fid);
     }
     keyboard(app, ui);
+    if session(app).is_none() {
+        // the sketch was finished from the keyboard
+        return;
+    }
 
     // cursor on the sketch plane
     let (p2, px) = match ray {
@@ -2332,6 +2336,78 @@ fn arrow(p: &egui::Painter, from: Pos2, to: Pos2, stroke: Stroke) {
     p.line_segment([to, to - dir * s - n * s * 0.4], stroke);
 }
 
+/// Add the edges of the face the sketch sits on as fixed sketch geometry.
+pub fn project_face_edges(app: &mut App) {
+    let Some(fid) = session(app).map(|s| s.fid) else { return };
+    let Some(sk) = sketch(app, fid).cloned() else { return };
+    let PlaneRef::Face(fr) = &sk.plane else {
+        app.info("Projection works for sketches placed on a face");
+        return;
+    };
+    let Some(frame) = frame_of(app, fid) else { return };
+    let st = app.pick_state().clone();
+    let Some(body) = st.bodies.get(&fr.body) else { return };
+    let Some(fi) = body.face_index(&fr.name) else {
+        app.error("The sketch face could not be found");
+        return;
+    };
+    let face = body.shape.faces()[fi].clone();
+    let before = app.doc.clone();
+    let Some(skm) = sketch_mut(app, fid) else { return };
+    let mut fixed_pt = |skm: &mut Sketch, p: DVec2| -> PId {
+        if let Some(id) = skm.points.iter().find(|q| (q.pos() - p).length() < 1e-7).map(|q| q.id) {
+            return id;
+        }
+        let id = skm.add_point(p);
+        skm.point_mut(id).unwrap().fixed = true;
+        id
+    };
+    let mut n = 0;
+    for e in face.edges() {
+        let Ok(info) = e.edge_info() else { continue };
+        match info.kind {
+            lusion_kernel::CurveKind::Line => {
+                let a = fixed_pt(skm, frame.to2(info.start));
+                let b = fixed_pt(skm, frame.to2(info.end));
+                if a != b {
+                    skm.add_line(a, b);
+                    n += 1;
+                }
+            }
+            lusion_kernel::CurveKind::Circle if info.closed => {
+                let c = fixed_pt(skm, frame.to2(info.center));
+                let ci = skm.add_curve(CurveGeom::Circle { c, r: info.radius }, false);
+                skm.add_constraint(Constraint::Dimension { kind: DimKind::Radius(ci), expr: fmt_num(info.radius), value: info.radius, offset: [info.radius * 0.7, info.radius * 0.7] });
+                n += 1;
+            }
+            lusion_kernel::CurveKind::Circle => {
+                let c = fixed_pt(skm, frame.to2(info.center));
+                let (mut a, mut b) = (fixed_pt(skm, frame.to2(info.start)), fixed_pt(skm, frame.to2(info.end)));
+                // make the arc counter-clockwise about the sketch normal and through the edge midpoint
+                let (cc, pa, pb, pm) = (skm.pos(c), skm.pos(a), skm.pos(b), frame.to2(info.mid));
+                if !angle_in_arc(cc, pa, pb, pm) {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                skm.add_curve(CurveGeom::Arc { c, a, b }, false);
+                n += 1;
+            }
+            _ => {
+                let pts = e.edge_polyline(0.05, 0.2);
+                let ids: Vec<PId> = pts.iter().map(|p| fixed_pt(skm, frame.to2(*p))).collect();
+                for w in ids.windows(2) {
+                    if w[0] != w[1] {
+                        skm.add_line(w[0], w[1]);
+                    }
+                }
+                n += 1;
+            }
+        }
+    }
+    solve(app, &[], true);
+    commit(app, before);
+    app.info(format!("Projected {n} edges"));
+}
+
 /// Sketch toolbar contents (shown in the top bar while sketching).
 pub fn toolbar(app: &mut App, ui: &mut egui::Ui) {
     let Mode::Sketch(s) = &app.mode else { return };
@@ -2364,5 +2440,8 @@ pub fn toolbar(app: &mut App, ui: &mut egui::Ui) {
     });
     if ui.add(egui::Button::new(RichText::new(ic::LINE_SEGMENTS).size(18.0)).min_size(egui::vec2(32.0, 30.0))).on_hover_text("Toggle construction (X)").clicked() {
         toggle_construction(app);
+    }
+    if ui.add(egui::Button::new(RichText::new(ic::SELECTION_FOREGROUND).size(18.0)).min_size(egui::vec2(32.0, 30.0))).on_hover_text("Project the outline of the face this sketch is on").clicked() {
+        project_face_edges(app);
     }
 }

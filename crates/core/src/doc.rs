@@ -108,6 +108,8 @@ pub enum ExtentMode {
     Symmetric,
     /// `distance` along the normal, `distance2` against it
     TwoSides,
+    /// through the whole model (direction from the sign of `distance`)
+    ThroughAll,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

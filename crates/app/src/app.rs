@@ -242,6 +242,21 @@ impl App {
         }
     }
 
+    /// Called after a caught panic: drop transient interaction state.
+    pub fn recover_from_panic(&mut self) {
+        if let Some(c) = self.cmd.take() {
+            // restore the pre-command document
+            self.doc = c.before;
+        }
+        if let Mode::Sketch(_) = self.mode {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::sketch_mode::finish(self)));
+            self.mode = Mode::Model;
+        }
+        self.hover = None;
+        self.selection.clear();
+        self.error("Internal error — the last action was cancelled. Your design is safe (please report this).");
+    }
+
     pub fn cancel_command(&mut self) {
         crate::commands::cancel(self);
     }
@@ -649,9 +664,15 @@ impl eframe::App for App {
         crate::panels::status_bar(self, ui);
         crate::panels::timeline(self, ui);
         crate::panels::left_panel(self, ui);
-        crate::commands::command_panel(self, ui);
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::commands::command_panel(self, ui))).is_err() {
+            self.recover_from_panic();
+        }
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
-            crate::viewport::show(self, ui);
+            // a bug in an interaction must not take the whole app (and the user's work) down
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::viewport::show(self, ui)));
+            if r.is_err() {
+                self.recover_from_panic();
+            }
         });
         crate::panels::dialogs(self, &ctx);
         crate::print::dialog(self, &ctx);

@@ -99,6 +99,12 @@ fn main() {
             eprintln!("feature {i}: {e}");
         }
     }
+    // like the UI: sketches consumed by features are hidden
+    for f in doc.features.iter_mut() {
+        if matches!(f.kind, FeatureKind::Sketch(_)) {
+            f.visible = false;
+        }
+    }
     lusion_core::io::save_native(&doc, std::path::Path::new(&out)).unwrap();
     println!("wrote {out}");
 }

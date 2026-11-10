@@ -728,7 +728,7 @@ impl Command {
     /// Fusion-style: pulling into the body cuts, pulling out joins.
     fn apply_auto_op(&self, app: &App, e: &mut Extrude) {
         let Some(base) = self.auto_op else { return };
-        if base == Operation::NewBody || e.mode != ExtentMode::OneSide {
+        if base == Operation::NewBody || !matches!(e.mode, ExtentMode::OneSide | ExtentMode::ThroughAll) {
             return;
         }
         let d = app.model.params.eval(&e.distance).unwrap_or(0.0);
@@ -979,14 +979,18 @@ fn dialog_body(c: &mut Command, app: &mut App, ui: &mut egui::Ui) -> Option<Stri
                         ExtentMode::OneSide => "One side",
                         ExtentMode::Symmetric => "Symmetric",
                         ExtentMode::TwoSides => "Two sides",
+                        ExtentMode::ThroughAll => "Through all",
                     })
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut e.mode, ExtentMode::OneSide, "One side");
                         ui.selectable_value(&mut e.mode, ExtentMode::Symmetric, "Symmetric");
                         ui.selectable_value(&mut e.mode, ExtentMode::TwoSides, "Two sides");
+                        ui.selectable_value(&mut e.mode, ExtentMode::ThroughAll, "Through all");
                     });
             });
-            expr_field(ui, app, "Distance", &mut e.distance, "mm");
+            if e.mode != ExtentMode::ThroughAll {
+                expr_field(ui, app, "Distance", &mut e.distance, "mm");
+            }
             ui.horizontal(|ui| {
                 ui.add_space(96.0);
                 if ui.small_button(format!("{} Flip", ic::ARROWS_DOWN_UP)).clicked() {

@@ -584,6 +584,19 @@ impl Ctx<'_> {
             ExtentMode::OneSide => (start, d),
             ExtentMode::Symmetric => (start - d, 2.0 * d),
             ExtentMode::TwoSides => (start - d2, d + d2),
+            ExtentMode::ThroughAll => {
+                // long enough to pass through every body
+                let mut lo = DVec3::splat(f64::INFINITY);
+                let mut hi = DVec3::splat(f64::NEG_INFINITY);
+                for b in st.bodies.values() {
+                    if let Some((a, c)) = b.shape.bbox() {
+                        lo = lo.min(a);
+                        hi = hi.max(c);
+                    }
+                }
+                let reach = if lo.x <= hi.x { (hi - lo).length() * 2.0 + 10.0 } else { 1000.0 };
+                (start, if d < 0.0 { -reach } else { reach })
+            }
         };
         if len.abs() < 1e-9 {
             return Err("extrude distance is zero".into());
