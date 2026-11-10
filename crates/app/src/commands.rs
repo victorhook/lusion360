@@ -127,6 +127,49 @@ fn same_profile(a: &ProfileRef, b: &ProfileRef) -> bool {
     }
 }
 
+/// Edges connected to `start` through tangent-continuous joints (by polyline end directions).
+fn tangent_chain(m: &lusion_core::tess::BodyMesh, start: usize) -> Vec<usize> {
+    use glam::Vec3 as V;
+    let ends = |i: usize| -> Option<[(V, V); 2]> {
+        let p = m.edges.get(i)?;
+        if p.len() < 2 {
+            return None;
+        }
+        let a = V::from_array(p[0]);
+        let a1 = V::from_array(p[1]);
+        let b = V::from_array(p[p.len() - 1]);
+        let b1 = V::from_array(p[p.len() - 2]);
+        // (position, outward direction at that end)
+        Some([(a, (a - a1).normalize_or_zero()), (b, (b - b1).normalize_or_zero())])
+    };
+    let scale = V::from_array(m.bbox.1).distance(V::from_array(m.bbox.0)).max(1e-3);
+    let tol = scale * 1e-5;
+    let mut chain = vec![start];
+    let mut stack = vec![start];
+    while let Some(e) = stack.pop() {
+        let Some(ee) = ends(e) else { continue };
+        for (p, d) in ee {
+            for j in 0..m.edges.len() {
+                if chain.contains(&j) {
+                    continue;
+                }
+                let Some(ej) = ends(j) else { continue };
+                for (q, dq) in ej {
+                    // joined end-to-end and continuing in the same direction
+                    if p.distance(q) < tol && d.dot(-dq) > 0.985 {
+                        chain.push(j);
+                        stack.push(j);
+                    }
+                }
+            }
+        }
+        if chain.len() > 500 {
+            break;
+        }
+    }
+    chain
+}
+
 // ------------------------------------------------------------------ lifecycle
 
 pub fn start(app: &mut App, kind: CmdKind) {
@@ -540,7 +583,13 @@ impl Command {
             CmdKind::Fillet | CmdKind::Chamfer => {
                 let mut refs: Vec<EdgeRef> = Vec::new();
                 match hit.pick {
-                    Pick::Edge { body, edge } => refs.extend(edge_ref(&st, body, edge)),
+                    Pick::Edge { body, edge } => {
+                        // Fusion-style: take the whole tangent chain
+                        let chain = st.bodies.get(&body).and_then(|b| app.meshes.get(b)).map(|m| tangent_chain(&m, edge as usize)).unwrap_or_else(|| vec![edge as usize]);
+                        for e in chain {
+                            refs.extend(edge_ref(&st, body, e as u32));
+                        }
+                    }
                     Pick::Face { body, face } => {
                         // all edges of the face
                         if let Some(b) = st.bodies.get(&body) {
@@ -571,14 +620,15 @@ impl Command {
                     Some(FeatureKind::Chamfer(f)) => &mut f.edges,
                     _ => return,
                 };
-                let single = refs.len() == 1;
-                for r in refs {
-                    if let Some(i) = list.iter().position(|e| e.body == r.body && e.name == r.name) {
-                        if single {
-                            list.remove(i);
+                let is_edge_pick = matches!(hit.pick, Pick::Edge { .. });
+                let all_present = refs.iter().all(|r| list.iter().any(|e| e.body == r.body && e.name == r.name));
+                if is_edge_pick && all_present {
+                    list.retain(|e| !refs.iter().any(|r| r.body == e.body && r.name == e.name));
+                } else {
+                    for r in refs {
+                        if !list.iter().any(|e| e.body == r.body && e.name == r.name) {
+                            list.push(r);
                         }
-                    } else {
-                        list.push(r);
                     }
                 }
             }
