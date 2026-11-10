@@ -345,3 +345,39 @@ fn pattern_and_mirror() {
     let v = m2.current(&doc2).bodies[&bid].shape.volume().unwrap();
     assert!((v - 300.0).abs() < 1e-6, "grid volume {v}");
 }
+
+#[test]
+fn shell_and_chamfer() {
+    let mut doc = Document::default();
+    let mut model = Model::new();
+    let mut s = Sketch::new(PlaneRef::Origin(OriginPlane::XY));
+    rect(&mut s, 0.0, 0.0, 30.0, 20.0);
+    let s1 = doc.insert_feature("S".into(), ROOT, FeatureKind::Sketch(s));
+    model.update(&doc);
+    let pr = profile_ref(&model, &doc, s1, |_| true);
+    let e1 = doc.insert_feature(
+        "E".into(),
+        ROOT,
+        FeatureKind::Extrude(Extrude { profiles: vec![pr], distance: "10".into(), distance2: String::new(), mode: ExtentMode::OneSide, start_offset: String::new(), op: Operation::NewBody, targets: vec![] }),
+    );
+    model.update(&doc);
+    let bid = *model.current(&doc).bodies.keys().next().unwrap();
+    // chamfer all top edges
+    let body = &model.current(&doc).bodies[&bid];
+    let top = format!("f{e1}.end");
+    let edges: Vec<EdgeRef> = body.edge_names.iter().filter(|n| n.contains(&top)).map(|n| EdgeRef { body: bid, name: n.clone(), hint: [0.0; 3] }).collect();
+    assert_eq!(edges.len(), 4);
+    doc.insert_feature("C".into(), ROOT, FeatureKind::Chamfer(Chamfer { edges, distance: "1".into() }));
+    model.update(&doc);
+    ok(&model);
+    // shell, removing the bottom face
+    doc.insert_feature(
+        "Sh".into(),
+        ROOT,
+        FeatureKind::Shell(Shell { body: Some(bid), faces: vec![FaceRef { body: bid, name: format!("f{e1}.start"), hint: [0.0; 3] }], thickness: "1.5".into() }),
+    );
+    model.update(&doc);
+    ok(&model);
+    let v = model.current(&doc).bodies[&bid].shape.volume().unwrap();
+    assert!(v > 0.0 && v < 30.0 * 20.0 * 10.0 * 0.5, "shelled volume {v}");
+}

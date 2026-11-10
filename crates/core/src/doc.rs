@@ -231,7 +231,7 @@ pub struct Mirror {
 }
 
 /// A B-rep imported from STEP/BREP, stored inside the document.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportShape {
     pub source: String,
     /// OCCT BREP text
@@ -239,13 +239,28 @@ pub struct ImportShape {
 }
 
 /// A triangle mesh imported from STL/OBJ/3MF/..., stored inside the document.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportMesh {
     pub source: String,
     #[serde(with = "b64_f32")]
     pub positions: Arc<Vec<f32>>,
     #[serde(with = "b64_u32")]
     pub indices: Arc<Vec<u32>>,
+}
+
+// Embedded data is shared via Arc; compare pointers first (O(1) for clones).
+impl PartialEq for ImportShape {
+    fn eq(&self, o: &Self) -> bool {
+        self.source == o.source && (Arc::ptr_eq(&self.brep, &o.brep) || self.brep == o.brep)
+    }
+}
+
+impl PartialEq for ImportMesh {
+    fn eq(&self, o: &Self) -> bool {
+        self.source == o.source
+            && (Arc::ptr_eq(&self.positions, &o.positions) || self.positions == o.positions)
+            && (Arc::ptr_eq(&self.indices, &o.indices) || self.indices == o.indices)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

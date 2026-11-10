@@ -199,6 +199,7 @@ impl App {
 
     /// Record `before` as an undo step (if the document changed).
     pub fn commit(&mut self, before: Document) {
+        crash_snapshot(&self.doc, self.dirty());
         if before != self.doc {
             self.undo.push(before);
             if self.undo.len() > 200 {
@@ -524,6 +525,32 @@ impl App {
         }
         self.cam.animate_to(to);
     }
+}
+
+static CRASH_DOC: std::sync::Mutex<Option<Document>> = std::sync::Mutex::new(None);
+
+/// Remember the latest document for the panic hook.
+pub fn crash_snapshot(doc: &Document, dirty: bool) {
+    if let Ok(mut g) = CRASH_DOC.lock() {
+        *g = dirty.then(|| doc.clone());
+    }
+}
+
+/// On panic, write the last known document to the recovery file.
+pub fn install_panic_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let (Ok(g), Some(p)) = (CRASH_DOC.try_lock(), autosave_path()) {
+            if let Some(doc) = g.as_ref() {
+                if let Some(dir) = p.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = io::save_native(doc, &p);
+                eprintln!("Lusion360 crashed; your work was saved to {}", p.display());
+            }
+        }
+        prev(info);
+    }));
 }
 
 /// Where crash-recovery snapshots go.

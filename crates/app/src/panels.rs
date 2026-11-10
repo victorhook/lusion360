@@ -539,8 +539,21 @@ fn browser(app: &mut App, ui: &mut egui::Ui) {
             app.show_origin = !app.show_origin;
         }
         ui.label(format!("{} Origin", ic::CROSSHAIR));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button(format!("{} Component", ic::PLUS)).on_hover_text("New component inside the active one").clicked() {
+                let before = app.doc.clone();
+                let name = format!("Component{}", app.doc.components.len());
+                let parent = app.active_comp;
+                let c = app.doc.add_component(&name, parent);
+                app.active_comp = c;
+                app.commit(before);
+                app.info(format!("{name} created and activated — new features go into it"));
+            }
+        });
     });
     component_tree(app, ui, ROOT, 0);
+    ui.add_space(8.0);
+    ui.label(RichText::new("Tip: drag bodies onto a component to move them.").small().color(theme::TEXT_DIM));
 }
 
 fn component_tree(app: &mut App, ui: &mut egui::Ui, cid: CompId, depth: usize) {
@@ -563,6 +576,15 @@ fn component_tree(app: &mut App, ui: &mut egui::Ui, cid: CompId, depth: usize) {
                 text = text.strong().color(theme::ACCENT);
             }
             let r = ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text("Click to activate · right-click for options");
+            // drop target for bodies dragged from the browser
+            if r.dnd_hover_payload::<BodyId>().is_some() {
+                ui.painter().rect_stroke(r.rect.expand(2.0), 4.0, egui::Stroke::new(1.5, theme::ACCENT), egui::StrokeKind::Outside);
+            }
+            if let Some(b) = r.dnd_release_payload::<BodyId>() {
+                let before = app.doc.clone();
+                app.doc.bodies.entry(*b).or_default().component = Some(cid);
+                app.commit(before);
+            }
             if r.clicked() {
                 app.active_comp = cid;
             }
@@ -647,7 +669,13 @@ fn component_tree(app: &mut App, ui: &mut egui::Ui, cid: CompId, depth: usize) {
                                 let is_mesh = st.bodies.get(&b).map(|x| x.is_mesh()).unwrap_or(false);
                                 let icon = if is_mesh { ic::TRIANGLE } else { ic::CUBE };
                                 let color = app.doc.body_props(b).color;
-                                let r = ui.selectable_label(selected, format!("{icon} {}", app.body_name(b)));
+                                let r = ui.selectable_label(selected, format!("{icon} {}", app.body_name(b))).interact(egui::Sense::click_and_drag());
+                                if r.drag_started() {
+                                    r.dnd_set_drag_payload(b);
+                                }
+                                if r.dragged() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                                }
                                 if let Some(c) = color {
                                     let rc = r.rect;
                                     ui.painter().circle_filled(egui::pos2(rc.right() + 6.0, rc.center().y), 4.0, Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8));
