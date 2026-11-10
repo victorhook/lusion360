@@ -816,7 +816,7 @@ impl Command {
         let tip = (anchor + n * d).as_vec3();
         let Some(tip_s) = app.cam.project(tip, view.size) else { return false };
         let (pressed, down, released) = ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.primary_released()));
-        if pressed && (tip_s - mouse).length() < 12.0 {
+        if pressed && (tip_s - mouse).length() < 16.0 {
             self.drag = Some(d);
         }
         if self.drag.is_some() && down {
@@ -857,12 +857,34 @@ impl Command {
     }
 
     pub fn draw(&self, app: &mut App, scene: &mut Scene, view: &View) {
-        let _ = view;
         if let Some((anchor, n, d)) = self.extrude_axis(app) {
             let a = anchor.as_vec3();
             let tip = (anchor + n * d).as_vec3();
             push_line(&mut scene.overlay_lines, a, tip, [0.25, 0.65, 1.0, 0.9], 2.0);
-            scene.points.push(crate::render::PointInst { p: tip.to_array(), color: [0.25, 0.65, 1.0, 1.0], size: 13.0 });
+            // cone arrowhead, sized in screen pixels
+            let px = app.cam.cam.px_size(view.size.y) * if app.cam.cam.ortho { 1.0 } else { (tip - app.cam.cam.eye()).length() / app.cam.cam.distance.max(1e-6) };
+            let dir = (n.as_vec3() * if d < 0.0 { -1.0 } else { 1.0 }).normalize();
+            let (h, r) = (px * 26.0, px * 9.0);
+            let base = tip;
+            let apex = base + dir * h;
+            let u = dir.any_orthonormal_vector();
+            let v = dir.cross(u);
+            let segs = 20;
+            for i in 0..segs {
+                let t0 = i as f32 / segs as f32 * std::f32::consts::TAU;
+                let t1 = (i + 1) as f32 / segs as f32 * std::f32::consts::TAU;
+                let p0 = base + (u * t0.cos() + v * t0.sin()) * r;
+                let p1 = base + (u * t1.cos() + v * t1.sin()) * r;
+                // shade sides by facing for a bit of depth
+                let side = (u * t0.cos() + v * t0.sin()).dot(-app.cam.cam.forward()).max(0.0);
+                let c = [0.20 + 0.25 * side, 0.55 + 0.25 * side, 1.0, 0.97];
+                for p in [apex, p0, p1] {
+                    scene.fills.push(crate::render::FillVert { p: p.to_array(), color: c });
+                }
+                for p in [base, p1, p0] {
+                    scene.fills.push(crate::render::FillVert { p: p.to_array(), color: [0.12, 0.35, 0.75, 0.97] });
+                }
+            }
             scene.points.push(crate::render::PointInst { p: a.to_array(), color: [0.9, 0.9, 0.95, 1.0], size: 7.0 });
         }
     }
