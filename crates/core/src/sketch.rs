@@ -840,7 +840,7 @@ fn build_eq(sk: &Sketch, k: &SkConstraint, dims: &HashMap<KId, f64>, curves: &Ha
                     let best = cands
                         .iter()
                         .copied()
-                        .min_by(|x, y| ang_diff(*x, cur).partial_cmp(&ang_diff(*y, cur)).unwrap())
+                        .min_by(|x, y| ang_diff(*x, cur).total_cmp(&ang_diff(*y, cur)))
                         .unwrap();
                     EqKind::Angle(a, b, c, d, best)
                 }

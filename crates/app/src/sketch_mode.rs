@@ -154,8 +154,8 @@ pub struct SketchSession {
     refs: Option<Vec<DVec2>>,
     /// value typed while drawing (Fusion-style heads-up input)
     typed: Option<String>,
-    /// text being edited: (id, text, height, newly created)
-    text_edit: Option<(u32, String, String, bool)>,
+    /// text being edited: (id, text, height, newly created, original text, original height)
+    text_edit: Option<(u32, String, String, bool, String, String)>,
 }
 
 // ------------------------------------------------------------------ enter / leave
@@ -166,6 +166,9 @@ pub fn enter(app: &mut App, fid: FeatureId) {
 }
 
 pub fn enter_with_before(app: &mut App, fid: FeatureId, before: Document, created: bool) {
+    if let Mode::Sketch(_) = app.mode {
+        finish(app);
+    }
     let Some(idx) = app.doc.feature_index(fid) else { return };
     if app.cmd.is_some() {
         crate::commands::cancel(app);
@@ -413,7 +416,7 @@ fn trim(sk: &mut Sketch, cid: CId, at: DVec2) -> bool {
             let l2 = d.length_squared().max(1e-24);
             let tc = (at - pa).dot(d) / l2;
             let mut ts: Vec<f64> = xs.iter().map(|p| (*p - pa).dot(d) / l2).filter(|t| *t > 1e-6 && *t < 1.0 - 1e-6).collect();
-            ts.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            ts.sort_by(|x, y| x.total_cmp(y));
             let lo = ts.iter().copied().filter(|t| *t < tc).last();
             let hi = ts.iter().copied().find(|t| *t > tc);
             match (lo, hi) {
@@ -447,7 +450,7 @@ fn trim(sk: &mut Sketch, cid: CId, at: DVec2) -> bool {
         CurveGeom::Circle { c: cc, r } => {
             let pc = sk.pos(cc);
             let mut angs: Vec<f64> = xs.iter().map(|p| (*p - pc).to_angle()).collect();
-            angs.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            angs.sort_by(|x, y| x.total_cmp(y));
             angs.dedup_by(|x, y| (*x - *y).abs() < 1e-9);
             if angs.len() < 2 {
                 sk.delete(&[], &[cid], &[]);
@@ -491,7 +494,7 @@ fn trim(sk: &mut Sketch, cid: CId, at: DVec2) -> bool {
             };
             let tc = norm((at - pc).to_angle());
             let mut ts: Vec<f64> = xs.iter().map(|p| norm((*p - pc).to_angle())).filter(|t| *t > 1e-6 && *t < sweep - 1e-6).collect();
-            ts.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            ts.sort_by(|x, y| x.total_cmp(y));
             let lo = ts.iter().copied().filter(|t| *t < tc).last();
             let hi = ts.iter().copied().find(|t| *t > tc);
             let at_ang = |t: f64| pc + DVec2::from_angle(a0 + t) * r;
@@ -645,7 +648,7 @@ fn nearest_point(sk: &Sketch, p: DVec2, tol: f64, exclude: &[PId]) -> Option<PId
         .filter(|q| !exclude.contains(&q.id))
         .map(|q| (q.id, (q.pos() - p).length()))
         .filter(|(_, d)| *d < tol)
-        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+        .min_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(id, _)| id)
 }
 
@@ -654,7 +657,7 @@ fn nearest_curve(sk: &Sketch, p: DVec2, tol: f64) -> Option<CId> {
         .iter()
         .map(|c| (c.id, sk.curve_distance(c, p)))
         .filter(|(_, d)| *d < tol)
-        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+        .min_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(id, _)| id)
 }
 
@@ -782,7 +785,7 @@ fn model_refs(app: &mut App, fid: FeatureId, frame: &Frame) -> Vec<DVec2> {
             }
         }
     }
-    out.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap().then(a.y.partial_cmp(&b.y).unwrap()));
+    out.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
     out.dedup_by(|a, b| (*a - *b).length() < 1e-7);
     let _ = fid;
     if let Some(s) = session(app) {
@@ -851,7 +854,7 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
                 let (q, sn) = compute_snap(&sk, p, px, &exclude);
                 if sn.is_none() || matches!(sn, Some(Snap::OnCurve(_))) {
                     // model geometry (vertices, edge midpoints, circle centres)
-                    let best = refs.iter().map(|r| (*r, (*r - p).length())).filter(|(_, d)| *d < px * 9.0).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                    let best = refs.iter().map(|r| (*r, (*r - p).length())).filter(|(_, d)| *d < px * 9.0).min_by(|a, b| a.1.total_cmp(&b.1));
                     match best {
                         Some((r, _)) => (r, Some(Snap::Model(r))),
                         None => (q, sn),
@@ -1017,7 +1020,7 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
         }
         if let Some(SkEnt::Text(tid)) = hover {
             if let Some(t) = sk.texts.iter().find(|t| t.id == tid) {
-                session(app).unwrap().text_edit = Some((tid, t.text.clone(), t.height.clone(), false));
+                session(app).unwrap().text_edit = Some((tid, t.text.clone(), t.height.clone(), false, t.text.clone(), t.height.clone()));
             }
             return;
         }
@@ -1069,7 +1072,7 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
                 commit(app, before);
                 if let Some(tid) = tid {
                     let s = session(app).unwrap();
-                    s.text_edit = Some((tid, "Text".into(), "5".into(), true));
+                    s.text_edit = Some((tid, "Text".into(), "5".into(), true, "Text".into(), "5".into()));
                     s.tool = SkTool::Select;
                 }
             }
@@ -2140,7 +2143,7 @@ pub fn overlay(app: &mut App, ui: &mut egui::Ui, view: &View) {
         Mode::Sketch(s) => s.text_edit.take(),
         _ => None,
     };
-    if let Some((tid, mut text, mut height, is_new)) = te {
+    if let Some((tid, mut text, mut height, is_new, orig_text, orig_height)) = te {
         let anchor = sk.texts.iter().find(|t| t.id == tid).map(|t| sk.pos(t.anchor));
         let pos = anchor.and_then(|a| proj(a)).unwrap_or(view.rect.center()) + egui::vec2(10.0, 16.0);
         let mut keep = true;
@@ -2181,7 +2184,17 @@ pub fn overlay(app: &mut App, ui: &mut egui::Ui, view: &View) {
             Mode::Sketch(s) => s.fid,
             _ => return,
         };
+        // the live preview already changed the document: undo/cancel go back to the originals
+        let restore = |app: &mut App| {
+            if let Some(skm) = sketch_mut(app, fid) {
+                if let Some(t) = skm.texts.iter_mut().find(|t| t.id == tid) {
+                    t.text = orig_text.clone();
+                    t.height = orig_height.clone();
+                }
+            }
+        };
         if apply && !text.trim().is_empty() {
+            restore(app);
             let before = app.doc.clone();
             if let Some(skm) = sketch_mut(app, fid) {
                 if let Some(t) = skm.texts.iter_mut().find(|t| t.id == tid) {
@@ -2194,6 +2207,8 @@ pub fn overlay(app: &mut App, ui: &mut egui::Ui, view: &View) {
             if let Some(skm) = sketch_mut(app, fid) {
                 skm.delete(&[], &[tid], &[]);
             }
+        } else if cancel {
+            restore(app);
         }
         if keep {
             // live preview while typing
@@ -2209,7 +2224,7 @@ pub fn overlay(app: &mut App, ui: &mut egui::Ui, view: &View) {
                 }
             }
             if let Mode::Sketch(s) = &mut app.mode {
-                s.text_edit = Some((tid, text, height, is_new));
+                s.text_edit = Some((tid, text, height, is_new, orig_text, orig_height));
             }
         }
     }

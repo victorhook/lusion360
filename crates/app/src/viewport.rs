@@ -38,6 +38,8 @@ pub struct VisBody {
     pub id: BodyId,
     pub mesh: Arc<BodyMesh>,
     pub is_mesh: bool,
+    /// mesh is from an older version of the body (re-tessellating in the background)
+    pub stale: bool,
 }
 
 pub fn visible_bodies(app: &mut App, st: &ModelState) -> Vec<VisBody> {
@@ -47,7 +49,8 @@ pub fn visible_bodies(app: &mut App, st: &ModelState) -> Vec<VisBody> {
             continue;
         }
         if let Some(m) = app.meshes.get(b) {
-            out.push(VisBody { id: b.id, mesh: m, is_mesh: b.is_mesh() });
+            let stale = !app.meshes.is_current(b);
+            out.push(VisBody { id: b.id, mesh: m, is_mesh: b.is_mesh(), stale });
         }
     }
     out
@@ -101,7 +104,7 @@ pub fn pick(app: &mut App, st: &ModelState, ray: &Ray, view: &View, filter: Filt
     let bodies = visible_bodies(app, st);
     // faces
     let mut face_hit: Option<Hit> = None;
-    for vb in &bodies {
+    for vb in bodies.iter().filter(|b| !b.stale) {
         let bvh = app.picks.bvh(&vb.mesh);
         if let Some((t, tri)) = bvh.raycast(&vb.mesh, ray) {
             if face_hit.map(|h| t < h.depth).unwrap_or(true) {
@@ -120,7 +123,7 @@ pub fn pick(app: &mut App, st: &ModelState, ray: &Ray, view: &View, filter: Filt
     // edges (screen space)
     if filter.edges {
         let mut best: Option<(f32, Hit)> = None;
-        for vb in bodies.iter().filter(|b| !b.is_mesh) {
+        for vb in bodies.iter().filter(|b| !b.is_mesh && !b.stale) {
             for (ei, poly) in vb.mesh.edges.iter().enumerate() {
                 let mut prev: Option<(Vec2, Vec3)> = None;
                 for p in poly {
@@ -863,7 +866,7 @@ fn view_cube(app: &mut App, ui: &mut egui::Ui, view: &View) {
     let painter = ui.painter_at(view.rect);
     // back-to-front
     let mut faces: Vec<(Vec3, &str, f32, f32)> = CUBE_FACES.to_vec();
-    faces.sort_by(|a, b| a.0.dot(cam.forward()).partial_cmp(&b.0.dot(cam.forward())).unwrap().reverse());
+    faces.sort_by(|a, b| a.0.dot(cam.forward()).total_cmp(&b.0.dot(cam.forward())).reverse());
     let mut hovered: Option<(f32, f32)> = None;
     let mut polys = Vec::new();
     for (n, label, yaw, pitch) in faces {
@@ -1008,7 +1011,7 @@ fn axis_triad(app: &App, ui: &egui::Ui, view: &View) {
     let painter = ui.painter_at(view.rect);
     let mut axes = [(Vec3::X, "X", Color32::from_rgb(235, 80, 80)), (Vec3::Y, "Y", Color32::from_rgb(90, 205, 90)), (Vec3::Z, "Z", Color32::from_rgb(90, 140, 255))];
     // draw back-to-front
-    axes.sort_by(|a, b| a.0.dot(cam.forward()).partial_cmp(&b.0.dot(cam.forward())).unwrap().reverse());
+    axes.sort_by(|a, b| a.0.dot(cam.forward()).total_cmp(&b.0.dot(cam.forward())).reverse());
     for (d, l, col) in axes {
         let x = d.dot(cam.right());
         let y = d.dot(cam.up());

@@ -170,10 +170,16 @@ impl Model {
             let ft = Instant::now();
             if !f.suppressed {
                 let mut ctx = Ctx { doc, params: &self.params, warnings: vec![] };
-                match ctx.eval(f, &mut st) {
-                    Ok(()) => {}
-                    Err(e) => {
+                // a kernel/logic panic in one feature must not take down the app
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.eval(f, &mut st)));
+                match r {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
                         status.error = Some(e);
+                        st = prev;
+                    }
+                    Err(_) => {
+                        status.error = Some("internal error while computing this feature".into());
                         st = prev;
                     }
                 }
@@ -466,6 +472,14 @@ impl Ctx<'_> {
         let body = st.bodies.get(&fr.body).ok_or_else(|| "referenced body no longer exists".to_string())?;
         let faces = body.shape.faces();
         if let Some(i) = body.face_index(&fr.name) {
+            // twins (`name~k`) can swap order when geometry moves: prefer the one nearest the hint
+            let base = fr.name.split('~').next().unwrap_or(&fr.name);
+            let twins: Vec<usize> = body.face_names.iter().enumerate().filter(|(_, n)| n.split('~').next() == Some(base)).map(|(j, _)| j).collect();
+            let hint = DVec3::from_array(fr.hint);
+            if twins.len() > 1 && hint != DVec3::ZERO {
+                let best = twins.iter().copied().min_by(|a, b| (face_center(&faces[*a]) - hint).length().total_cmp(&(face_center(&faces[*b]) - hint).length())).unwrap_or(i);
+                return Ok((body, faces[best].clone()));
+            }
             return Ok((body, faces[i].clone()));
         }
         // fallback: nearest face centre
@@ -474,7 +488,7 @@ impl Ctx<'_> {
             .iter()
             .enumerate()
             .map(|(i, f)| (i, (face_center(f) - hint).length()))
-            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            .min_by(|a, b| a.1.total_cmp(&b.1));
         match best {
             Some((i, _)) => {
                 self.warnings.push(format!("face '{}' was lost; re-attached by position", fr.name));
@@ -487,6 +501,14 @@ impl Ctx<'_> {
     fn resolve_edge(&mut self, body: &Body, er: &EdgeRef) -> Result<Shape, String> {
         let edges = body.shape.edges();
         if let Some(i) = body.edge_index(&er.name) {
+            let base = er.name.split('~').next().unwrap_or(&er.name);
+            let twins: Vec<usize> = body.edge_names.iter().enumerate().filter(|(_, n)| n.split('~').next() == Some(base)).map(|(j, _)| j).collect();
+            let hint = DVec3::from_array(er.hint);
+            if twins.len() > 1 && hint != DVec3::ZERO {
+                let mid = |j: usize| edges[j].edge_info().map(|e| e.mid).unwrap_or(DVec3::splat(f64::INFINITY));
+                let best = twins.iter().copied().min_by(|a, b| (mid(*a) - hint).length().total_cmp(&(mid(*b) - hint).length())).unwrap_or(i);
+                return Ok(edges[best].clone());
+            }
             return Ok(edges[i].clone());
         }
         let hint = DVec3::from_array(er.hint);
@@ -494,7 +516,7 @@ impl Ctx<'_> {
             .iter()
             .enumerate()
             .filter_map(|(i, e)| e.edge_info().ok().map(|inf| (i, (inf.mid - hint).length())))
-            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            .min_by(|a, b| a.1.total_cmp(&b.1));
         match best {
             Some((i, d)) if d < 1e3 => {
                 self.warnings.push(format!("edge '{}' was lost; re-attached by position", er.name));
@@ -858,7 +880,11 @@ impl Ctx<'_> {
                 let (n2, d2, dir2) = match &p.axis2 {
                     Some(a2) => {
                         let (_, d2v) = self.resolve_axis(st, a2)?;
-                        (self.eval_expr("count 2", &p.count2)?.round().max(1.0) as i64, self.eval_expr("spacing 2", &p.spacing2)?, d2v)
+                        let n2 = self.eval_expr("count 2", &p.count2)?.round() as i64;
+                        if !(1..=1000).contains(&n2) || n * n2 > 10_000 {
+                            return Err("too many copies (max 10 000)".into());
+                        }
+                        (n2, self.eval_expr("spacing 2", &p.spacing2)?, d2v)
                     }
                     None => (1, 0.0, DVec3::ZERO),
                 };
@@ -1067,7 +1093,7 @@ pub fn find_profile<'a>(ss: &'a SolvedSketch, curves: &[u32], hint: DVec2) -> Op
                 .copied()
                 .find(|p| p.contains(hint))
                 .or_else(|| exact.iter().copied().min_by(|a, b| {
-                    (a.hint - hint).length().partial_cmp(&(b.hint - hint).length()).unwrap()
+                    (a.hint - hint).length().total_cmp(&(b.hint - hint).length())
                 }))
         }
         _ => {}
@@ -1076,7 +1102,7 @@ pub fn find_profile<'a>(ss: &'a SolvedSketch, curves: &[u32], hint: DVec2) -> Op
     ss.profiles
         .iter()
         .filter(|p| p.contains(hint))
-        .min_by(|a, b| a.area.partial_cmp(&b.area).unwrap())
+        .min_by(|a, b| a.area.total_cmp(&b.area))
 }
 
 /// Closed regions of a solved sketch.
@@ -1135,7 +1161,7 @@ pub fn compute_profiles(s: &Sketch, frame: &Frame, sid: FeatureId, params: &Para
         let tris = triangulate_face(&face, frame, scale);
         let hint = tris
             .iter()
-            .max_by(|a, b| tri_area(a).partial_cmp(&tri_area(b)).unwrap())
+            .max_by(|a, b| tri_area(a).total_cmp(&tri_area(b)))
             .map(|t| (t[0] + t[1] + t[2]) / 3.0)
             .unwrap_or(DVec2::ZERO);
         let mut curves = Vec::new();
@@ -1148,7 +1174,7 @@ pub fn compute_profiles(s: &Sketch, frame: &Frame, sid: FeatureId, params: &Para
                 .iter()
                 .filter(|c| !c.construction)
                 .map(|c| (c.id, s.curve_distance(c, m2)))
-                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                .min_by(|a, b| a.1.total_cmp(&b.1));
             let tol = scale * 1e-5 + 1e-6;
             match best {
                 Some((cid, d)) if d < tol => {

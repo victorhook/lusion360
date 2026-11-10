@@ -179,7 +179,7 @@ impl App {
             hover_anim: None,
             last_autosave: Instant::now(),
             autosaved_doc: None,
-            recovery: autosave_path().filter(|p| p.exists()),
+            recovery: find_orphan_autosave(),
             slicer_pref: cc.storage.and_then(|s| s.get_string("slicer")).filter(|s| !s.is_empty()),
         };
         if let Some(p) = initial {
@@ -224,6 +224,10 @@ impl App {
     }
 
     pub fn redo(&mut self) {
+        if self.cmd.is_some() {
+            self.cancel_command();
+            return;
+        }
         if let Some(next) = self.redo.pop() {
             let cur = std::mem::replace(&mut self.doc, next);
             self.undo.push(cur);
@@ -234,6 +238,8 @@ impl App {
     fn after_doc_swap(&mut self) {
         self.selection.clear();
         self.hover = None;
+        self.timeline_sel = None;
+        crash_snapshot(&self.doc, self.dirty());
         if let Mode::Sketch(s) = &self.mode {
             if self.doc.feature(s.fid).is_none() {
                 self.mode = Mode::Model;
@@ -257,6 +263,47 @@ impl App {
         self.hover = None;
         self.selection.clear();
         self.error("Internal error — the last action was cancelled. Your design is safe (please report this).");
+    }
+
+    /// Visibility-type change: applied to the live document and to a running
+    /// command's snapshot (so cancelling the command keeps it).
+    pub fn view_change(&mut self, f: impl Fn(&mut Document)) {
+        if let Some(c) = self.cmd.as_mut() {
+            f(&mut c.before);
+            f(&mut self.doc);
+        } else {
+            let before = self.doc.clone();
+            f(&mut self.doc);
+            self.commit(before);
+        }
+    }
+
+    /// Drop selections that no longer exist (after edits, undo, parameter changes).
+    fn prune_selection(&mut self) {
+        let st = self.display_state();
+        let valid = |p: &Pick| match *p {
+            Pick::Face { body, face } => st.bodies.get(&body).map(|b| (face as usize) < b.face_names.len()).unwrap_or(false),
+            Pick::Edge { body, edge } => st.bodies.get(&body).map(|b| (edge as usize) < b.edge_names.len()).unwrap_or(false),
+            Pick::Body(b) => st.bodies.contains_key(&b),
+            Pick::Profile { sketch, index } => st.sketches.get(&sketch).map(|s| index < s.profiles.len()).unwrap_or(false),
+            Pick::Plane(f) => st.planes.contains_key(&f),
+            Pick::SketchLine { sketch, curve } => st.sketches.get(&sketch).map(|s| s.sketch.line_pts(curve).is_some()).unwrap_or(false),
+            Pick::Origin(_) | Pick::Axis(_) => true,
+        };
+        let keep: Vec<Pick> = self.selection.iter().copied().filter(|p| valid(p)).collect();
+        if keep.len() != self.selection.len() {
+            self.selection = keep;
+        }
+    }
+
+    /// Cancel an open command dialog and finish an open sketch.
+    pub fn end_interaction(&mut self) {
+        if self.cmd.is_some() {
+            self.cancel_command();
+        }
+        if let Mode::Sketch(_) = self.mode {
+            crate::sketch_mode::finish(self);
+        }
     }
 
     pub fn cancel_command(&mut self) {
@@ -365,6 +412,7 @@ impl App {
         self.redo.clear();
         self.path = None;
         self.selection.clear();
+        self.timeline_sel = None;
         self.active_comp = ROOT;
         self.cam = CameraCtl::new();
     }
@@ -381,6 +429,7 @@ impl App {
                 self.undo.clear();
                 self.redo.clear();
                 self.selection.clear();
+                self.timeline_sel = None;
                 self.active_comp = ROOT;
                 if native {
                     self.saved_doc = self.doc.clone();
@@ -425,9 +474,20 @@ impl App {
         } else {
             self.path.clone().unwrap()
         };
-        match io::save_native(&self.doc, &path) {
+        // never write a half-finished command or a rolled-back sketch timeline
+        let mut to_save = match &self.cmd {
+            Some(c) => c.before.clone(),
+            None => self.doc.clone(),
+        };
+        if let Mode::Sketch(s) = &self.mode {
+            if let Some(idx) = to_save.feature_index(s.fid) {
+                to_save.marker = s.prev_marker.max(idx + 1).min(to_save.features.len());
+            }
+        }
+        match io::save_native(&to_save, &path) {
             Ok(()) => {
                 self.saved_doc = self.doc.clone();
+                crash_snapshot(&self.doc, false);
                 self.path = Some(path.clone());
                 self.push_recent(&path);
                 self.clear_autosave();
@@ -448,6 +508,7 @@ impl App {
             v
         };
         let Some(p) = rfd::FileDialog::new().add_filter("3D files", &exts).pick_file() else { return };
+        self.end_interaction();
         let before = self.doc.clone();
         match io::import_into(&mut self.doc, &p, self.active_comp) {
             Ok(n) => {
@@ -577,7 +638,32 @@ pub fn autosave_path() -> Option<PathBuf> {
     } else {
         std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
     }?;
-    Some(base.join("lusion360").join("autosave.l360"))
+    Some(base.join("lusion360").join(format!("autosave-{}.l360", std::process::id())))
+}
+
+/// An autosave left behind by an instance that is no longer running.
+pub fn find_orphan_autosave() -> Option<PathBuf> {
+    let dir = autosave_path()?.parent()?.to_path_buf();
+    let me = std::process::id();
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for e in std::fs::read_dir(&dir).ok()?.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(pid) = name.strip_prefix("autosave-").and_then(|r| r.strip_suffix(".l360")).and_then(|p| p.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        // still running? (Linux: /proc/<pid>)
+        if cfg!(target_os = "linux") && std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            continue;
+        }
+        if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
+            found.push((t, e.path()));
+        }
+    }
+    found.sort();
+    found.pop().map(|(_, p)| p)
 }
 
 impl App {
@@ -642,7 +728,9 @@ impl eframe::App for App {
         self.timeline_hover = None;
         self.autosave();
         // keep the model up to date
-        self.model.update(&self.doc);
+        if self.model.update(&self.doc) {
+            self.prune_selection();
+        }
         self.meshes.tick();
         self.picks.tick();
         if self.fit_pending {
@@ -706,6 +794,7 @@ impl App {
             if io::ext_of(&p) == io::NATIVE_EXT || self.doc.features.is_empty() {
                 self.request(PendingAction::Open(Some(p)));
             } else {
+                self.end_interaction();
                 let before = self.doc.clone();
                 match io::import_into(&mut self.doc, &p, self.active_comp) {
                     Ok(_) => {

@@ -289,7 +289,10 @@ pub fn cancel(app: &mut App) {
 
 /// Start a sketch on a plane/face pick and enter sketch mode.
 pub fn new_sketch_on(app: &mut App, pick: Pick) {
-    let st = app.display_state().clone();
+    let st = app.pick_state().clone();
+    if app.cmd.is_some() {
+        cancel(app);
+    }
     let plane = match pick {
         Pick::Origin(p) => PlaneRef::Origin(p),
         Pick::Plane(fid) => PlaneRef::Plane(fid),
@@ -490,7 +493,7 @@ impl Command {
                 // clicking any letter of a text selects the whole text
                 if let (Pick::Profile { sketch, index }, false) = (hit.pick, self.expanding) {
                     if let Some(ss) = st.sketches.get(&sketch) {
-                        let p = &ss.profiles[index];
+                        let Some(p) = ss.profiles.get(index) else { return };
                         let tids: Vec<u32> = ss.sketch.texts.iter().map(|t| t.id).filter(|t| p.curves.contains(t)).collect();
                         if let Some(&tid) = tids.first() {
                             let all = lusion_core::model::text_fill_profiles(ss, tid, &app.model.params);

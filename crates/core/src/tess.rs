@@ -111,6 +111,11 @@ impl MeshCache {
         })
     }
 
+    /// Is the cached mesh for this body up to date (not a stale stand-in)?
+    pub fn is_current(&self, body: &Body) -> bool {
+        Self::key(body).map(|k| self.map.contains_key(&k)).unwrap_or(false)
+    }
+
     /// True while background tessellation is running.
     pub fn busy(&self) -> bool {
         !self.pending.is_empty()

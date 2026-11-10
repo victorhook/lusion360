@@ -60,7 +60,7 @@ impl Bvh {
             let slice = &mut tris[start..start + count];
             let mid = count / 2;
             slice.select_nth_unstable_by(mid, |a, b| {
-                cents[*a as usize][axis].partial_cmp(&cents[*b as usize][axis]).unwrap_or(std::cmp::Ordering::Equal)
+                cents[*a as usize][axis].total_cmp(&cents[*b as usize][axis])
             });
             let left = nodes.len();
             nodes.push(Node { min: lo, max: hi, start: start as u32, count: mid as u32 });

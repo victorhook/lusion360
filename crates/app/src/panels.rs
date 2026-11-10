@@ -323,7 +323,7 @@ pub fn timeline(app: &mut App, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 3.0;
             let n = app.doc.features.len();
-            let editing = app.cmd.as_ref().map(|c| c.editing).unwrap_or(false) || matches!(app.mode, Mode::Sketch(_));
+            let editing = app.cmd.is_some() || matches!(app.mode, Mode::Sketch(_));
             let mut set_marker: Option<usize> = None;
             if ui.add_enabled(!editing, egui::Button::new(ic::SKIP_BACK).frame(false)).on_hover_text("Roll back to start").clicked() {
                 set_marker = Some(0);
@@ -474,6 +474,9 @@ fn marker_bar(ui: &mut egui::Ui, locked: bool) -> egui::Response {
 }
 
 pub fn feature_action(app: &mut App, fid: FeatureId, a: &str) {
+    if a != "edit" && a != "rename" {
+        app.end_interaction();
+    }
     let Some(i) = app.doc.feature_index(fid) else { return };
     match a {
         "edit" => commands::edit(app, fid),
@@ -563,11 +566,11 @@ fn component_tree(app: &mut App, ui: &mut egui::Ui, cid: CompId, depth: usize) {
     egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
         .show_header(ui, |ui| {
             if eye(ui, comp.visible) {
-                let before = app.doc.clone();
-                if let Some(c) = app.doc.component_mut(cid) {
-                    c.visible = !c.visible;
-                }
-                app.commit(before);
+                app.view_change(|d| {
+                    if let Some(c) = d.component_mut(cid) {
+                        c.visible = !c.visible;
+                    }
+                });
             }
             let active = app.active_comp == cid;
             let icon = if depth == 0 { ic::CUBE } else { ic::PUZZLE_PIECE };
@@ -661,9 +664,7 @@ fn component_tree(app: &mut App, ui: &mut egui::Ui, cid: CompId, depth: usize) {
                             ui.horizontal(|ui| {
                                 let vis = app.doc.body_props(b).visible.unwrap_or(true);
                                 if eye(ui, vis) {
-                                    let before = app.doc.clone();
-                                    app.doc.bodies.entry(b).or_default().visible = Some(!vis);
-                                    app.commit(before);
+                                    app.view_change(|d| d.bodies.entry(b).or_default().visible = Some(!vis));
                                 }
                                 let selected = app.selection.contains(&Pick::Body(b));
                                 let is_mesh = st.bodies.get(&b).map(|x| x.is_mesh()).unwrap_or(false);
@@ -709,11 +710,12 @@ fn component_tree(app: &mut App, ui: &mut egui::Ui, cid: CompId, depth: usize) {
                         for f in feats {
                             ui.horizontal(|ui| {
                                 if eye(ui, f.visible) {
-                                    let before = app.doc.clone();
-                                    if let Some(x) = app.doc.feature_mut(f.id) {
-                                        x.visible = !x.visible;
-                                    }
-                                    app.commit(before);
+                                    let fid = f.id;
+                                    app.view_change(|d| {
+                                        if let Some(x) = d.feature_mut(fid) {
+                                            x.visible = !x.visible;
+                                        }
+                                    });
                                 }
                                 let r = ui.selectable_label(app.timeline_sel == Some(f.id), format!("{} {}", feature_icon(&f.kind), f.name));
                                 if r.clicked() {
@@ -898,6 +900,7 @@ pub fn dialogs(app: &mut App, ctx: &egui::Context) {
                         Ok(d) => {
                             app.new_doc();
                             app.doc = d;
+                            let _ = std::fs::remove_file(&p);
                             app.fit_pending = true;
                             app.info("Recovered autosaved design — save it to keep it");
                         }
@@ -930,7 +933,6 @@ pub fn dialogs(app: &mut App, ctx: &egui::Context) {
                 }
                 if ui.button(RichText::new("Discard").color(theme::ERR)).clicked() {
                     close = true;
-                    app.saved_doc = app.doc.clone();
                     app.perform(action.clone());
                 }
                 if ui.button("Cancel").clicked() {
@@ -1060,6 +1062,10 @@ fn params_window(app: &mut App, ctx: &egui::Context) {
         params.remove(i);
     }
     if params != app.doc.parameters {
+        if app.cmd.is_some() || matches!(app.mode, Mode::Sketch(_)) {
+            // finish the current command/sketch first so the change is a clean undo step
+            app.end_interaction();
+        }
         let before = app.doc.clone();
         app.doc.parameters = params;
         app.commit(before);
