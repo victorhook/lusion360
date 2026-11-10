@@ -90,6 +90,8 @@ pub struct Scene {
     /// lines drawn on top of everything
     pub overlay_lines: Vec<LineSeg>,
     pub points: Vec<PointInst>,
+    /// an animation is running (ask egui for another frame)
+    pub wants_repaint: bool,
 }
 
 struct GpuMesh {

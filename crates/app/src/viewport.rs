@@ -319,7 +319,14 @@ fn push_square(scene: &mut Scene, f: &lusion_core::sketch::Frame, center: glam::
 }
 
 pub fn highlight(app: &mut App, scene: &mut Scene, st: &ModelState, pick: Pick, strong: bool) {
+    highlight_a(app, scene, st, pick, strong, 1.0)
+}
+
+/// Highlight with an extra opacity factor (used for hover fade-in).
+pub fn highlight_a(app: &mut App, scene: &mut Scene, st: &ModelState, pick: Pick, strong: bool, k: f32) {
     let (fc, ec, pc) = if strong { (theme::SELECT, theme::SELECT_EDGE, theme::PROFILE_SEL) } else { (theme::HOVER, theme::HOVER_EDGE, theme::PROFILE_HOVER) };
+    let fade = |c: [f32; 4]| [c[0], c[1], c[2], c[3] * k];
+    let (fc, ec, pc) = (fade(fc), fade(ec), fade(pc));
     match pick {
         Pick::Face { body, face } => {
             if let Some(b) = st.bodies.get(&body) {
@@ -564,7 +571,18 @@ fn build_scene(app: &mut App, view: &View) -> Scene {
         }
         if let Some(h) = app.hover {
             if !matches!(h.pick, Pick::Body(_)) {
-                highlight(app, &mut scene, &pst, h.pick, false);
+                // fade in over ~120 ms
+                let k = match app.hover_anim {
+                    Some((p, t)) if p == h.pick => (t.elapsed().as_secs_f32() / 0.12).min(1.0),
+                    _ => {
+                        app.hover_anim = Some((h.pick, std::time::Instant::now()));
+                        0.15
+                    }
+                };
+                highlight_a(app, &mut scene, &pst, h.pick, false, k);
+                if k < 1.0 {
+                    scene.wants_repaint = true;
+                }
             }
         }
     }
@@ -693,6 +711,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         }
     }
     let scene = build_scene(app, &view);
+    if scene.wants_repaint {
+        ui.ctx().request_repaint();
+    }
     ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, ViewportCallback { scene: Arc::new(scene) }));
 
     // 2D overlays
