@@ -1,0 +1,128 @@
+//! Display tessellation with caching (keyed by B-rep identity).
+
+use crate::doc::ImportMesh;
+use crate::model::Body;
+use lusion_kernel::Shape;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+#[derive(Debug, Default)]
+pub struct BodyMesh {
+    pub positions: Vec<[f32; 3]>,
+    pub normals: Vec<[f32; 3]>,
+    pub indices: Vec<u32>,
+    /// face index (B-rep face order) for each triangle
+    pub tri_face: Vec<u32>,
+    /// polyline per B-rep edge (edge order)
+    pub edges: Vec<Vec<[f32; 3]>>,
+    pub bbox: ([f32; 3], [f32; 3]),
+}
+
+impl BodyMesh {
+    pub fn from_shape(s: &Shape) -> anyhow::Result<BodyMesh> {
+        let diag = s.bbox().map(|(a, b)| (b - a).length()).unwrap_or(1.0);
+        let lin = (diag * 0.0006).clamp(0.002, 0.5);
+        let m = s.mesh(lin, 0.25).map_err(|e| anyhow::anyhow!(e.0))?;
+        let positions: Vec<[f32; 3]> = m.positions.chunks(3).map(|c| [c[0], c[1], c[2]]).collect();
+        let normals: Vec<[f32; 3]> = m.normals.chunks(3).map(|c| [c[0], c[1], c[2]]).collect();
+        let mut edges = Vec::with_capacity(m.edge_ranges.len().saturating_sub(1));
+        for w in m.edge_ranges.windows(2) {
+            let (a, b) = (w[0] as usize, w[1] as usize);
+            edges.push((a..b).map(|i| [m.edge_points[3 * i], m.edge_points[3 * i + 1], m.edge_points[3 * i + 2]]).collect());
+        }
+        let bbox = bounds(&positions);
+        Ok(BodyMesh { positions, normals, indices: m.indices, tri_face: m.tri_face, edges, bbox })
+    }
+
+    pub fn from_import(m: &ImportMesh) -> BodyMesh {
+        let mut tm = lusion_meshio::TriMesh {
+            name: String::new(),
+            positions: m.positions.chunks(3).map(|c| [c[0], c[1], c[2]]).collect(),
+            normals: vec![],
+            indices: (*m.indices).clone(),
+            color: None,
+        };
+        tm.compute_normals(30.0);
+        let bbox = bounds(&tm.positions);
+        let n = tm.indices.len() / 3;
+        BodyMesh {
+            positions: tm.positions,
+            normals: tm.normals,
+            indices: tm.indices,
+            tri_face: vec![0; n],
+            edges: vec![],
+            bbox,
+        }
+    }
+
+    pub fn from_trimesh(tm: &lusion_meshio::TriMesh) -> BodyMesh {
+        let n = tm.indices.len() / 3;
+        BodyMesh {
+            positions: tm.positions.clone(),
+            normals: tm.normals.clone(),
+            indices: tm.indices.clone(),
+            tri_face: vec![0; n],
+            edges: vec![],
+            bbox: bounds(&tm.positions),
+        }
+    }
+}
+
+fn bounds(p: &[[f32; 3]]) -> ([f32; 3], [f32; 3]) {
+    let mut lo = [f32::INFINITY; 3];
+    let mut hi = [f32::NEG_INFINITY; 3];
+    for v in p {
+        for k in 0..3 {
+            lo[k] = lo[k].min(v[k]);
+            hi[k] = hi[k].max(v[k]);
+        }
+    }
+    (lo, hi)
+}
+
+/// Cache of display meshes. Entries not touched for a few generations are evicted.
+#[derive(Default)]
+pub struct MeshCache {
+    map: HashMap<u64, (Arc<BodyMesh>, u64)>,
+    generation: u64,
+}
+
+impl MeshCache {
+    pub fn get(&mut self, body: &Body) -> Option<Arc<BodyMesh>> {
+        let key = match &body.mesh {
+            Some(m) => Arc::as_ptr(&m.positions) as u64 ^ 0x9e37_79b9_7f4a_7c15,
+            None => {
+                if body.shape.is_null() {
+                    return None;
+                }
+                body.shape.hash()
+            }
+        };
+        let generation = self.generation;
+        if let Some((m, g)) = self.map.get_mut(&key) {
+            *g = generation;
+            return Some(m.clone());
+        }
+        let m = match &body.mesh {
+            Some(im) => Arc::new(BodyMesh::from_import(im)),
+            None => match BodyMesh::from_shape(&body.shape) {
+                Ok(m) => Arc::new(m),
+                Err(e) => {
+                    log::warn!("tessellation failed: {e}");
+                    return None;
+                }
+            },
+        };
+        self.map.insert(key, (m.clone(), generation));
+        Some(m)
+    }
+
+    /// Call once per frame/update; drops meshes unused for a while.
+    pub fn tick(&mut self) {
+        self.generation += 1;
+        let g = self.generation;
+        if self.map.len() > 64 {
+            self.map.retain(|_, (_, last)| g - *last < 600);
+        }
+    }
+}

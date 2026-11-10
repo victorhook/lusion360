@@ -1,0 +1,14 @@
+[package]
+name = "lusion-meshio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Triangle-mesh import (STL, OBJ, glTF/GLB, 3MF, PLY, OFF) and export (STL, OBJ, 3MF)"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+# Without the default `import` feature (which pulls in image decoding); buffers are resolved by us.
+gltf = { version = "1.4", default-features = false, features = ["utils", "names"] }
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
+quick-xml = "0.41"
