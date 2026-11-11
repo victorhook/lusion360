@@ -5,7 +5,7 @@ use crate::app::{App, Filter, Hit, Mode, Pick};
 use crate::icons as ic;
 use crate::render::Scene;
 use crate::theme;
-use crate::viewport::{push_line, View};
+use crate::viewport::{push_line, push_polyline, View};
 use egui::{Color32, RichText};
 use glam::{DVec3, Vec2, Vec3};
 use lusion_core::doc::*;
@@ -67,11 +67,124 @@ pub struct Command {
     pub before: Document,
     pub prev_marker: usize,
     pub stage: u8,
-    drag: Option<f64>,
+    gdrag: Option<GDrag>,
+    ghover: Option<u8>,
     /// automatic Join/Cut switching (until the user picks an operation)
     auto_op: Option<Operation>,
     /// guard against re-expanding text picks
     expanding: bool,
+}
+
+// ------------------------------------------------------------------ manipulators
+
+#[derive(Clone, Copy, Debug)]
+enum GKind {
+    /// arrow from `base` to `tip`; values measured along `dir` from `origin`
+    Linear { origin: Vec3, dir: Vec3, base: Vec3, tip: Vec3 },
+    /// rotation ring
+    Ring { center: Vec3, normal: Vec3, radius: f32 },
+}
+
+#[derive(Clone, Debug)]
+struct Handle {
+    id: u8,
+    kind: GKind,
+    value: f64,
+    color: [f32; 4],
+    label: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GDrag {
+    id: u8,
+    kind: GKind,
+    start_value: f64,
+    start_param: f64,
+}
+
+const AXIS_COLORS: [[f32; 4]; 3] = [[0.92, 0.32, 0.32, 1.0], [0.36, 0.82, 0.38, 1.0], [0.35, 0.58, 1.0, 1.0]];
+const HANDLE_BLUE: [f32; 4] = [0.25, 0.65, 1.0, 1.0];
+
+/// World size of one screen pixel at `p`.
+fn px_at(app: &App, view: &View, p: Vec3) -> f32 {
+    let c = &app.cam.cam;
+    c.px_size(view.size.y) * if c.ortho { 1.0 } else { (p - c.eye()).length() / c.distance.max(1e-6) }
+}
+
+/// Snap to a "nice" step (1/2/5 x 10^n) worth ~3 pixels.
+fn nice_snap(v: f64, px: f32) -> f64 {
+    let raw = (px as f64 * 3.0).max(1e-4);
+    let mag = 10f64.powf(raw.log10().floor());
+    let step = [1.0, 2.0, 5.0, 10.0].iter().map(|m| m * mag).find(|s| *s >= raw).unwrap_or(10.0 * mag);
+    (v / step).round() * step
+}
+
+/// Parameter along line (origin, dir) closest to the mouse ray.
+fn line_param(ray: &crate::camera::Ray, origin: Vec3, dir: Vec3) -> Option<f64> {
+    let w0 = origin - ray.o;
+    let (a, b, c, d, e) = (dir.dot(dir), dir.dot(ray.d), ray.d.dot(ray.d), dir.dot(w0), ray.d.dot(w0));
+    let den = a * c - b * b;
+    (den.abs() > 1e-9).then(|| ((b * e - c * d) / den) as f64)
+}
+
+/// Angle (degrees) of the mouse ray's hit on a ring's plane.
+fn ring_angle(ray: &crate::camera::Ray, center: Vec3, normal: Vec3) -> Option<f64> {
+    let t = ray.plane(center, normal)?;
+    let v = ray.at(t) - center;
+    let u = normal.any_orthonormal_vector();
+    let w = normal.cross(u);
+    Some((v.dot(w).atan2(v.dot(u)) as f64).to_degrees())
+}
+
+fn push_cone(scene: &mut Scene, app: &App, base: Vec3, dir: Vec3, h: f32, r: f32, color: [f32; 4]) {
+    let apex = base + dir * h;
+    let u = dir.any_orthonormal_vector();
+    let v = dir.cross(u);
+    let segs = 18;
+    for i in 0..segs {
+        let t0 = i as f32 / segs as f32 * std::f32::consts::TAU;
+        let t1 = (i + 1) as f32 / segs as f32 * std::f32::consts::TAU;
+        let p0 = base + (u * t0.cos() + v * t0.sin()) * r;
+        let p1 = base + (u * t1.cos() + v * t1.sin()) * r;
+        let side = (u * t0.cos() + v * t0.sin()).dot(-app.cam.cam.forward()).max(0.0);
+        let c = [color[0] * (0.75 + 0.25 * side), color[1] * (0.75 + 0.25 * side), color[2] * (0.75 + 0.25 * side), 0.97];
+        for p in [apex, p0, p1] {
+            scene.overlay_fills.push(crate::render::FillVert { p: p.to_array(), color: c });
+        }
+        for p in [base, p1, p0] {
+            scene.overlay_fills.push(crate::render::FillVert { p: p.to_array(), color: [color[0] * 0.5, color[1] * 0.5, color[2] * 0.5, 0.97] });
+        }
+    }
+}
+
+/// Outward direction at an edge: bisector of the adjacent faces' normals near `mid`.
+fn edge_outward(app: &mut App, st: &ModelState, body: BodyId, edge: usize, mid: Vec3) -> Vec3 {
+    let Some(b) = st.bodies.get(&body) else { return Vec3::Z };
+    let Some((f1, f2)) = b.shape.edge_faces().get(edge).copied() else { return Vec3::Z };
+    let Some(mesh) = app.meshes.get(b) else { return Vec3::Z };
+    let normal_near = |f: i32| -> Option<Vec3> {
+        if f < 0 {
+            return None;
+        }
+        let r = crate::viewport::face_range(&mesh, f as u32);
+        let mut best: Option<(f32, Vec3)> = None;
+        for t in r {
+            for k in 0..3 {
+                let vi = mesh.indices[3 * t + k] as usize;
+                let d = (Vec3::from_array(mesh.positions[vi]) - mid).length_squared();
+                if best.map(|b| d < b.0).unwrap_or(true) {
+                    best = Some((d, Vec3::from_array(mesh.normals[vi])));
+                }
+            }
+        }
+        best.map(|b| b.1)
+    };
+    let n = normal_near(f1).unwrap_or(Vec3::ZERO) + normal_near(f2).unwrap_or(Vec3::ZERO);
+    if n.length() < 1e-6 {
+        Vec3::Z
+    } else {
+        n.normalize()
+    }
 }
 
 // ------------------------------------------------------------------ refs <-> picks
@@ -179,7 +292,7 @@ pub fn start(app: &mut App, kind: CmdKind) {
     if let Mode::Sketch(_) = app.mode {
         crate::sketch_mode::finish(app);
     }
-    let mut c = Command { kind, fid: None, editing: false, before: app.doc.clone(), prev_marker: app.doc.marker, stage: 0, drag: None, auto_op: None, expanding: false };
+    let mut c = Command { kind, fid: None, editing: false, before: app.doc.clone(), prev_marker: app.doc.marker, stage: 0, gdrag: None, ghover: None, auto_op: None, expanding: false };
     let sel = std::mem::take(&mut app.selection);
     app.cmd = None;
     // pre-selection
@@ -234,7 +347,7 @@ pub fn edit(app: &mut App, fid: FeatureId) {
     let prev_marker = app.doc.marker;
     app.doc.marker = idx + 1;
     app.selection.clear();
-    app.cmd = Some(Command { kind, fid: Some(fid), editing: true, before, prev_marker, stage: 0, drag: None, auto_op: None, expanding: false });
+    app.cmd = Some(Command { kind, fid: Some(fid), editing: true, before, prev_marker, stage: 0, gdrag: None, ghover: None, auto_op: None, expanding: false });
 }
 
 pub fn ok(app: &mut App) {
@@ -328,6 +441,16 @@ pub fn new_sketch_on(app: &mut App, pick: Pick) {
 // ------------------------------------------------------------------ behaviour
 
 impl Command {
+    /// Model state before this command's feature (what the user picks from).
+    /// Use this instead of `self.pre_state(app)`: the command is taken out of
+    /// `app` while its methods run.
+    fn pre_state<'a>(&self, app: &'a App) -> &'a ModelState {
+        match self.fid.and_then(|f| app.doc.feature_index(f)) {
+            Some(i) => app.model.state_after(i),
+            None => app.model.current(&app.doc),
+        }
+    }
+
     pub fn wants_planes(&self) -> bool {
         matches!(self.kind, CmdKind::NewSketch | CmdKind::Plane) || (self.kind == CmdKind::Mirror && self.stage == 1)
     }
@@ -368,9 +491,21 @@ impl Command {
                 f.planar_only = true;
                 f.planes = true;
             }
-            CmdKind::Combine | CmdKind::Move => {
+            CmdKind::Combine => {
                 f.bodies = true;
             }
+            CmdKind::Move => match self.stage {
+                1 => {
+                    f.edges = true;
+                    f.sketch_lines = true;
+                    f.axes = true;
+                }
+                2 => {
+                    f.faces = true;
+                    f.edges = true;
+                }
+                _ => f.bodies = true,
+            },
             CmdKind::Pattern => {
                 if self.stage == 0 {
                     f.bodies = true;
@@ -413,7 +548,7 @@ impl Command {
 
     /// Picks that show as selected while the command runs.
     pub fn selected_picks(&self, app: &App) -> Vec<Pick> {
-        let st = app.pick_state();
+        let st = self.pre_state(app);
         let Some(k) = self.feature(app) else { return vec![] };
         let mut v = Vec::new();
         match k {
@@ -465,7 +600,7 @@ impl Command {
     }
 
     pub fn on_pick(&mut self, app: &mut App, hit: Hit) {
-        let st = app.pick_state().clone();
+        let st = self.pre_state(app).clone();
         match self.kind {
             CmdKind::NewSketch => {
                 if matches!(hit.pick, Pick::Face { .. } | Pick::Origin(_) | Pick::Plane(_)) {
@@ -755,6 +890,33 @@ impl Command {
                     list.push(b);
                 }
             }
+            CmdKind::Move if self.stage == 1 && self.fid.is_some() => {
+                // rotation axis
+                let axis = match hit.pick {
+                    Pick::Axis(0) => Some(AxisRef::X),
+                    Pick::Axis(1) => Some(AxisRef::Y),
+                    Pick::Axis(_) => Some(AxisRef::Z),
+                    Pick::SketchLine { sketch, curve } => Some(AxisRef::SketchLine { sketch, curve }),
+                    Pick::Edge { body, edge } => edge_ref(&st, body, edge).map(AxisRef::Edge),
+                    _ => None,
+                };
+                if let (Some(a), Some(FeatureKind::Move(m))) = (axis, self.feature_mut(app)) {
+                    m.axis = a;
+                }
+                self.stage = 0;
+            }
+            CmdKind::Move if self.stage == 2 && self.fid.is_some() => {
+                // pivot: face centre, edge midpoint (circle centre for round edges)
+                let p = match hit.pick {
+                    Pick::Face { body, face } => st.bodies.get(&body).and_then(|b| b.shape.faces().get(face as usize).and_then(|f| f.face_info().ok())).map(|i| i.center),
+                    Pick::Edge { body, edge } => st.bodies.get(&body).and_then(|b| b.shape.edges().get(edge as usize).and_then(|e| e.edge_info().ok())).map(|i| if i.kind == lusion_kernel::CurveKind::Circle { i.center } else { i.mid }),
+                    _ => None,
+                };
+                if let (Some(p), Some(FeatureKind::Move(m))) = (p, self.feature_mut(app)) {
+                    m.pivot = Some(p.to_array());
+                }
+                self.stage = 0;
+            }
             CmdKind::Move => {
                 let b = match hit.pick {
                     Pick::Body(b) | Pick::Face { body: b, .. } => b,
@@ -763,7 +925,7 @@ impl Command {
                 if self.fid.is_none() {
                     self.insert(
                         app,
-                        FeatureKind::Move(MoveBodies { bodies: vec![b], dx: "0".into(), dy: "0".into(), dz: "0".into(), rz: "0".into(), copy: false }),
+                        FeatureKind::Move(MoveBodies { bodies: vec![b], dx: "0".into(), dy: "0".into(), dz: "0".into(), rz: "0".into(), copy: false, pivot: None, axis: AxisRef::Z }),
                     );
                     return;
                 }
@@ -791,7 +953,7 @@ impl Command {
     /// Anchor + direction of the extrude drag arrow.
     fn extrude_axis(&self, app: &App) -> Option<(DVec3, DVec3, f64)> {
         let Some(FeatureKind::Extrude(e)) = self.feature(app) else { return None };
-        let st = app.pick_state();
+        let st = self.pre_state(app);
         let (anchor, n) = match e.profiles.first()? {
             ProfileRef::Sketch { sketch, curves, hint } => {
                 let ss = st.sketches.get(sketch)?;
@@ -810,103 +972,280 @@ impl Command {
         Some((anchor + n * start, n, d))
     }
 
+    /// In-viewport manipulators for the current command.
+    fn handles(&self, app: &mut App, view: &View) -> Vec<Handle> {
+        let mut out = Vec::new();
+        match self.kind {
+            CmdKind::Extrude => {
+                if let Some((anchor, n, d)) = self.extrude_axis(app) {
+                    let (o, dir) = (anchor.as_vec3(), n.as_vec3());
+                    out.push(Handle {
+                        id: 0,
+                        kind: GKind::Linear { origin: o, dir, base: o, tip: o + dir * d as f32 },
+                        value: d,
+                        color: HANDLE_BLUE,
+                        label: Some(format!("{} mm", lusion_core::expr::fmt_num(d))),
+                    });
+                }
+            }
+            CmdKind::Fillet | CmdKind::Chamfer => {
+                let (first, size, fillet) = match self.feature(app) {
+                    Some(FeatureKind::Fillet(f)) => (f.edges.first().cloned(), f.radius.clone(), true),
+                    Some(FeatureKind::Chamfer(f)) => (f.edges.first().cloned(), f.distance.clone(), false),
+                    _ => return out,
+                };
+                let Some(er) = first else { return out };
+                let st = self.pre_state(app).clone();
+                let Some(body) = st.bodies.get(&er.body) else { return out };
+                let Some(ei) = body.edge_index(&er.name) else { return out };
+                let Some(info) = body.shape.edges().get(ei).and_then(|e| e.edge_info().ok()) else { return out };
+                let mid = info.mid.as_vec3();
+                let dir = edge_outward(app, &st, er.body, ei, mid);
+                let v = app.model.params.eval(&size).unwrap_or(1.0);
+                // show the arrow at least 30 px long so it can be grabbed
+                let shown = (v as f32).max(px_at(app, view, mid) * 30.0);
+                out.push(Handle {
+                    id: 0,
+                    kind: GKind::Linear { origin: mid, dir, base: mid, tip: mid + dir * shown },
+                    value: v,
+                    color: HANDLE_BLUE,
+                    label: Some(if fillet { format!("R {} mm", lusion_core::expr::fmt_num(v)) } else { format!("{} mm", lusion_core::expr::fmt_num(v)) }),
+                });
+            }
+            CmdKind::Move => {
+                let Some(FeatureKind::Move(m)) = self.feature(app).cloned() else { return out };
+                let st = self.pre_state(app).clone();
+                let pivot = m.pivot.map(|p| DVec3::from_array(p)).unwrap_or_else(|| lusion_core::model::move_pivot(&st, &m.bodies));
+                let ev = |e: &str| app.model.params.eval(if e.trim().is_empty() { "0" } else { e }).unwrap_or(0.0);
+                let d = [ev(&m.dx), ev(&m.dy), ev(&m.dz)];
+                let ang = ev(&m.rz);
+                let gc = (pivot + DVec3::from_array(d)).as_vec3();
+                let px = px_at(app, view, gc);
+                let len = px * 95.0;
+                for (i, dir) in [Vec3::X, Vec3::Y, Vec3::Z].iter().enumerate() {
+                    out.push(Handle {
+                        id: i as u8,
+                        kind: GKind::Linear { origin: gc - *dir * d[i] as f32, dir: *dir, base: gc + *dir * px * 14.0, tip: gc + *dir * len },
+                        value: d[i],
+                        color: AXIS_COLORS[i],
+                        label: None,
+                    });
+                }
+                let axis_idx = match m.axis {
+                    AxisRef::X => Some(0),
+                    AxisRef::Y => Some(1),
+                    AxisRef::Z => Some(2),
+                    _ => None,
+                };
+                for (i, n) in [Vec3::X, Vec3::Y, Vec3::Z].iter().enumerate() {
+                    out.push(Handle {
+                        id: 3 + i as u8,
+                        kind: GKind::Ring { center: gc, normal: *n, radius: px * 72.0 },
+                        value: if axis_idx == Some(i) { ang } else { 0.0 },
+                        color: AXIS_COLORS[i],
+                        label: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    fn set_handle(&mut self, app: &mut App, id: u8, v: f64) {
+        let txt = lusion_core::expr::fmt_num(v);
+        match self.feature_mut(app) {
+            Some(FeatureKind::Extrude(ex)) => {
+                if ex.distance != txt {
+                    ex.distance = txt;
+                }
+            }
+            Some(FeatureKind::Fillet(f)) => f.radius = lusion_core::expr::fmt_num(v.max(0.01)),
+            Some(FeatureKind::Chamfer(f)) => f.distance = lusion_core::expr::fmt_num(v.max(0.01)),
+            Some(FeatureKind::Move(m)) => match id {
+                0 => m.dx = txt,
+                1 => m.dy = txt,
+                2 => m.dz = txt,
+                _ => {
+                    let axis = [AxisRef::X, AxisRef::Y, AxisRef::Z][(id - 3) as usize].clone();
+                    if m.axis != axis {
+                        m.axis = axis;
+                    }
+                    m.rz = txt;
+                }
+            },
+            _ => {}
+        }
+        if self.kind == CmdKind::Extrude {
+            let mut ex2 = match self.feature(app) {
+                Some(FeatureKind::Extrude(e)) => e.clone(),
+                _ => return,
+            };
+            self.apply_auto_op(app, &mut ex2);
+            if let Some(FeatureKind::Extrude(ex)) = self.feature_mut(app) {
+                if ex.op != ex2.op {
+                    ex.op = ex2.op;
+                }
+            }
+        }
+    }
+
+    /// Screen distance from the mouse to a handle.
+    fn handle_dist(app: &App, view: &View, h: &Handle, mouse: Vec2) -> f32 {
+        match h.kind {
+            GKind::Linear { base, tip, .. } => {
+                let (Some(a), Some(b)) = (app.cam.project(base, view.size), app.cam.project(tip, view.size)) else { return f32::INFINITY };
+                // the arrow head extends beyond the tip
+                let ext = b + (b - a).normalize_or_zero() * 22.0;
+                crate::pick::seg_dist(mouse, a, ext).0
+            }
+            GKind::Ring { center, normal, radius } => {
+                let u = normal.any_orthonormal_vector();
+                let w = normal.cross(u);
+                let mut best = f32::INFINITY;
+                let mut prev: Option<Vec2> = None;
+                for k in 0..=64 {
+                    let t = k as f32 / 64.0 * std::f32::consts::TAU;
+                    let p = app.cam.project(center + (u * t.cos() + w * t.sin()) * radius, view.size);
+                    if let (Some(a), Some(b)) = (prev, p) {
+                        best = best.min(crate::pick::seg_dist(mouse, a, b).0);
+                    }
+                    prev = p;
+                }
+                best
+            }
+        }
+    }
+
     /// Drag handling for in-viewport manipulators. Returns true if the pointer is consumed.
     pub fn handle_drag(&mut self, app: &mut App, ui: &egui::Ui, view: &View) -> bool {
-        let Some((anchor, n, d)) = self.extrude_axis(app) else { return false };
-        let Some(mouse) = view.mouse else {
-            return self.drag.is_some();
-        };
-        let tip = (anchor + n * d).as_vec3();
-        let Some(tip_s) = app.cam.project(tip, view.size) else { return false };
-        let (pressed, down, released) = ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.primary_released()));
-        if pressed && (tip_s - mouse).length() < 26.0 {
-            self.drag = Some(d);
+        let handles = self.handles(app, view);
+        if handles.is_empty() {
+            self.gdrag = None;
+            self.ghover = None;
+            return false;
         }
-        if self.drag.is_some() && down {
-            // closest point on the extrude axis to the mouse ray
-            let ray = app.cam.ray(mouse, view.size);
-            let (p0, u) = (anchor.as_vec3(), n.as_vec3());
-            let w0 = p0 - ray.o;
-            let (a, b, c, dd, e) = (u.dot(u), u.dot(ray.d), ray.d.dot(ray.d), u.dot(w0), ray.d.dot(w0));
-            let den = a * c - b * b;
-            if den.abs() > 1e-9 {
-                let s = (b * e - c * dd) / den;
-                // snap to a "nice" step (1/2/5 x 10^n) worth ~3 pixels at the handle
-                let px = app.cam.cam.px_size(view.size.y) * if app.cam.cam.ortho { 1.0 } else { (tip - app.cam.cam.eye()).length() / app.cam.cam.distance.max(1e-6) };
-                let raw = (px * 3.0).max(1e-4);
-                let mag = 10f32.powf(raw.log10().floor());
-                let step = [1.0, 2.0, 5.0, 10.0].iter().map(|m| m * mag).find(|s| *s >= raw).unwrap_or(10.0 * mag);
-                let v = ((s / step).round() * step) as f64;
-                if let Some(FeatureKind::Extrude(ex)) = self.feature_mut(app) {
-                    let txt = lusion_core::expr::fmt_num(v);
-                    if ex.distance != txt {
-                        ex.distance = txt;
+        let Some(mouse) = view.mouse else {
+            return self.gdrag.is_some();
+        };
+        let (pressed, down, released, fine) =
+            ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.primary_released(), i.modifiers.shift));
+        let ray = app.cam.ray(mouse, view.size);
+        if self.gdrag.is_none() {
+            let near = handles
+                .iter()
+                // arrows win over rings when both are close
+                .map(|h| (h, Self::handle_dist(app, view, h, mouse) + if matches!(h.kind, GKind::Ring { .. }) { 5.0 } else { 0.0 }))
+                .filter(|(_, d)| *d < 12.0)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(h, _)| h.clone());
+            self.ghover = near.as_ref().map(|h| h.id);
+            if pressed {
+                if let Some(h) = near {
+                    let start_param = match h.kind {
+                        GKind::Linear { origin, dir, .. } => line_param(&ray, origin, dir),
+                        GKind::Ring { center, normal, .. } => ring_angle(&ray, center, normal),
+                    };
+                    if let Some(sp) = start_param {
+                        self.gdrag = Some(GDrag { id: h.id, kind: h.kind, start_value: h.value, start_param: sp });
+                        return true;
                     }
                 }
-                let mut ex2 = match self.feature(app) {
-                    Some(FeatureKind::Extrude(e)) => e.clone(),
-                    _ => return true,
-                };
-                self.apply_auto_op(app, &mut ex2);
-                if let Some(FeatureKind::Extrude(ex)) = self.feature_mut(app) {
-                    if ex.op != ex2.op {
-                        ex.op = ex2.op;
+            }
+            return false;
+        }
+        let g = self.gdrag.unwrap();
+        if down {
+            match g.kind {
+                GKind::Linear { origin, dir, tip, .. } => {
+                    if let Some(sp) = line_param(&ray, origin, dir) {
+                        let v = nice_snap(g.start_value + (sp - g.start_param), px_at(app, view, tip));
+                        self.set_handle(app, g.id, v);
+                    }
+                }
+                GKind::Ring { center, normal, .. } => {
+                    if let Some(a) = ring_angle(&ray, center, normal) {
+                        let mut delta = a - g.start_param;
+                        while delta > 180.0 {
+                            delta -= 360.0;
+                        }
+                        while delta < -180.0 {
+                            delta += 360.0;
+                        }
+                        let step = if fine { 1.0 } else { 5.0 };
+                        let v = ((g.start_value + delta) / step).round() * step;
+                        self.set_handle(app, g.id, v);
+                        // keep the start reference so large rotations accumulate
+                        if let Some(gd) = self.gdrag.as_mut() {
+                            gd.start_value = v;
+                            gd.start_param = a - (g.start_value + delta - v);
+                        }
                     }
                 }
             }
             return true;
         }
-        if released && self.drag.is_some() {
-            self.drag = None;
+        if released || !down {
+            self.gdrag = None;
             return true;
         }
-        self.drag.is_some()
+        true
     }
 
     pub fn draw(&self, app: &mut App, scene: &mut Scene, view: &View) {
-        if let Some((anchor, n, d)) = self.extrude_axis(app) {
-            let a = anchor.as_vec3();
-            let tip = (anchor + n * d).as_vec3();
-            push_line(&mut scene.overlay_lines, a, tip, [0.25, 0.65, 1.0, 0.9], 2.0);
-            // cone arrowhead, sized in screen pixels
-            let px = app.cam.cam.px_size(view.size.y) * if app.cam.cam.ortho { 1.0 } else { (tip - app.cam.cam.eye()).length() / app.cam.cam.distance.max(1e-6) };
-            let dir = (n.as_vec3() * if d < 0.0 { -1.0 } else { 1.0 }).normalize();
-            let (h, r) = (px * 26.0, px * 9.0);
-            let base = tip;
-            let apex = base + dir * h;
-            let u = dir.any_orthonormal_vector();
-            let v = dir.cross(u);
-            let segs = 20;
-            for i in 0..segs {
-                let t0 = i as f32 / segs as f32 * std::f32::consts::TAU;
-                let t1 = (i + 1) as f32 / segs as f32 * std::f32::consts::TAU;
-                let p0 = base + (u * t0.cos() + v * t0.sin()) * r;
-                let p1 = base + (u * t1.cos() + v * t1.sin()) * r;
-                // shade sides by facing for a bit of depth
-                let side = (u * t0.cos() + v * t0.sin()).dot(-app.cam.cam.forward()).max(0.0);
-                let c = [0.20 + 0.25 * side, 0.55 + 0.25 * side, 1.0, 0.97];
-                for p in [apex, p0, p1] {
-                    scene.fills.push(crate::render::FillVert { p: p.to_array(), color: c });
+        let handles = self.handles(app, view);
+        let active = self.gdrag.map(|g| g.id).or(self.ghover);
+        for h in &handles {
+            let hot = active == Some(h.id);
+            let c = if hot { [1.0, 0.85, 0.30, 1.0] } else { h.color };
+            match h.kind {
+                GKind::Linear { origin, dir, base, tip } => {
+                    let px = px_at(app, view, tip);
+                    push_line(&mut scene.overlay_lines, base, tip, c, if hot { 3.5 } else { 2.2 });
+                    let d = if (tip - base).dot(dir) < 0.0 { -dir } else { dir };
+                    push_cone(scene, app, tip, d, px * if hot { 28.0 } else { 24.0 }, px * if hot { 10.0 } else { 8.0 }, c);
+                    if self.kind != CmdKind::Move {
+                        scene.points.push(crate::render::PointInst { p: base.to_array(), color: [0.9, 0.9, 0.95, 1.0], size: 7.0 });
+                    }
+                    let _ = origin;
                 }
-                for p in [base, p1, p0] {
-                    scene.fills.push(crate::render::FillVert { p: p.to_array(), color: [0.12, 0.35, 0.75, 0.97] });
+                GKind::Ring { center, normal, radius } => {
+                    let u = normal.any_orthonormal_vector();
+                    let w = normal.cross(u);
+                    let pts: Vec<Vec3> = (0..=72).map(|k| {
+                        let t = k as f32 / 72.0 * std::f32::consts::TAU;
+                        center + (u * t.cos() + w * t.sin()) * radius
+                    }).collect();
+                    push_polyline(&mut scene.overlay_lines, &pts, [c[0], c[1], c[2], if hot { 1.0 } else { 0.75 }], if hot { 3.5 } else { 2.0 });
                 }
             }
-            scene.points.push(crate::render::PointInst { p: a.to_array(), color: [0.9, 0.9, 0.95, 1.0], size: 7.0 });
+        }
+        if self.kind == CmdKind::Move && !handles.is_empty() {
+            if let GKind::Ring { center, .. } = handles[3].kind {
+                scene.points.push(crate::render::PointInst { p: center.to_array(), color: [1.0, 1.0, 1.0, 1.0], size: 9.0 });
+            }
         }
     }
 
     pub fn overlay(&mut self, app: &mut App, ui: &egui::Ui, view: &View) {
-        if let Some((anchor, n, d)) = self.extrude_axis(app) {
-            if let Some(p) = app.cam.project((anchor + n * d).as_vec3(), view.size) {
-                let pos = view.to_screen(p + Vec2::new(14.0, -14.0));
-                ui.painter().text(
-                    pos,
-                    egui::Align2::LEFT_BOTTOM,
-                    format!("{} mm", lusion_core::expr::fmt_num(d)),
-                    egui::FontId::proportional(13.0),
-                    Color32::WHITE,
-                );
+        let handles = self.handles(app, view);
+        for h in &handles {
+            let text = match (&h.label, self.gdrag) {
+                (Some(l), _) => Some(l.clone()),
+                (None, Some(g)) if g.id == h.id => Some(if h.id >= 3 { format!("{}°", lusion_core::expr::fmt_num(h.value)) } else { format!("{} mm", lusion_core::expr::fmt_num(h.value)) }),
+                _ => None,
+            };
+            let Some(text) = text else { continue };
+            let at = match h.kind {
+                GKind::Linear { tip, .. } => tip,
+                GKind::Ring { center, normal, radius } => center + normal.any_orthonormal_vector() * radius,
+            };
+            if let Some(p) = app.cam.project(at, view.size) {
+                let pos = view.to_screen(p + Vec2::new(16.0, -16.0));
+                let galley = ui.painter().layout_no_wrap(text, egui::FontId::proportional(13.0), Color32::WHITE);
+                let r = egui::Rect::from_min_size(pos - egui::vec2(4.0, galley.size().y + 2.0), galley.size() + egui::vec2(8.0, 4.0));
+                ui.painter().rect_filled(r, 4.0, Color32::from_rgba_unmultiplied(20, 24, 30, 210));
+                ui.painter().galley(r.min + egui::vec2(4.0, 2.0), galley, Color32::WHITE);
             }
         }
     }
@@ -1169,7 +1508,7 @@ fn dialog_body(c: &mut Command, app: &mut App, ui: &mut egui::Ui) -> Option<Stri
                 }
                 _ => {}
             }
-            Some("Click edges to add/remove. Clicking a face adds all of its edges.".into())
+            Some("Click edges to add/remove (a face adds all its edges). Drag the arrow or type a value.".into())
         }
         CmdKind::Shell => {
             let Some(fid) = fid else { return Some("Select the faces to remove.".into()) };
@@ -1333,18 +1672,62 @@ fn dialog_body(c: &mut Command, app: &mut App, ui: &mut egui::Ui) -> Option<Stri
             let Some(fid) = fid else { return Some("Select bodies to move.".into()) };
             let Some(FeatureKind::Move(m)) = app.doc.feature(fid).map(|f| &f.kind) else { return None };
             let mut m = m.clone();
-            ui.label(format!("{} bodies", m.bodies.len()));
+            ui.horizontal(|ui| {
+                ui.add_sized([92.0, 22.0], egui::Label::new("Bodies"));
+                if ui.selectable_label(c.stage == 0, format!("{} selected", m.bodies.len())).clicked() {
+                    c.stage = 0;
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(RichText::new("Translate").small().strong().color(theme::TEXT_DIM));
             expr_field(ui, app, "X", &mut m.dx, "mm");
             expr_field(ui, app, "Y", &mut m.dy, "mm");
             expr_field(ui, app, "Z", &mut m.dz, "mm");
-            expr_field(ui, app, "Rotate Z", &mut m.rz, "deg");
+            ui.add_space(4.0);
+            ui.label(RichText::new("Rotate").small().strong().color(theme::TEXT_DIM));
+            ui.horizontal(|ui| {
+                ui.add_sized([92.0, 22.0], egui::Label::new("Axis"));
+                for (l, a) in [("X", AxisRef::X), ("Y", AxisRef::Y), ("Z", AxisRef::Z)] {
+                    if ui.selectable_label(m.axis == a, l).clicked() {
+                        m.axis = a;
+                    }
+                }
+                let picked = matches!(m.axis, AxisRef::Edge(_) | AxisRef::SketchLine { .. });
+                if ui.selectable_label(c.stage == 1 || picked, format!("{} Pick", ic::CURSOR_CLICK)).on_hover_text("Pick an edge or sketch line as the rotation axis").clicked() {
+                    c.stage = 1;
+                }
+            });
+            expr_field(ui, app, "Angle", &mut m.rz, "deg");
+            ui.horizontal(|ui| {
+                ui.add_sized([92.0, 22.0], egui::Label::new("Pivot"));
+                let txt = match m.pivot {
+                    Some(p) => format!("{}, {}, {}", lusion_core::expr::fmt_num(p[0]), lusion_core::expr::fmt_num(p[1]), lusion_core::expr::fmt_num(p[2])),
+                    None => "body centre".into(),
+                };
+                ui.label(RichText::new(txt).color(theme::TEXT_DIM));
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(96.0);
+                if ui.selectable_label(c.stage == 2, format!("{} Pick point", ic::CROSSHAIR)).on_hover_text("Click a face (its centre) or an edge (midpoint / circle centre)").clicked() {
+                    c.stage = 2;
+                }
+                if m.pivot.is_some() && ui.small_button("Reset").clicked() {
+                    m.pivot = None;
+                }
+            });
+            ui.add_space(4.0);
             ui.checkbox(&mut m.copy, "Create copy");
             if let Some(FeatureKind::Move(x)) = app.doc.feature_mut(fid).map(|f| &mut f.kind) {
                 if *x != m {
                     *x = m;
                 }
             }
-            None
+            Some(match c.stage {
+                1 => "Pick the rotation axis: an edge, sketch line or origin axis.",
+                2 => "Pick the pivot: a face (centre) or an edge (midpoint / circle centre).",
+                _ => "Drag the arrows to move and the rings to rotate (Shift = 1° steps). Click bodies to add/remove.",
+            }
+            .into())
         }
     }
 }

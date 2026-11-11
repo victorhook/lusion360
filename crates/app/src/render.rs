@@ -85,6 +85,8 @@ pub struct Scene {
     pub bodies: Vec<BodyDraw>,
     /// translucent fills (profiles, plane glyphs)
     pub fills: Vec<FillVert>,
+    /// fills drawn on top of everything (manipulators)
+    pub overlay_fills: Vec<FillVert>,
     /// depth-tested lines
     pub lines: Vec<LineSeg>,
     /// lines drawn on top of everything
@@ -152,6 +154,7 @@ pub struct Renderer {
     mesh_overlay: wgpu::RenderPipeline,
     outline: wgpu::RenderPipeline,
     fill: wgpu::RenderPipeline,
+    fill_top: wgpu::RenderPipeline,
     line: wgpu::RenderPipeline,
     line_top: wgpu::RenderPipeline,
     point: wgpu::RenderPipeline,
@@ -166,6 +169,7 @@ pub struct Renderer {
     overlay: DynBuf,
     points: DynBuf,
     fills: DynBuf,
+    top_fills: DynBuf,
     frame: u64,
     srgb_target: bool,
     /// draw list prepared for paint()
@@ -178,6 +182,7 @@ enum Cmd {
     Outline { key: usize, draw: u32 },
     Edges { key: usize, draw: u32, range: Range<u32> },
     Fills { draw: u32, n: u32 },
+    TopFills { draw: u32, n: u32 },
     Lines { draw: u32, n: u32 },
     Overlay { draw: u32, n: u32 },
     Points { draw: u32, n: u32 },
@@ -315,7 +320,8 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
-        let fill = mk("fill", "vs_fill", "fs_fill", &[Some(fill_layout)], T::TriangleList, false, C::LessEqual);
+        let fill = mk("fill", "vs_fill", "fs_fill", &[Some(fill_layout.clone())], T::TriangleList, false, C::LessEqual);
+        let fill_top = mk("fill top", "vs_fill", "fs_fill", &[Some(fill_layout)], T::TriangleList, false, C::Always);
         let line = mk("line", "vs_line", "fs_line", &[Some(line_layout.clone())], T::TriangleList, false, C::LessEqual);
         let line_top = mk("line top", "vs_line", "fs_line", &[Some(line_layout)], T::TriangleList, false, C::Always);
         let point = mk("point", "vs_point", "fs_point", &[Some(point_layout)], T::TriangleList, false, C::Always);
@@ -327,6 +333,7 @@ impl Renderer {
             mesh_overlay,
             outline,
             fill,
+            fill_top,
             line,
             line_top,
             point,
@@ -341,6 +348,7 @@ impl Renderer {
             overlay: DynBuf::new(device, vb, "overlay lines"),
             points: DynBuf::new(device, vb, "points"),
             fills: DynBuf::new(device, vb, "fills"),
+            top_fills: DynBuf::new(device, vb, "top fills"),
             frame: 0,
             srgb_target,
             plan: vec![],
@@ -520,6 +528,11 @@ impl Renderer {
             let d = push([1.0; 4], [1.0, 0.0, 0.0, 0.0]);
             plan.push(Cmd::Overlay { draw: d, n: scene.overlay_lines.len() as u32 });
         }
+        if !scene.overlay_fills.is_empty() {
+            self.top_fills.write(device, queue, bytemuck::cast_slice(&scene.overlay_fills));
+            let d = push([1.0; 4], [1.0, 0.0, 0.0, 0.0]);
+            plan.push(Cmd::TopFills { draw: d, n: scene.overlay_fills.len() as u32 });
+        }
         if !scene.points.is_empty() {
             self.points.write(device, queue, bytemuck::cast_slice(&scene.points));
             let d = push([1.0; 4], [1.0, 0.0, 0.0, 0.0]);
@@ -588,6 +601,12 @@ impl Renderer {
                     rp.set_pipeline(&self.fill);
                     rp.set_bind_group(1, &self.draws_bg, &[(*draw as u64 * DRAW_STRIDE) as u32]);
                     rp.set_vertex_buffer(0, self.fills.buf.slice(..));
+                    rp.draw(0..*n, 0..1);
+                }
+                Cmd::TopFills { draw, n } => {
+                    rp.set_pipeline(&self.fill_top);
+                    rp.set_bind_group(1, &self.draws_bg, &[(*draw as u64 * DRAW_STRIDE) as u32]);
+                    rp.set_vertex_buffer(0, self.top_fills.buf.slice(..));
                     rp.draw(0..*n, 0..1);
                 }
                 Cmd::Lines { draw, n } => {

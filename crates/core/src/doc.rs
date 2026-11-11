@@ -182,11 +182,21 @@ pub struct MoveBodies {
     pub dx: String,
     pub dy: String,
     pub dz: String,
-    /// rotation about the Z axis through the bodies' centre (degrees)
+    /// rotation angle (degrees) about `axis`
     #[serde(default)]
     pub rz: String,
     #[serde(default)]
     pub copy: bool,
+    /// rotation centre; None = centre of the selected bodies
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pivot: Option<[f64; 3]>,
+    /// rotation axis (X/Y/Z run through the pivot; edges / sketch lines are used as-is)
+    #[serde(default = "axis_z")]
+    pub axis: AxisRef,
+}
+
+fn axis_z() -> AxisRef {
+    AxisRef::Z
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

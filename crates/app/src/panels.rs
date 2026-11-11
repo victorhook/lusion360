@@ -10,18 +10,27 @@ use lusion_core::doc::*;
 use lusion_core::expr::{fmt_num, Parameter};
 
 fn tool_button(ui: &mut egui::Ui, icon: &str, label: &str, tip: &str) -> egui::Response {
-    let b = egui::Button::new(
-        egui::text::LayoutJob::default(),
-    );
-    let _ = b;
-    ui.vertical(|ui| {
-        ui.set_width(52.0);
-        let r = ui.add(egui::Button::new(RichText::new(icon).size(22.0)).min_size(egui::vec2(48.0, 32.0)).frame(false));
-        ui.label(RichText::new(label).size(10.0).color(theme::TEXT_DIM));
-        r
-    })
-    .inner
-    .on_hover_text(tip)
+    tool_button_active(ui, icon, label, tip, false)
+}
+
+/// Ribbon button; `active` draws it highlighted (the running command).
+fn tool_button_active(ui: &mut egui::Ui, icon: &str, label: &str, tip: &str, active: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(52.0, 46.0), egui::Sense::click());
+    let p = ui.painter();
+    let hovered = resp.hovered();
+    if active {
+        p.rect_filled(rect.shrink(1.0), 6.0, theme::ACCENT_DIM);
+        p.rect_stroke(rect.shrink(1.0), 6.0, egui::Stroke::new(1.0, theme::ACCENT), egui::StrokeKind::Inside);
+    } else if hovered {
+        p.rect_filled(rect.shrink(1.0), 6.0, Color32::from_rgb(0x2c, 0x32, 0x3a));
+    }
+    let fg = if active { Color32::WHITE } else if hovered { Color32::from_rgb(0xe8, 0xee, 0xf6) } else { Color32::from_rgb(0xc8, 0xd0, 0xda) };
+    p.text(rect.center_top() + egui::vec2(0.0, 16.0), egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(21.0), fg);
+    p.text(rect.center_bottom() - egui::vec2(0.0, 8.0), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(10.0), if active { Color32::WHITE } else { theme::TEXT_DIM });
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.on_hover_text(tip)
 }
 
 pub fn top_bar(app: &mut App, ui: &mut egui::Ui) {
@@ -177,11 +186,13 @@ pub fn top_bar(app: &mut App, ui: &mut egui::Ui) {
                 (CmdKind::Revolve, "Revolve", "Revolve profiles around an axis"),
             ];
             for (k, l, t) in items {
-                if tool_button(ui, k.icon(), l, t).clicked() {
+                let active = app.cmd.as_ref().map(|c| c.kind == k).unwrap_or(false);
+                if tool_button_active(ui, k.icon(), l, t, active).clicked() {
                     commands::start(app, k);
                 }
             }
-            if tool_button(ui, CmdKind::Plane.icon(), "Plane", "Offset construction plane").clicked() {
+            let plane_active = app.cmd.as_ref().map(|c| c.kind == CmdKind::Plane).unwrap_or(false);
+            if tool_button_active(ui, CmdKind::Plane.icon(), "Plane", "Offset construction plane", plane_active).clicked() {
                 commands::start(app, CmdKind::Plane);
             }
             ui.separator();
@@ -196,7 +207,8 @@ pub fn top_bar(app: &mut App, ui: &mut egui::Ui) {
                 (CmdKind::Mirror, "Mirror", "Mirror bodies across a plane"),
             ];
             for (k, l, t) in items {
-                if tool_button(ui, k.icon(), l, t).clicked() {
+                let active = app.cmd.as_ref().map(|c| c.kind == k).unwrap_or(false);
+                if tool_button_active(ui, k.icon(), l, t, active).clicked() {
                     commands::start(app, k);
                 }
             }
@@ -205,7 +217,7 @@ pub fn top_bar(app: &mut App, ui: &mut egui::Ui) {
             if tool_button(ui, ic::DOWNLOAD_SIMPLE, "Import", "Insert STEP / STL / OBJ / 3MF … (Ctrl+I)").clicked() {
                 app.import_file();
             }
-            if tool_button(ui, ic::FUNCTION, "Params", "User parameters").clicked() {
+            if tool_button_active(ui, ic::FUNCTION, "Params", "User parameters", app.show_params).clicked() {
                 app.show_params = true;
             }
             ui.separator();
@@ -213,7 +225,7 @@ pub fn top_bar(app: &mut App, ui: &mut egui::Ui) {
             if tool_button(ui, ic::EXPORT, "Export", "STEP / STL / 3MF / OBJ (Ctrl+E)").clicked() {
                 app.export(None);
             }
-            if tool_button(ui, ic::PRINTER, "3D Print", "Export 3MF for your slicer").clicked() {
+            if tool_button_active(ui, ic::PRINTER, "3D Print", "Export 3MF for your slicer", app.print.is_some()).clicked() {
                 crate::print::export_for_print(app);
             }
         });

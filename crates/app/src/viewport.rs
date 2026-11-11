@@ -888,55 +888,68 @@ fn view_cube(app: &mut App, ui: &mut egui::Ui, view: &View) {
     let resp = ui.interact(area, ui.id().with("view_cube"), Sense::click());
     let mouse = resp.hover_pos();
     let painter = ui.painter_at(view.rect);
-    // back-to-front
+    // back-to-front faces
     let mut faces: Vec<(Vec3, &str, f32, f32)> = CUBE_FACES.to_vec();
     faces.sort_by(|a, b| a.0.dot(cam.forward()).total_cmp(&b.0.dot(cam.forward())).reverse());
-    let mut hovered: Option<(f32, f32)> = None;
-    let mut polys = Vec::new();
-    for (n, label, yaw, pitch) in faces {
+    // Each face is a 3x3 grid: centre = face view, borders = edge views, corners = corner views.
+    let cuts = [-1.0f32, -0.62, 0.62, 1.0];
+    struct Zone {
+        pts: Vec<Pos2>,
+        dir: [i8; 3],
+        facing: f32,
+    }
+    let mut zones: Vec<Zone> = Vec::new();
+    let mut face_labels = Vec::new();
+    for (n, label, _, _) in &faces {
         let facing = -n.dot(cam.forward());
         if facing <= 0.02 {
             continue;
         }
-        let (u, v) = if n.z.abs() > 0.5 { (Vec3::X, Vec3::Y * n.z.signum()) } else { (Vec3::Z.cross(n), Vec3::Z) };
-        let pts: Vec<Pos2> = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
-            .iter()
-            .map(|(a, b)| proj(n + u * *a + v * *b))
-            .collect();
-        let inside = mouse.map(|m| point_in_poly(m, &pts)).unwrap_or(false);
-        if inside {
-            hovered = Some((yaw, pitch));
-        }
-        polys.push((pts, label, facing, inside, proj(n)));
-    }
-    // only the front-most hovered face counts
-    let mut hover_label = None;
-    if mouse.is_some() {
-        for (pts, label, _, inside, _) in polys.iter().rev() {
-            if *inside {
-                hover_label = Some(*label);
-                let _ = pts;
-                break;
+        let (u, v) = if n.z.abs() > 0.5 { (Vec3::X, Vec3::Y * n.z.signum()) } else { (Vec3::Z.cross(*n), Vec3::Z) };
+        for i in 0..3 {
+            for j in 0..3 {
+                let (a0, a1, b0, b1) = (cuts[i], cuts[i + 1], cuts[j], cuts[j + 1]);
+                let pts: Vec<Pos2> = [(a0, b0), (a1, b0), (a1, b1), (a0, b1)].iter().map(|(a, b)| proj(*n + u * *a + v * *b)).collect();
+                let d = *n + u * (i as f32 - 1.0) + v * (j as f32 - 1.0);
+                zones.push(Zone { pts, dir: [d.x.round() as i8, d.y.round() as i8, d.z.round() as i8], facing });
             }
         }
+        face_labels.push((proj(*n), *label, facing));
     }
-    for (pts, label, facing, _, c) in &polys {
-        let hot = hover_label == Some(*label);
-        let shade = (150.0 + 70.0 * facing) as u8;
+    // front-most zone under the mouse
+    let hovered: Option<[i8; 3]> = mouse.and_then(|m| zones.iter().rev().find(|z| point_in_poly(m, &z.pts)).map(|z| z.dir));
+    for z in &zones {
+        let hot = hovered == Some(z.dir);
+        let shade = (150.0 + 70.0 * z.facing) as u8;
         let fill = if hot { theme::ACCENT } else { Color32::from_rgba_unmultiplied(shade / 3 + 20, shade / 3 + 24, shade / 3 + 30, 235) };
-        painter.add(egui::Shape::convex_polygon(pts.clone(), fill, egui::Stroke::new(1.0, Color32::from_rgb(90, 100, 115))));
-        if *facing > 0.35 {
-            painter.text(*c, egui::Align2::CENTER_CENTER, *label, egui::FontId::proportional(9.0 + 2.0 * facing), Color32::from_gray((170.0 + 85.0 * facing) as u8));
+        painter.add(egui::Shape::convex_polygon(z.pts.clone(), fill, egui::Stroke::NONE));
+    }
+    // face outlines on top
+    for (n, _, _, _) in &faces {
+        if -n.dot(cam.forward()) <= 0.02 {
+            continue;
         }
+        let (u, v) = if n.z.abs() > 0.5 { (Vec3::X, Vec3::Y * n.z.signum()) } else { (Vec3::Z.cross(*n), Vec3::Z) };
+        let pts: Vec<Pos2> = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0), (-1.0, -1.0)].iter().map(|(a, b): &(f32, f32)| proj(*n + u * *a + v * *b)).collect();
+        painter.add(egui::Shape::line(pts, egui::Stroke::new(1.0, Color32::from_rgb(90, 100, 115))));
+    }
+    for (c, label, facing) in face_labels {
+        if facing > 0.35 {
+            painter.text(c, egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(9.0 + 2.0 * facing), Color32::from_gray((170.0 + 85.0 * facing) as u8));
+        }
+    }
+    if hovered.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     if resp.clicked() {
-        if let Some(l) = hover_label {
-            if let Some((_, _, yaw, pitch)) = CUBE_FACES.iter().find(|f| f.1 == l) {
-                app.cam.set_orientation(crate::camera::Camera::view_rot(yaw.to_radians(), pitch.to_radians()));
-            }
+        if let Some(d) = hovered {
+            // look from direction d towards the centre
+            let f = -Vec3::new(d[0] as f32, d[1] as f32, d[2] as f32).normalize();
+            let pitch = (-f.z).clamp(-1.0, 1.0).asin();
+            let yaw = if f.x.abs() + f.y.abs() < 1e-6 { 0.0 } else { (-f.x).atan2(f.y) };
+            app.cam.set_orientation(crate::camera::Camera::view_rot(yaw, pitch));
         }
     }
-    let _ = hovered;
 }
 
 fn point_in_poly(p: Pos2, pts: &[Pos2]) -> bool {

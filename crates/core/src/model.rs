@@ -1026,7 +1026,16 @@ impl Ctx<'_> {
 
     fn move_bodies(&mut self, f: &Feature, m: &MoveBodies, st: &mut ModelState) -> Result<(), String> {
         let d = DVec3::new(self.eval_expr("x", &m.dx)?, self.eval_expr("y", &m.dy)?, self.eval_expr("z", &m.dz)?);
-        let rz = self.eval_expr("rotation", &m.rz)?;
+        let ang = self.eval_expr("rotation", &m.rz)?;
+        let pivot = m.pivot.map(DVec3::from_array).unwrap_or_else(|| move_pivot(st, &m.bodies));
+        let (ao, adir) = match &m.axis {
+            AxisRef::X => (pivot, DVec3::X),
+            AxisRef::Y => (pivot, DVec3::Y),
+            AxisRef::Z => (pivot, DVec3::Z),
+            other => self.resolve_axis(st, other)?,
+        };
+        let rot = DMat4::from_translation(ao) * DMat4::from_quat(DQuat::from_axis_angle(adir.normalize(), ang.to_radians())) * DMat4::from_translation(-ao);
+        let mat = DMat4::from_translation(d) * rot;
         let mut k_idx = 0;
         for bid in &m.bodies {
             let body = st.bodies.get(bid).ok_or("body no longer exists")?.clone();
@@ -1034,11 +1043,6 @@ impl Ctx<'_> {
                 self.warnings.push("mesh bodies cannot be moved yet".into());
                 continue;
             }
-            let c = body.shape.bbox().map(|(a, b)| (a + b) * 0.5).unwrap_or(DVec3::ZERO);
-            let mat = DMat4::from_translation(d)
-                * DMat4::from_translation(c)
-                * DMat4::from_quat(DQuat::from_rotation_z(rz.to_radians()))
-                * DMat4::from_translation(-c);
             let op = k::transform(&body.shape, &mat).map_err(|e| e.0)?;
             let named = propagate(&op, &[&body_named(&body)], &[], op.shape(), &format!("f{}.moved", f.id));
             if m.copy {
@@ -1078,6 +1082,23 @@ pub fn text_fill_profiles(ss: &SolvedSketch, tid: u32, params: &ParamValues) -> 
         .filter(|(_, p)| contours.iter().filter(|c| inside(p.hint, c)).count() % 2 == 1)
         .map(|(i, _)| i)
         .collect()
+}
+
+/// Default rotation centre of a Move: centre of the bodies' combined bounding box.
+pub fn move_pivot(st: &ModelState, bodies: &[BodyId]) -> DVec3 {
+    let mut lo = DVec3::splat(f64::INFINITY);
+    let mut hi = DVec3::splat(f64::NEG_INFINITY);
+    for b in bodies.iter().filter_map(|b| st.bodies.get(b)) {
+        if let Some((a, c)) = b.shape.bbox() {
+            lo = lo.min(a);
+            hi = hi.max(c);
+        }
+    }
+    if lo.x <= hi.x {
+        (lo + hi) * 0.5
+    } else {
+        DVec3::ZERO
+    }
 }
 
 pub fn find_profile<'a>(ss: &'a SolvedSketch, curves: &[u32], hint: DVec2) -> Option<&'a Profile> {
