@@ -69,6 +69,18 @@ The geometry kernel is **OpenCASCADE 8** (the same kernel FreeCAD uses). On the 
 
 Windows: the same `cargo build --release` works with MSVC. The code has no Linux-only parts, but only Linux has been tested so far.
 
+## AI agents (MCP)
+
+Lusion360 includes a local stdio [Model Context Protocol](https://modelcontextprotocol.io/) server. It runs directly on the parametric core — it does not start the GUI or open a network port — so it is suitable for local coding/agent clients:
+
+```bash
+cargo build --release -p lusion-mcp
+```
+
+Configure the client to launch `target/release/lusion-mcp`. The server keeps documents in memory for the session and writes normal editable `.l360` files when asked. Its initial tool set creates/opens/saves native designs, sets named parameters, creates constrained rectangle/circle sketches, extrudes solved profiles, and reports a compact timeline, validation status, bounds, and volume.
+
+All modelling calls are transactional: an operation that fails to recompute is rolled back. An agent should use named parameters and inspect after meaningful changes, then save the resulting `.l360` for opening in the desktop application.
+
 ## Architecture
 
 ```

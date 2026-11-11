@@ -1,0 +1,16 @@
+[package]
+name = "lusion-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lusion-mcp"
+path = "src/main.rs"
+
+[dependencies]
+lusion-core = { path = "../core" }
+glam.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true

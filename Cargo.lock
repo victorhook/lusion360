@@ -1822,6 +1822,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lusion-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "glam 0.34.3",
+ "lusion-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lusion-meshio"
 version = "0.1.0"
 dependencies = [
