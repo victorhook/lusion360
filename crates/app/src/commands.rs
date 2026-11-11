@@ -831,7 +831,11 @@ impl Command {
             let den = a * c - b * b;
             if den.abs() > 1e-9 {
                 let s = (b * e - c * dd) / den;
-                let step = 10f32.powf((app.cam.cam.distance / 50.0).log10().floor()).max(0.01) * 0.5;
+                // snap to a "nice" step (1/2/5 x 10^n) worth ~3 pixels at the handle
+                let px = app.cam.cam.px_size(view.size.y) * if app.cam.cam.ortho { 1.0 } else { (tip - app.cam.cam.eye()).length() / app.cam.cam.distance.max(1e-6) };
+                let raw = (px * 3.0).max(1e-4);
+                let mag = 10f32.powf(raw.log10().floor());
+                let step = [1.0, 2.0, 5.0, 10.0].iter().map(|m| m * mag).find(|s| *s >= raw).unwrap_or(10.0 * mag);
                 let v = ((s / step).round() * step) as f64;
                 if let Some(FeatureKind::Extrude(ex)) = self.feature_mut(app) {
                     let txt = lusion_core::expr::fmt_num(v);

@@ -257,7 +257,7 @@ pub(crate) fn write(meshes: &[TriMesh]) -> Result<Vec<u8>> {
             .sum::<usize>(),
     );
     s.push_str("# Wavefront OBJ exported by Lusion360 (units: mm)\n");
-    let mut base = 1usize;
+    let (mut vbase, mut nbase) = (1usize, 1usize);
     for (mi, m) in meshes.iter().enumerate() {
         let computed;
         let m = if m.normals.len() == m.positions.len() {
@@ -285,8 +285,20 @@ pub(crate) fn write(meshes: &[TriMesh]) -> Result<Vec<u8>> {
             name
         };
         let _ = writeln!(s, "o {name}");
+        // Positions are written once per distinct point so faces share
+        // vertices (slicers need a watertight, manifold index structure);
+        // normals are indexed separately so creases stay sharp.
+        let mut uniq: std::collections::HashMap<[u32; 3], usize> = std::collections::HashMap::new();
+        let mut vmap: Vec<usize> = Vec::with_capacity(m.positions.len());
+        let mut nv = 0usize;
         for p in &m.positions {
-            let _ = writeln!(s, "v {} {} {}", p[0], p[1], p[2]);
+            let key = [p[0].to_bits(), p[1].to_bits(), p[2].to_bits()];
+            let id = *uniq.entry(key).or_insert_with(|| {
+                let _ = writeln!(s, "v {} {} {}", p[0], p[1], p[2]);
+                nv += 1;
+                nv - 1
+            });
+            vmap.push(id);
         }
         for n in &m.normals {
             let _ = writeln!(s, "vn {} {} {}", n[0], n[1], n[2]);
@@ -296,14 +308,15 @@ pub(crate) fn write(meshes: &[TriMesh]) -> Result<Vec<u8>> {
             if t.iter().any(|&i| i as usize >= np) {
                 continue;
             }
-            let (a, b, c) = (
-                t[0] as usize + base,
-                t[1] as usize + base,
-                t[2] as usize + base,
-            );
-            let _ = writeln!(s, "f {a}//{a} {b}//{b} {c}//{c}");
+            let v = |i: u32| vmap[i as usize] + vbase;
+            let n = |i: u32| i as usize + nbase;
+            if v(t[0]) == v(t[1]) || v(t[1]) == v(t[2]) || v(t[0]) == v(t[2]) {
+                continue; // degenerate after welding
+            }
+            let _ = writeln!(s, "f {}//{} {}//{} {}//{}", v(t[0]), n(t[0]), v(t[1]), n(t[1]), v(t[2]), n(t[2]));
         }
-        base += np;
+        vbase += nv;
+        nbase += np;
     }
     Ok(s.into_bytes())
 }

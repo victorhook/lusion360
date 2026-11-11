@@ -85,18 +85,29 @@ fn bounds(p: &[[f32; 3]]) -> ([f32; 3], [f32; 3]) {
     (lo, hi)
 }
 
-/// Cache of display meshes. Tessellation of B-reps runs on worker threads
-/// (on a deep copy of the shape); until a mesh is ready the previous mesh of
-/// the same body is shown.
+/// Cache of display meshes.
+///
+/// Small bodies are tessellated synchronously (the time it took is remembered
+/// per body). Slow bodies are tessellated on a worker thread from a deep copy;
+/// at most one job runs per body, and while it runs the newest finished mesh
+/// of that body is shown. This keeps interactive edits (dragging an extrude)
+/// smooth: the preview updates as fast as meshing allows instead of waiting
+/// for a mesh of the exact current shape.
 #[derive(Default)]
 pub struct MeshCache {
     map: HashMap<u64, (Arc<BodyMesh>, u64)>,
     generation: u64,
-    pending: HashMap<u64, std::sync::mpsc::Receiver<Option<BodyMesh>>>,
+    /// body id -> (shape key, receiver) of the job in flight
+    inflight: HashMap<u64, (u64, std::sync::mpsc::Receiver<(Option<BodyMesh>, f64)>)>,
     /// last mesh shown per body (for stale display while recomputing)
     last_for_body: HashMap<u64, Arc<BodyMesh>>,
+    /// last tessellation time per body (ms)
+    cost_ms: HashMap<u64, f64>,
     failed: std::collections::HashSet<u64>,
 }
+
+/// Bodies cheaper than this are meshed inline.
+const SYNC_BUDGET_MS: f64 = 30.0;
 
 impl MeshCache {
     fn key(body: &Body) -> Option<u64> {
@@ -118,68 +129,82 @@ impl MeshCache {
 
     /// True while background tessellation is running.
     pub fn busy(&self) -> bool {
-        !self.pending.is_empty()
+        !self.inflight.is_empty()
+    }
+
+    /// Collect a finished background job for `bid`, if any.
+    fn poll(&mut self, bid: u64) {
+        let Some((key, rx)) = self.inflight.get(&bid) else { return };
+        let key = *key;
+        match rx.try_recv() {
+            Ok((Some(m), ms)) => {
+                self.inflight.remove(&bid);
+                let m = Arc::new(m);
+                self.map.insert(key, (m.clone(), self.generation));
+                self.last_for_body.insert(bid, m);
+                self.cost_ms.insert(bid, ms);
+            }
+            Ok((None, _)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.inflight.remove(&bid);
+                self.failed.insert(key);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
     }
 
     pub fn get(&mut self, body: &Body) -> Option<Arc<BodyMesh>> {
         let key = Self::key(body)?;
+        let bid = body.id.0;
         let generation = self.generation;
+        self.poll(bid);
         if let Some((m, g)) = self.map.get_mut(&key) {
             *g = generation;
             let m = m.clone();
-            self.last_for_body.insert(body.id.0, m.clone());
+            self.last_for_body.insert(bid, m.clone());
             return Some(m);
         }
-        // finished in the background?
-        if let Some(rx) = self.pending.get(&key) {
-            match rx.try_recv() {
-                Ok(Some(m)) => {
-                    self.pending.remove(&key);
-                    let m = Arc::new(m);
-                    self.map.insert(key, (m.clone(), generation));
-                    self.last_for_body.insert(body.id.0, m.clone());
-                    return Some(m);
-                }
-                Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.pending.remove(&key);
-                    self.failed.insert(key);
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    return self.last_for_body.get(&body.id.0).cloned();
-                }
-            }
-        }
+        let stale = self.last_for_body.get(&bid).cloned();
         if self.failed.contains(&key) {
-            return self.last_for_body.get(&body.id.0).cloned();
+            return stale;
         }
         let m = match &body.mesh {
             Some(im) => Arc::new(BodyMesh::from_import(im)),
             None => {
-                let faces = body.shape.faces().len();
-                let stale = self.last_for_body.get(&body.id.0).cloned();
-                if faces > 24 && stale.is_some() || faces > 400 {
-                    // heavy: tessellate a deep copy on a worker thread
-                    let copy = body.shape.deep_copy();
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    std::thread::spawn(move || {
-                        let r = BodyMesh::from_shape(&copy).ok();
-                        let _ = tx.send(r);
-                    });
-                    self.pending.insert(key, rx);
+                let known = self.cost_ms.get(&bid).copied();
+                let cheap = match known {
+                    Some(ms) => ms < SYNC_BUDGET_MS,
+                    None => body.shape.faces().len() <= 400 || stale.is_none(),
+                };
+                if !cheap {
+                    // one job per body; a newer request waits for the running one
+                    if !self.inflight.contains_key(&bid) {
+                        let copy = body.shape.deep_copy();
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let t = std::time::Instant::now();
+                            let r = BodyMesh::from_shape(&copy).ok();
+                            let _ = tx.send((r, t.elapsed().as_secs_f64() * 1000.0));
+                        });
+                        self.inflight.insert(bid, (key, rx));
+                    }
                     return stale;
                 }
+                let t = std::time::Instant::now();
                 match BodyMesh::from_shape(&body.shape) {
-                    Ok(m) => Arc::new(m),
+                    Ok(m) => {
+                        self.cost_ms.insert(bid, t.elapsed().as_secs_f64() * 1000.0);
+                        Arc::new(m)
+                    }
                     Err(e) => {
                         log::warn!("tessellation failed: {e}");
                         self.failed.insert(key);
-                        return None;
+                        return stale;
                     }
                 }
             }
         };
         self.map.insert(key, (m.clone(), generation));
-        self.last_for_body.insert(body.id.0, m.clone());
+        self.last_for_body.insert(bid, m.clone());
         Some(m)
     }
 

@@ -655,7 +655,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             };
             let st = app.pick_state().clone();
             let navigating = resp.dragged_by(PointerButton::Middle) || resp.dragged_by(PointerButton::Secondary);
-            app.hover = match (ray, navigating) {
+            // no picking while dragging a manipulator (avoids BVH rebuilds of every preview mesh)
+            app.hover = match (ray, navigating || consumed) {
                 (Some(r), false) => pick(app, &st, &r, &view, filter),
                 _ => None,
             };

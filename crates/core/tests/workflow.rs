@@ -437,3 +437,71 @@ fn multiple_extrusions_from_one_sketch() {
     assert!(zs.iter().any(|(lo, hi)| (lo - 0.0).abs() < 1e-6 && (hi - 3.0).abs() < 1e-6));
     assert!(zs.iter().any(|(lo, hi)| (lo - 3.0).abs() < 1e-6 && (hi - 13.0).abs() < 1e-6));
 }
+
+/// Every edge used by exactly two triangles in opposite directions (closed, oriented, manifold).
+fn manifold_errors(idx: &[u32]) -> usize {
+    use std::collections::HashMap;
+    let mut dir: HashMap<(u32, u32), i32> = HashMap::new();
+    for t in idx.chunks_exact(3) {
+        for k in 0..3 {
+            *dir.entry((t[k], t[(k + 1) % 3])).or_default() += 1;
+        }
+    }
+    let mut bad = 0;
+    for (&(a, b), &n) in &dir {
+        if n != 1 || dir.get(&(b, a)).copied().unwrap_or(0) != 1 {
+            bad += 1;
+        }
+    }
+    bad
+}
+
+#[test]
+fn exports_are_manifold() {
+    // donut: circle on XZ revolved around Z
+    let mut doc = Document::default();
+    let mut model = Model::new();
+    let mut s = Sketch::new(PlaneRef::Origin(OriginPlane::XZ));
+    let c = s.add_point(DVec2::new(30.0, 5.0));
+    s.add_curve(CurveGeom::Circle { c, r: 5.0 }, false);
+    let s1 = doc.insert_feature("S".into(), ROOT, FeatureKind::Sketch(s));
+    model.update(&doc);
+    let pr = profile_ref(&model, &doc, s1, |_| true);
+    doc.insert_feature("R".into(), ROOT, FeatureKind::Revolve(Revolve { profiles: vec![pr], axis: AxisRef::Z, angle: "360".into(), op: Operation::NewBody, targets: vec![] }));
+    model.update(&doc);
+    ok(&model);
+    let donut: Vec<_> = model.current(&doc).bodies.values().collect();
+    let bracket_doc = lusion_core::io::load_native(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/bracket.l360"))).ok();
+    let mut bm = Model::new();
+    let mut cases: Vec<(&str, Vec<&lusion_core::model::Body>)> = vec![("donut", donut)];
+    if let Some(d) = &bracket_doc {
+        bm.update(d);
+        cases.push(("bracket", bm.current(d).bodies.values().collect()));
+    }
+    let dir = std::env::temp_dir().join(format!("l360-manifold-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, bodies) in cases {
+        // OBJ: parse the file exactly like a slicer would (faces index `v` lines)
+        let p = dir.join(format!("{name}.obj"));
+        lusion_core::io::export(&p, &bodies, &[name.into()]).unwrap();
+        let txt = std::fs::read_to_string(&p).unwrap();
+        let mut idx = Vec::new();
+        for l in txt.lines().filter(|l| l.starts_with("f ")) {
+            for c in l.split_whitespace().skip(1) {
+                idx.push(c.split('/').next().unwrap().parse::<u32>().unwrap() - 1);
+            }
+        }
+        assert!(!idx.is_empty());
+        assert_eq!(manifold_errors(&idx), 0, "{name}.obj is not manifold");
+        // 3MF: inspect the model XML triangles
+        let p = dir.join(format!("{name}.3mf"));
+        lusion_core::io::export(&p, &bodies, &[name.into()]).unwrap();
+        let meshes = lusion_meshio::load_mesh_file(&p).unwrap();
+        // loader may split vertices for normals; re-weld by position before checking
+        for m in meshes {
+            let (_, idx) = lusion_core::io::weld(&m.positions, &m.indices);
+            assert_eq!(manifold_errors(&idx), 0, "{name}.3mf is not manifold");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

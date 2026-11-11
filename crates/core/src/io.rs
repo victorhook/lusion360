@@ -5,6 +5,7 @@ use crate::model::{Body, ModelState};
 use crate::tess::BodyMesh;
 use anyhow::{anyhow, bail, Context, Result};
 use lusion_kernel::Shape;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -124,13 +125,90 @@ fn body_trimesh(b: &Body, fine: bool) -> Result<lusion_meshio::TriMesh> {
             ..Default::default()
         }
     };
-    Ok(lusion_meshio::TriMesh {
-        name: format!("body{}", b.id.0),
-        positions: m.positions,
-        normals: m.normals,
-        indices: m.indices,
-        color: None,
-    })
+    let (positions, indices) = weld(&m.positions, &m.indices);
+    let normals = vertex_normals(&positions, &indices);
+    Ok(lusion_meshio::TriMesh { name: format!("body{}", b.id.0), positions, normals, indices, color: None })
+}
+
+/// Merge vertices closer than a small tolerance (B-rep tessellations have a
+/// separate copy of every boundary/seam node per face) and drop triangles that
+/// become degenerate. Result: a closed, manifold mesh for closed solids.
+pub fn weld(pos: &[[f32; 3]], idx: &[u32]) -> (Vec<[f32; 3]>, Vec<u32>) {
+    let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+    for p in pos {
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt().max(1e-3);
+    let tol = (diag * 2e-6).max(1e-6);
+    let cell = tol * 2.0;
+    let key = |p: &[f32; 3]| [(p[0] / cell).floor() as i64, (p[1] / cell).floor() as i64, (p[2] / cell).floor() as i64];
+    let mut grid: HashMap<[i64; 3], Vec<u32>> = HashMap::new();
+    let mut out: Vec<[f32; 3]> = Vec::new();
+    let mut remap: Vec<u32> = Vec::with_capacity(pos.len());
+    for p in pos {
+        let k = key(p);
+        let mut found = None;
+        'search: for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    if let Some(list) = grid.get(&[k[0] + dx, k[1] + dy, k[2] + dz]) {
+                        for &i in list {
+                            let q = out[i as usize];
+                            if (q[0] - p[0]).abs() <= tol && (q[1] - p[1]).abs() <= tol && (q[2] - p[2]).abs() <= tol {
+                                found = Some(i);
+                                break 'search;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let id = match found {
+            Some(i) => i,
+            None => {
+                out.push(*p);
+                let i = (out.len() - 1) as u32;
+                grid.entry(k).or_default().push(i);
+                i
+            }
+        };
+        remap.push(id);
+    }
+    let mut tris = Vec::with_capacity(idx.len());
+    for t in idx.chunks_exact(3) {
+        let (a, b, c) = (remap[t[0] as usize], remap[t[1] as usize], remap[t[2] as usize]);
+        if a != b && b != c && a != c {
+            tris.extend_from_slice(&[a, b, c]);
+        }
+    }
+    (out, tris)
+}
+
+fn vertex_normals(pos: &[[f32; 3]], idx: &[u32]) -> Vec<[f32; 3]> {
+    let mut n = vec![[0.0f32; 3]; pos.len()];
+    for t in idx.chunks_exact(3) {
+        let (a, b, c) = (pos[t[0] as usize], pos[t[1] as usize], pos[t[2] as usize]);
+        let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let f = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+        for &i in t {
+            for k in 0..3 {
+                n[i as usize][k] += f[k];
+            }
+        }
+    }
+    for v in n.iter_mut() {
+        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        if l > 0.0 {
+            *v = [v[0] / l, v[1] / l, v[2] / l];
+        } else {
+            *v = [0.0, 0.0, 1.0];
+        }
+    }
+    n
 }
 
 /// Export bodies to `path`; format chosen by extension.
