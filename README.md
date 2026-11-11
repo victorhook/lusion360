@@ -77,9 +77,9 @@ Lusion360 includes a local stdio [Model Context Protocol](https://modelcontextpr
 cargo build --release -p lusion-mcp
 ```
 
-Configure the client to launch `target/release/lusion-mcp`. The server keeps documents in memory for the session and writes normal editable `.l360` files when asked. Its initial tool set creates/opens/saves native designs, sets named parameters, creates constrained rectangle/circle sketches, extrudes solved profiles, and reports a compact timeline, validation status, bounds, and volume.
+Configure the client to launch `target/release/lusion-mcp`. The server keeps documents in memory for the session and writes normal editable `.l360` files when asked. It can create/open/save native designs, set named parameters, create constrained rectangle/circle sketches on origin planes or stable planar face references, extrude solved profiles, fillet/chamfer named edges, shell selected faces, export CAD/mesh files, and write a fast isometric SVG preview.
 
-All modelling calls are transactional: an operation that fails to recompute is rolled back. An agent should use named parameters and inspect after meaningful changes, then save the resulting `.l360` for opening in the desktop application.
+All modelling calls are transactional: an operation that fails to recompute is rolled back. An agent should call `lusion_query_geometry` before selecting faces or edges; it returns persistent names with useful geometry metadata. Use named parameters and inspect after meaningful changes, then save the resulting `.l360` for opening in the desktop application.
 
 ## Architecture
 
