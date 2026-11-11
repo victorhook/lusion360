@@ -272,22 +272,37 @@ pub fn push_polyline(v: &mut Vec<LineSeg>, pts: &[Vec3], color: [f32; 4], width:
 }
 
 pub fn push_dashed(v: &mut Vec<LineSeg>, pts: &[Vec3], color: [f32; 4], width: f32, dash: f32) {
-    let mut acc = 0.0f32;
+    if !(dash > 1e-9) || !dash.is_finite() {
+        push_polyline(v, pts, color, width);
+        return;
+    }
+    // walk the polyline by cumulative length; dash k covers [k*dash, (k+1)*dash), drawn when k is even
+    let mut acc = 0.0f64;
+    let dash = dash as f64;
+    let mut budget = 20_000usize;
     for w in pts.windows(2) {
-        let len = (w[1] - w[0]).length();
-        if len < 1e-9 {
+        let len = (w[1] - w[0]).length() as f64;
+        if len < 1e-12 {
             continue;
         }
-        let mut s = 0.0;
-        while s < len {
-            let phase = (acc / dash) as i64 % 2 == 0;
-            let step = (dash - acc % dash).min(len - s);
-            if phase {
-                push_line(v, w[0].lerp(w[1], s / len), w[0].lerp(w[1], (s + step) / len), color, width);
+        let (t0, t1) = (acc, acc + len);
+        let (k0, k1) = ((t0 / dash).floor() as i64, (t1 / dash).floor() as i64);
+        for k in k0..=k1 {
+            if budget == 0 {
+                return;
             }
-            s += step;
-            acc += step;
+            budget -= 1;
+            if k % 2 != 0 {
+                continue;
+            }
+            let a = (k as f64 * dash).max(t0);
+            let b = ((k + 1) as f64 * dash).min(t1);
+            if b > a {
+                let (fa, fb) = (((a - t0) / len) as f32, ((b - t0) / len) as f32);
+                push_line(v, w[0].lerp(w[1], fa), w[0].lerp(w[1], fb), color, width);
+            }
         }
+        acc = t1;
     }
 }
 
@@ -622,6 +637,14 @@ fn build_scene(app: &mut App, view: &View) -> Scene {
     }
     if in_sketch {
         crate::sketch_mode::draw(app, &mut scene, view);
+        // project tool: highlight the model face/edge under the cursor
+        let ph = match &app.mode {
+            Mode::Sketch(s) if s.tool == crate::sketch_mode::SkTool::Project => s.proj_hover(),
+            _ => None,
+        };
+        if let Some(p) = ph {
+            highlight(app, &mut scene, &pst, p, false);
+        }
     }
     scene
 }

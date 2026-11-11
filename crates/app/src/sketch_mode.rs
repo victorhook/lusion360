@@ -80,6 +80,8 @@ pub enum SkTool {
     Trim,
     Fillet,
     Text,
+    Offset,
+    Project,
     Con(ConKind),
 }
 
@@ -97,6 +99,8 @@ impl SkTool {
             SkTool::Trim => "Click the part of a curve to remove.",
             SkTool::Fillet => "Click a corner where two lines meet to round it.",
             SkTool::Text => "Click where the text should start (baseline, left).",
+            SkTool::Offset => "Click a curve (its connected chain is used), move to choose side & distance, click — or type a value.",
+            SkTool::Project => "Click a face to project its outline, or an edge, onto the sketch plane.",
             SkTool::Con(_) => "Pick the entities to constrain.",
         }
     }
@@ -154,11 +158,21 @@ pub struct SketchSession {
     refs: Option<Vec<DVec2>>,
     /// value typed while drawing (Fusion-style heads-up input)
     typed: Option<String>,
+    /// offset tool: chosen chain (start curve)
+    offset_src: Option<CId>,
+    /// project tool: model entity under the cursor
+    proj_hover: Option<crate::app::Pick>,
     /// text being edited: (id, text, height, newly created, original text, original height)
     text_edit: Option<(u32, String, String, bool, String, String)>,
 }
 
 // ------------------------------------------------------------------ enter / leave
+
+impl SketchSession {
+    pub fn proj_hover(&self) -> Option<crate::app::Pick> {
+        self.proj_hover
+    }
+}
 
 pub fn enter(app: &mut App, fid: FeatureId) {
     let before = app.doc.clone();
@@ -201,6 +215,8 @@ pub fn enter_with_before(app: &mut App, fid: FeatureId, before: Document, create
         cam_before: Some(app.cam.cam),
         refs: None,
         typed: None,
+        offset_src: None,
+        proj_hover: None,
         text_edit: None,
     };
     if !created {
@@ -848,7 +864,7 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
     let (cursor, snap) = match p2 {
         Some(p) if !navigating => {
             let exclude: Vec<PId> = s.drag.as_ref().map(|d| d.points.iter().map(|x| x.0).collect()).unwrap_or_default();
-            if matches!(tool, SkTool::Select | SkTool::Dimension | SkTool::Trim | SkTool::Fillet | SkTool::Con(_)) {
+            if matches!(tool, SkTool::Select | SkTool::Dimension | SkTool::Trim | SkTool::Fillet | SkTool::Offset | SkTool::Project | SkTool::Con(_)) {
                 (p, None)
             } else {
                 let (q, sn) = compute_snap(&sk, p, px, &exclude);
@@ -887,7 +903,7 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
     s.snap = snap;
     let mut hover = None;
     if let (Some(p), false) = (p2, navigating) {
-        if matches!(tool, SkTool::Select | SkTool::Dimension | SkTool::Con(_) | SkTool::Trim | SkTool::Fillet) {
+        if matches!(tool, SkTool::Select | SkTool::Dimension | SkTool::Con(_) | SkTool::Trim | SkTool::Fillet | SkTool::Offset) {
             hover = dim_label_hit(app, fid, view).map(SkEnt::Con);
             if hover.is_none() && tool != SkTool::Trim {
                 hover = nearest_point(&sk, p, px * 8.0, &[]).map(SkEnt::Point);
@@ -901,6 +917,15 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
         }
     }
     session(app).unwrap().hover = hover;
+    if tool == SkTool::Project {
+        let st = app.pick_state().clone();
+        let filter = crate::app::Filter { faces: true, edges: true, ..Default::default() };
+        let h = match (ray, navigating) {
+            (Some(r), false) => crate::viewport::pick(app, &st, &r, view, filter).map(|h| h.pick),
+            _ => None,
+        };
+        session(app).unwrap().proj_hover = h;
+    }
 
     // ---- drags (select tool)
     if tool == SkTool::Select {
@@ -1058,6 +1083,20 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
                 draw_click(app, fid, cursor, snap);
             }
             SkTool::Dimension => dim_click(app, fid, hover, p),
+            SkTool::Offset => {
+                let src = session(app).and_then(|s| s.offset_src);
+                match (src, hover) {
+                    (Some(src), _) => create_offset(app, src, p, None),
+                    (None, Some(SkEnt::Curve(c))) => session(app).unwrap().offset_src = Some(c),
+                    _ => {}
+                }
+            }
+            SkTool::Project => {
+                let hit = session(app).and_then(|s| s.proj_hover);
+                if let Some(h) = hit {
+                    project_pick(app, h);
+                }
+            }
             SkTool::Text => {
                 let before = app.doc.clone();
                 let tid = sketch_mut(app, fid).map(|skm| {
@@ -1132,7 +1171,8 @@ fn keyboard(app: &mut App, ui: &egui::Ui) {
     }
     // typing a number while drawing opens the value box
     if let Some(s) = session(app) {
-        let drawing = !s.chain.is_empty() && matches!(s.tool, SkTool::Line | SkTool::Rect | SkTool::CenterRect | SkTool::Circle);
+        let drawing = (!s.chain.is_empty() && matches!(s.tool, SkTool::Line | SkTool::Rect | SkTool::CenterRect | SkTool::Circle))
+            || (s.tool == SkTool::Offset && s.offset_src.is_some());
         if drawing && s.typed.is_none() {
             let started: Option<String> = ui.input(|i| {
                 i.events.iter().find_map(|e| match e {
@@ -1153,7 +1193,8 @@ fn keyboard(app: &mut App, ui: &egui::Ui) {
         (Key::R, SkTool::Rect),
         (Key::C, SkTool::Circle),
         (Key::A, SkTool::Arc),
-        (Key::P, SkTool::Point),
+        (Key::P, SkTool::Project),
+        (Key::O, SkTool::Offset),
         (Key::D, SkTool::Dimension),
         (Key::T, SkTool::Trim),
         (Key::G, SkTool::Fillet),
@@ -1167,9 +1208,10 @@ fn keyboard(app: &mut App, ui: &egui::Ui) {
         let s = session(app).unwrap();
         if s.edit_dim.is_some() {
             s.edit_dim = None;
-        } else if !s.chain.is_empty() || !s.picks.is_empty() {
+        } else if !s.chain.is_empty() || !s.picks.is_empty() || s.offset_src.is_some() {
             s.chain.clear();
             s.picks.clear();
+            s.offset_src = None;
         } else if s.tool != SkTool::Select {
             s.tool = SkTool::Select;
         } else if !s.selection.is_empty() {
@@ -1215,6 +1257,8 @@ pub fn set_tool(app: &mut App, t: SkTool) {
         s.tool = t;
         s.chain.clear();
         s.picks.clear();
+        s.offset_src = None;
+        s.proj_hover = None;
     }
 }
 
@@ -1421,6 +1465,14 @@ fn draw_click(app: &mut App, fid: FeatureId, p: DVec2, snap: Option<Snap>) {
 
 /// Create geometry from a typed value while drawing.
 fn apply_typed(app: &mut App, text: &str) {
+    if let Some((src, cursor)) = session(app).filter(|s| s.tool == SkTool::Offset).and_then(|s| s.offset_src.zip(s.cursor)) {
+        match app.model.params.eval(text) {
+            Ok(d) if d.abs() > 1e-9 => create_offset(app, src, cursor, Some(d.abs())),
+            Ok(_) => {}
+            Err(e) => app.error(format!("Invalid value: {e}")),
+        }
+        return;
+    }
     let Some(s) = session(app) else { return };
     let fid = s.fid;
     let tool = s.tool;
@@ -1908,6 +1960,31 @@ pub fn draw(app: &mut App, scene: &mut Scene, view: &View) {
             push_polyline(&mut scene.overlay_lines, &pts, col, 1.6);
         }
     }
+    // offset tool: highlight the chain under the cursor / preview the offset
+    if s.tool == SkTool::Offset {
+        let src = s.offset_src.or(match s.hover {
+            Some(SkEnt::Curve(c)) => Some(c),
+            _ => None,
+        });
+        if let Some(src) = src {
+            let chain = offset_chain(sk, src);
+            for (cid, _) in &chain.elems {
+                if let Some(c) = sk.curve(*cid) {
+                    let pts: Vec<Vec3> = sk.curve_polyline(c, tol).iter().map(|p| f.to3(*p).as_vec3()).collect();
+                    push_polyline(&mut scene.overlay_lines, &pts, theme::SK_HOVER, 3.0);
+                }
+            }
+            if let (Some(_), Some(cur)) = (s.offset_src, s.cursor) {
+                let (side, d) = offset_side(sk, &chain, cur);
+                if let Some(g) = offset_geometry(sk, &chain, side, snap_dist(d, s.px)) {
+                    for poly in g.preview {
+                        let pts: Vec<Vec3> = poly.iter().map(|p| f.to3(*p).as_vec3()).collect();
+                        push_dashed(&mut scene.overlay_lines, &pts, [0.35, 0.75, 1.0, 0.95], 2.0, (s.px * 6.0) as f32);
+                    }
+                }
+            }
+        }
+    }
     // rubber band preview
     if let Some(cur) = s.cursor {
         let accent = [0.35, 0.75, 1.0, 0.95];
@@ -2117,6 +2194,14 @@ pub fn overlay(app: &mut App, ui: &mut egui::Ui, view: &View) {
             painter.text(pos, egui::Align2::CENTER_CENTER, g, egui::FontId::proportional(10.0), col);
         }
     }
+    // offset distance label
+    if let (SkTool::Offset, Some(src), Some(c)) = (s.tool, s.offset_src, s.cursor) {
+        let chain = offset_chain(&sk, src);
+        let (_, d) = offset_side(&sk, &chain, c);
+        if let Some(sp) = proj(c) {
+            painter.text(sp + egui::vec2(14.0, -16.0), egui::Align2::LEFT_BOTTOM, format!("{} mm", fmt_num(snap_dist(d, s.px))), egui::FontId::proportional(12.0), Color32::from_rgb(170, 210, 255));
+        }
+    }
     // H/V inference hint
     if let (Some(h), Some(c)) = (s.hv_hint, s.cursor) {
         if let Some(sp) = proj(c) {
@@ -2238,6 +2323,7 @@ pub fn overlay(app: &mut App, ui: &mut egui::Ui, view: &View) {
         let mut keep = true;
         let mut apply = false;
         let hint = match tool {
+            SkTool::Offset => "offset",
             SkTool::Line => "length",
             SkTool::Circle => "diameter",
             _ => "width x height",
@@ -2356,20 +2442,40 @@ pub fn project_face_edges(app: &mut App) {
     let Some(fid) = session(app).map(|s| s.fid) else { return };
     let Some(sk) = sketch(app, fid).cloned() else { return };
     let PlaneRef::Face(fr) = &sk.plane else {
-        app.info("Projection works for sketches placed on a face");
+        // not on a face: switch to the interactive project tool
+        set_tool(app, SkTool::Project);
         return;
     };
-    let Some(frame) = frame_of(app, fid) else { return };
     let st = app.pick_state().clone();
     let Some(body) = st.bodies.get(&fr.body) else { return };
     let Some(fi) = body.face_index(&fr.name) else {
         app.error("The sketch face could not be found");
         return;
     };
-    let face = body.shape.faces()[fi].clone();
+    let edges = body.shape.faces()[fi].edges();
+    project_edges(app, &edges);
+}
+
+/// Project a picked face (its outline) or edge.
+fn project_pick(app: &mut App, pick: crate::app::Pick) {
+    let st = app.pick_state().clone();
+    let edges = match pick {
+        crate::app::Pick::Face { body, face } => st.bodies.get(&body).and_then(|b| b.shape.faces().get(face as usize).map(|f| f.edges())),
+        crate::app::Pick::Edge { body, edge } => st.bodies.get(&body).and_then(|b| b.shape.edges().get(edge as usize).cloned()).map(|e| vec![e]),
+        _ => None,
+    };
+    if let Some(edges) = edges {
+        project_edges(app, &edges);
+    }
+}
+
+/// Project 3D edges orthogonally onto the sketch plane as fixed geometry.
+fn project_edges(app: &mut App, edges: &[lusion_kernel::Shape]) -> usize {
+    let Some(fid) = session(app).map(|s| s.fid) else { return 0 };
+    let Some(frame) = frame_of(app, fid) else { return 0 };
     let before = app.doc.clone();
-    let Some(skm) = sketch_mut(app, fid) else { return };
-    let mut fixed_pt = |skm: &mut Sketch, p: DVec2| -> PId {
+    let Some(skm) = sketch_mut(app, fid) else { return 0 };
+    let fixed_pt = |skm: &mut Sketch, p: DVec2| -> PId {
         if let Some(id) = skm.points.iter().find(|q| (q.pos() - p).length() < 1e-7).map(|q| q.id) {
             return id;
         }
@@ -2378,27 +2484,28 @@ pub fn project_face_edges(app: &mut App) {
         id
     };
     let mut n = 0;
-    for e in face.edges() {
+    for e in edges {
         let Ok(info) = e.edge_info() else { continue };
+        // circles stay circles only when they lie parallel to the sketch plane
+        let flat_circle = info.kind == lusion_kernel::CurveKind::Circle && info.axis.normalize().cross(frame.n).length() < 1e-6;
         match info.kind {
             lusion_kernel::CurveKind::Line => {
                 let a = fixed_pt(skm, frame.to2(info.start));
                 let b = fixed_pt(skm, frame.to2(info.end));
-                if a != b {
+                if a != b && (skm.pos(a) - skm.pos(b)).length() > 1e-7 {
                     skm.add_line(a, b);
                     n += 1;
                 }
             }
-            lusion_kernel::CurveKind::Circle if info.closed => {
+            lusion_kernel::CurveKind::Circle if flat_circle && info.closed => {
                 let c = fixed_pt(skm, frame.to2(info.center));
                 let ci = skm.add_curve(CurveGeom::Circle { c, r: info.radius }, false);
                 skm.add_constraint(Constraint::Dimension { kind: DimKind::Radius(ci), expr: fmt_num(info.radius), value: info.radius, offset: [info.radius * 0.7, info.radius * 0.7] });
                 n += 1;
             }
-            lusion_kernel::CurveKind::Circle => {
+            lusion_kernel::CurveKind::Circle if flat_circle => {
                 let c = fixed_pt(skm, frame.to2(info.center));
                 let (mut a, mut b) = (fixed_pt(skm, frame.to2(info.start)), fixed_pt(skm, frame.to2(info.end)));
-                // make the arc counter-clockwise about the sketch normal and through the edge midpoint
                 let (cc, pa, pb, pm) = (skm.pos(c), skm.pos(a), skm.pos(b), frame.to2(info.mid));
                 if !angle_in_arc(cc, pa, pb, pm) {
                     std::mem::swap(&mut a, &mut b);
@@ -2406,21 +2513,327 @@ pub fn project_face_edges(app: &mut App) {
                 skm.add_curve(CurveGeom::Arc { c, a, b }, false);
                 n += 1;
             }
+            lusion_kernel::CurveKind::Degenerated => {}
             _ => {
                 let pts = e.edge_polyline(0.05, 0.2);
                 let ids: Vec<PId> = pts.iter().map(|p| fixed_pt(skm, frame.to2(*p))).collect();
+                let mut any = false;
                 for w in ids.windows(2) {
                     if w[0] != w[1] {
                         skm.add_line(w[0], w[1]);
+                        any = true;
                     }
                 }
-                n += 1;
+                n += any as usize;
             }
         }
     }
     solve(app, &[], true);
     commit(app, before);
-    app.info(format!("Projected {n} edges"));
+    app.info(format!("Projected {n} edge{}", if n == 1 { "" } else { "s" }));
+    n
+}
+
+// ------------------------------------------------------------------ offset
+
+struct OffsetChain {
+    /// (curve, traversed start→end in its stored direction)
+    elems: Vec<(CId, bool)>,
+    closed: bool,
+}
+
+fn curve_ends(sk: &Sketch, c: CId) -> Option<(PId, PId)> {
+    match sk.curve(c)?.geom {
+        CurveGeom::Line { a, b } | CurveGeom::Arc { a, b, .. } => Some((a, b)),
+        CurveGeom::Circle { .. } => None,
+    }
+}
+
+/// The connected chain of lines/arcs containing `start` (a circle is its own chain).
+fn offset_chain(sk: &Sketch, start: CId) -> OffsetChain {
+    let Some((sa, sb)) = curve_ends(sk, start) else {
+        return OffsetChain { elems: vec![(start, true)], closed: true };
+    };
+    let at = |p: PId| -> Vec<CId> {
+        sk.curves
+            .iter()
+            .filter(|c| curve_ends(sk, c.id).map(|(a, b)| a == p || b == p).unwrap_or(false))
+            .map(|c| c.id)
+            .collect()
+    };
+    let mut elems = std::collections::VecDeque::from(vec![(start, true)]);
+    let mut seen: HashSet<CId> = HashSet::from([start]);
+    // forward from sb
+    let mut end = sb;
+    loop {
+        let next = at(end);
+        if next.len() != 2 {
+            break;
+        }
+        let Some(&c) = next.iter().find(|c| !seen.contains(c)) else { break };
+        let (a, b) = curve_ends(sk, c).unwrap();
+        let fwd = a == end;
+        elems.push_back((c, fwd));
+        seen.insert(c);
+        end = if fwd { b } else { a };
+    }
+    let closed = end == sa;
+    if !closed {
+        let mut st = sa;
+        loop {
+            let prev = at(st);
+            if prev.len() != 2 {
+                break;
+            }
+            let Some(&c) = prev.iter().find(|c| !seen.contains(c)) else { break };
+            let (a, b) = curve_ends(sk, c).unwrap();
+            let fwd = b == st;
+            elems.push_front((c, fwd));
+            seen.insert(c);
+            st = if fwd { a } else { b };
+        }
+    }
+    OffsetChain { elems: elems.into(), closed }
+}
+
+/// Which side of the chain the cursor is on (+1 = left of travel) and how far.
+fn offset_side(sk: &Sketch, ch: &OffsetChain, p: DVec2) -> (f64, f64) {
+    let mut best = (1.0, f64::INFINITY);
+    for &(cid, fwd) in &ch.elems {
+        let Some(c) = sk.curve(cid) else { continue };
+        let (side, d) = match c.geom {
+            CurveGeom::Line { a, b } => {
+                let (pa, pb) = if fwd { (sk.pos(a), sk.pos(b)) } else { (sk.pos(b), sk.pos(a)) };
+                let t = (pb - pa).normalize_or_zero();
+                (t.perp_dot(p - pa).signum(), dist_point_segment(p, pa, pb))
+            }
+            CurveGeom::Circle { c, r } => {
+                let dc = (p - sk.pos(c)).length();
+                // circles: "left" = inside
+                (if dc < r { 1.0 } else { -1.0 }, (dc - r).abs())
+            }
+            CurveGeom::Arc { c, a, .. } => {
+                let cc = sk.pos(c);
+                let r = (sk.pos(a) - cc).length();
+                let dc = (p - cc).length();
+                // left of travel is towards the centre when going CCW (forward)
+                let inside = dc < r;
+                (if inside == fwd { 1.0 } else { -1.0 }, sk.curve_distance(sk.curve(cid).unwrap(), p))
+            }
+        };
+        if d < best.1 {
+            best = (side, d);
+        }
+    }
+    best
+}
+
+fn snap_dist(d: f64, px: f64) -> f64 {
+    let raw = (px * 3.0).max(1e-4);
+    let mag = 10f64.powf(raw.log10().floor());
+    let step = [1.0, 2.0, 5.0, 10.0].iter().map(|m| m * mag).find(|s| *s >= raw).unwrap_or(10.0 * mag);
+    ((d / step).round() * step).max(step)
+}
+
+struct OffsetGeom {
+    /// joints in sketch coordinates (open chain: n+1, closed: n)
+    joints: Vec<DVec2>,
+    /// per element: new radius for arcs / circles
+    radii: Vec<Option<f64>>,
+    preview: Vec<Vec<DVec2>>,
+}
+
+fn offset_geometry(sk: &Sketch, ch: &OffsetChain, side: f64, d: f64) -> Option<OffsetGeom> {
+    let n = ch.elems.len();
+    // circle
+    if n == 1 {
+        if let Some(CurveGeom::Circle { c, r }) = sk.curve(ch.elems[0].0).map(|c| c.geom) {
+            let r2 = r - side * d;
+            if r2 <= 1e-9 {
+                return None;
+            }
+            let cc = sk.pos(c);
+            let poly = (0..=96).map(|i| cc + DVec2::from_angle(i as f64 / 96.0 * std::f64::consts::TAU) * r2).collect();
+            return Some(OffsetGeom { joints: vec![], radii: vec![Some(r2)], preview: vec![poly] });
+        }
+    }
+    // offset end points of each element (in travel order) + new radius for arcs
+    let mut segs: Vec<(DVec2, DVec2, Option<(DVec2, f64)>)> = Vec::with_capacity(n);
+    for &(cid, fwd) in &ch.elems {
+        let c = sk.curve(cid)?;
+        match c.geom {
+            CurveGeom::Line { a, b } => {
+                let (pa, pb) = if fwd { (sk.pos(a), sk.pos(b)) } else { (sk.pos(b), sk.pos(a)) };
+                let nrm = (pb - pa).normalize_or_zero().perp() * side * d;
+                segs.push((pa + nrm, pb + nrm, None));
+            }
+            CurveGeom::Arc { c, a, b } => {
+                let cc = sk.pos(c);
+                let r = (sk.pos(a) - cc).length();
+                let r2 = if fwd { r - side * d } else { r + side * d };
+                if r2 <= 1e-9 {
+                    return None;
+                }
+                let (pa, pb) = if fwd { (sk.pos(a), sk.pos(b)) } else { (sk.pos(b), sk.pos(a)) };
+                segs.push((cc + (pa - cc).normalize_or_zero() * r2, cc + (pb - cc).normalize_or_zero() * r2, Some((cc, r2))));
+            }
+            CurveGeom::Circle { .. } => return None,
+        }
+    }
+    let joint = |i: usize, j: usize| -> DVec2 {
+        let (a0, a1, aa) = segs[i];
+        let (b0, b1, ba) = segs[j];
+        match (aa, ba) {
+            (None, None) => {
+                let (r, s2) = (a1 - a0, b1 - b0);
+                let den = r.perp_dot(s2);
+                if den.abs() < 1e-12 {
+                    a1
+                } else {
+                    a0 + r * ((b0 - a0).perp_dot(s2) / den)
+                }
+            }
+            (Some(_), None) => a1,
+            (None, Some(_)) => b0,
+            (Some(_), Some(_)) => (a1 + b0) * 0.5,
+        }
+    };
+    let mut joints = Vec::new();
+    if ch.closed {
+        for i in 0..n {
+            joints.push(joint((i + n - 1) % n, i));
+        }
+    } else {
+        joints.push(segs[0].0);
+        for i in 1..n {
+            joints.push(joint(i - 1, i));
+        }
+        joints.push(segs[n - 1].1);
+    }
+    let mut preview = Vec::new();
+    for (i, seg) in segs.iter().enumerate() {
+        let (j0, j1) = (joints[i], joints[(i + 1) % joints.len()]);
+        match seg.2 {
+            None => preview.push(vec![j0, j1]),
+            Some((cc, r2)) => {
+                let a0 = (j0 - cc).to_angle();
+                let mut sw = (j1 - cc).to_angle() - a0;
+                // travel direction: forward arcs go CCW
+                let fwd = ch.elems[i].1;
+                if fwd && sw <= 0.0 {
+                    sw += std::f64::consts::TAU;
+                }
+                if !fwd && sw >= 0.0 {
+                    sw -= std::f64::consts::TAU;
+                }
+                preview.push((0..=48).map(|k| cc + DVec2::from_angle(a0 + sw * k as f64 / 48.0) * r2).collect());
+            }
+        }
+    }
+    let radii = segs.iter().map(|s| s.2.map(|x| x.1)).collect();
+    Some(OffsetGeom { joints, radii, preview })
+}
+
+/// Create the offset of the chain containing `src`, on the cursor's side.
+fn create_offset(app: &mut App, src: CId, cursor: DVec2, dist: Option<f64>) {
+    let Some(fid) = session(app).map(|s| s.fid) else { return };
+    let Some(sk) = sketch(app, fid).cloned() else { return };
+    let px = session(app).map(|s| s.px).unwrap_or(0.1);
+    let ch = offset_chain(&sk, src);
+    let (side, dc) = offset_side(&sk, &ch, cursor);
+    let d = dist.unwrap_or_else(|| snap_dist(dc, px));
+    let Some(g) = offset_geometry(&sk, &ch, side, d) else {
+        app.error("Offset too large for this geometry");
+        return;
+    };
+    let before = app.doc.clone();
+    // one parameter drives every offset distance of this chain
+    let mut k = 1;
+    while app.doc.parameters.iter().any(|p| p.name == format!("offset{k}")) {
+        k += 1;
+    }
+    let pname = format!("offset{k}");
+    app.doc.parameters.push(lusion_core::expr::Parameter { name: pname.clone(), expr: fmt_num(d), comment: "sketch offset".into() });
+    app.model.params = lusion_core::expr::ParamValues::evaluate(&app.doc.parameters);
+    let Some(skm) = sketch_mut(app, fid) else { return };
+    let n = ch.elems.len();
+    let construction = skm.curve(src).map(|c| c.construction).unwrap_or(false);
+    if n == 1 && ch.closed && g.joints.is_empty() {
+        // circle: concentric, radius = r ± offset
+        if let (Some(CurveGeom::Circle { c, r }), Some(Some(r2))) = (skm.curve(src).map(|c| c.geom), g.radii.first()) {
+            let ci = skm.add_curve(CurveGeom::Circle { c, r: *r2 }, construction);
+            let expr = format!("2 * ({} {} {pname})", fmt_num(r), if *r2 > r { "+" } else { "-" });
+            skm.add_constraint(Constraint::Dimension { kind: DimKind::Diameter(ci), expr, value: 2.0 * r2, offset: [r2 * 0.8, r2 * 0.8] });
+        }
+    } else {
+        let jp: Vec<PId> = g.joints.iter().map(|p| skm.add_point(*p)).collect();
+        let mut first_dim = true;
+        let mut new_ids: Vec<Option<CId>> = vec![None; n];
+        for (i, &(cid, fwd)) in ch.elems.iter().enumerate() {
+            let (j0, j1) = (jp[i], jp[(i + 1) % jp.len()]);
+            let Some(orig) = skm.curve(cid).map(|c| c.geom) else { continue };
+            match orig {
+                CurveGeom::Line { .. } => {
+                    let nl = skm.add_curve(CurveGeom::Line { a: j0, b: j1 }, construction);
+                    new_ids[i] = Some(nl);
+                    skm.add_constraint(Constraint::Parallel(cid, nl));
+                    let off = (skm.pos(j0) - skm.pos(j1)).perp().normalize_or_zero() * px * 18.0;
+                    let _ = first_dim;
+                    skm.add_constraint(Constraint::Dimension { kind: DimKind::PointLine(j0, cid), expr: pname.clone(), value: d, offset: off.to_array() });
+                    first_dim = false;
+                }
+                CurveGeom::Arc { c, .. } => {
+                    let (a, b) = if fwd { (j0, j1) } else { (j1, j0) };
+                    let na = skm.add_curve(CurveGeom::Arc { c, a, b }, construction);
+                    new_ids[i] = Some(na);
+                    // radius follows from neighbouring lines when bounded by them; otherwise drive it
+                    let prev_line = (i > 0 || ch.closed) && matches!(skm.curve(ch.elems[(i + n - 1) % n].0).map(|c| c.geom), Some(CurveGeom::Line { .. }));
+                    let next_line = (i + 1 < n || ch.closed) && matches!(skm.curve(ch.elems[(i + 1) % n].0).map(|c| c.geom), Some(CurveGeom::Line { .. }));
+                    if !(prev_line && next_line) {
+                        let r = skm.radius_of(cid).unwrap_or(0.0);
+                        let r2 = g.radii[i].unwrap_or(r);
+                        let expr = format!("{} {} {pname}", fmt_num(r), if r2 > r { "+" } else { "-" });
+                        skm.add_constraint(Constraint::Dimension { kind: DimKind::Radius(na), expr, value: r2, offset: [r2 * 0.6, r2 * 0.6] });
+                    }
+                }
+                CurveGeom::Circle { .. } => {}
+            }
+        }
+        // keep tangency where the original line/arc pairs were tangent
+        for i in 0..n {
+            let j = (i + 1) % n;
+            if j == 0 && !ch.closed {
+                break;
+            }
+            let (oi, oj) = (ch.elems[i].0, ch.elems[j].0);
+            let (Some(ni), Some(nj)) = (new_ids[i], new_ids[j]) else { continue };
+            let (line_o, arc_o, line_n, arc_n) = match (skm.curve(oi).map(|c| c.geom), skm.curve(oj).map(|c| c.geom)) {
+                (Some(CurveGeom::Line { .. }), Some(CurveGeom::Arc { .. })) => (oi, oj, ni, nj),
+                (Some(CurveGeom::Arc { .. }), Some(CurveGeom::Line { .. })) => (oj, oi, nj, ni),
+                _ => continue,
+            };
+            let (Some((pa, pb)), Some(r)) = (skm.line_pts(line_o), skm.radius_of(arc_o)) else { continue };
+            let center = match skm.curve(arc_o).map(|c| c.geom) {
+                Some(CurveGeom::Arc { c, .. }) => skm.pos(c),
+                _ => continue,
+            };
+            if (dist_point_line(center, pa, pb) - r).abs() < 1e-6 * (1.0 + r) {
+                skm.add_constraint(Constraint::Tangent(line_n, arc_n));
+            }
+        }
+    }
+    if !solve(app, &[], true) {
+        app.doc = before;
+        app.model.params = lusion_core::expr::ParamValues::evaluate(&app.doc.parameters);
+        solve(app, &[], true);
+        app.error("Could not offset that chain (conflicting constraints?)");
+        return;
+    }
+    commit(app, before);
+    if let Some(s) = session(app) {
+        s.offset_src = None;
+    }
+    app.info(format!("Offset {} mm — edit '{pname}' in Parameters to change it", fmt_num(d)));
 }
 
 /// Sketch toolbar contents (shown in the top bar while sketching).
@@ -2445,6 +2858,8 @@ pub fn toolbar(app: &mut App, ui: &mut egui::Ui) {
     tool_btn(ui, SkTool::Trim, ic::SCISSORS, "Trim (T)");
     tool_btn(ui, SkTool::Fillet, ic::BEZIER_CURVE, "Sketch fillet: round a corner (G)");
     tool_btn(ui, SkTool::Text, ic::TEXT_T, "Text — for embossed / engraved labels");
+    tool_btn(ui, SkTool::Offset, ic::SQUARE_SPLIT_HORIZONTAL, "Offset curves (O)");
+    tool_btn(ui, SkTool::Project, ic::SELECTION_FOREGROUND, "Project faces / edges onto the sketch (P)");
     ui.menu_button(RichText::new(format!("{} Constrain", ic::LINK)).size(14.0), |ui| {
         for k in ConKind::ALL {
             if ui.button(format!("{}   {}", k.glyph(), k.label())).clicked() {
@@ -2458,5 +2873,41 @@ pub fn toolbar(app: &mut App, ui: &mut egui::Ui) {
     }
     if ui.add(egui::Button::new(RichText::new(ic::SELECTION_FOREGROUND).size(18.0)).min_size(egui::vec2(32.0, 30.0))).on_hover_text("Project the outline of the face this sketch is on").clicked() {
         project_face_edges(app);
+    }
+}
+
+#[cfg(test)]
+mod offset_tests {
+    use super::*;
+
+    fn rounded_rect() -> (Sketch, CId) {
+        let mut s = Sketch::new(PlaneRef::Origin(OriginPlane::XY));
+        let p = [
+            s.add_point(DVec2::new(0.0, 0.0)),
+            s.add_point(DVec2::new(60.0, 0.0)),
+            s.add_point(DVec2::new(60.0, 40.0)),
+            s.add_point(DVec2::new(0.0, 40.0)),
+        ];
+        let l: Vec<CId> = (0..4).map(|i| s.add_line(p[i], p[(i + 1) % 4])).collect();
+        sketch_fillet(&mut s, p[2]).unwrap();
+        (s, l[0])
+    }
+
+    #[test]
+    fn chain_and_inside_offset() {
+        let (s, bottom) = rounded_rect();
+        let ch = offset_chain(&s, bottom);
+        assert!(ch.closed, "rounded rect is a closed chain");
+        assert_eq!(ch.elems.len(), 5);
+        let (side, d) = offset_side(&s, &ch, DVec2::new(30.0, 5.0));
+        assert!((d - 5.0).abs() < 1e-9);
+        let g = offset_geometry(&s, &ch, side, 5.0).expect("geometry");
+        // inside offset: all joints inside the rectangle by 5
+        for j in &g.joints {
+            assert!(j.x >= 4.999 && j.x <= 55.001 && j.y >= 4.999 && j.y <= 35.001, "joint {j:?}");
+        }
+        let (side_out, _) = offset_side(&s, &ch, DVec2::new(30.0, -5.0));
+        assert_eq!(side_out, -side);
+        assert!(offset_geometry(&s, &ch, side_out, 5.0).is_some());
     }
 }

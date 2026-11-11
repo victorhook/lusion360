@@ -1,0 +1,241 @@
+{
+  "format": 1,
+  "parameters": [],
+  "components": [
+    {
+      "id": 0,
+      "name": "Design",
+      "parent": null,
+      "visible": true,
+      "color": null
+    }
+  ],
+  "features": [
+    {
+      "id": 1,
+      "name": "Sketch1",
+      "component": 0,
+      "visible": false,
+      "kind": {
+        "Sketch": {
+          "plane": {
+            "Origin": "XY"
+          },
+          "points": [
+            {
+              "id": 1,
+              "x": 0.0,
+              "y": 0.0,
+              "fixed": true
+            }
+          ],
+          "curves": [
+            {
+              "id": 2,
+              "geom": {
+                "Circle": {
+                  "c": 1,
+                  "r": 25.0
+                }
+              }
+            },
+            {
+              "id": 4,
+              "geom": {
+                "Circle": {
+                  "c": 1,
+                  "r": 35.00000000000214
+                }
+              }
+            }
+          ],
+          "constraints": [
+            {
+              "id": 3,
+              "c": {
+                "Dimension": {
+                  "kind": {
+                    "Diameter": 2
+                  },
+                  "expr": "50",
+                  "value": 50.0,
+                  "offset": [
+                    21.25705142569213,
+                    21.25705142569213
+                  ]
+                }
+              }
+            },
+            {
+              "id": 5,
+              "c": {
+                "Dimension": {
+                  "kind": {
+                    "Diameter": 4
+                  },
+                  "expr": "70",
+                  "value": 70.0,
+                  "offset": [
+                    28.319662647162893,
+                    28.319662647162893
+                  ]
+                }
+              }
+            }
+          ],
+          "next_id": 6
+        }
+      }
+    },
+    {
+      "id": 2,
+      "name": "Extrude1",
+      "component": 0,
+      "visible": true,
+      "kind": {
+        "Extrude": {
+          "profiles": [
+            {
+              "Sketch": {
+                "sketch": 1,
+                "curves": [
+                  2,
+                  4
+                ],
+                "hint": [
+                  14.142135623731532,
+                  -25.808802290398784
+                ]
+              }
+            }
+          ],
+          "distance": "10",
+          "distance2": "10",
+          "mode": "OneSide",
+          "start_offset": "",
+          "op": "NewBody",
+          "targets": []
+        }
+      }
+    },
+    {
+      "id": 3,
+      "name": "Sketch2",
+      "component": 0,
+      "visible": true,
+      "kind": {
+        "Sketch": {
+          "plane": {
+            "Face": {
+              "body": 2097152,
+              "name": "f2.end",
+              "hint": [
+                0.0,
+                -8.479143313401751e-15,
+                10.0
+              ]
+            }
+          },
+          "points": [
+            {
+              "id": 1,
+              "x": 0.0,
+              "y": 0.0,
+              "fixed": true
+            },
+            {
+              "id": 2,
+              "x": -23.77574157714844,
+              "y": 24.279006958007812
+            }
+          ],
+          "curves": [],
+          "constraints": [],
+          "next_id": 3
+        }
+      }
+    },
+    {
+      "id": 4,
+      "name": "Fillet1",
+      "component": 0,
+      "visible": true,
+      "kind": {
+        "Fillet": {
+          "edges": [
+            {
+              "body": 2097152,
+              "name": "f2.end|f2.side(s1.c2)",
+              "hint": [
+                -25.0,
+                3.061616997868383e-15,
+                10.0
+              ]
+            }
+          ],
+          "radius": "4"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "name": "Chamfer1",
+      "component": 0,
+      "visible": true,
+      "kind": {
+        "Chamfer": {
+          "edges": [
+            {
+              "body": 2097152,
+              "name": "f2.end|f2.side(s1.c4)",
+              "hint": [
+                -35.00000000000214,
+                4.2862637970159984e-15,
+                10.0
+              ]
+            }
+          ],
+          "distance": "4"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "name": "Move1",
+      "component": 0,
+      "visible": true,
+      "kind": {
+        "Move": {
+          "bodies": [
+            2097152
+          ],
+          "dx": "0",
+          "dy": "0",
+          "dz": "0",
+          "rz": "0",
+          "copy": false
+        }
+      }
+    },
+    {
+      "id": 7,
+      "name": "Mirror1",
+      "component": 0,
+      "visible": true,
+      "kind": {
+        "Mirror": {
+          "bodies": [
+            2097152
+          ],
+          "plane": {
+            "Origin": "XY"
+          },
+          "join": false
+        }
+      }
+    }
+  ],
+  "marker": 7,
+  "bodies": {},
+  "next_id": 8
+}
