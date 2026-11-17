@@ -726,6 +726,18 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     }
                 }
             }
+            // grab a body and drag it out of the window (e.g. onto Bambu Studio)
+            if resp.drag_started_by(PointerButton::Primary) && !consumed && app.cmd.is_none() {
+                let press = ui.input(|i| i.pointer.press_origin()).map(|p| Vec2::new(p.x - rect.min.x, p.y - rect.min.y));
+                let hit = press.and_then(|m| {
+                    let r = app.cam.ray(m, view.size);
+                    pick(app, &st, &r, &view, filter)
+                });
+                if let Some(Pick::Body(b) | Pick::Face { body: b, .. } | Pick::Edge { body: b, .. }) = hit.map(|h| h.pick) {
+                    let bodies = crate::dragdrop::bodies_for_grab(app, b);
+                    crate::dragdrop::begin(app, bodies);
+                }
+            }
             if resp.double_clicked_by(PointerButton::Primary) && app.cmd.is_none() {
                 if let Some(h) = app.hover {
                     match h.pick {

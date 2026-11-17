@@ -104,6 +104,9 @@ pub struct App {
     pub last_autosave: Instant,
     pub autosaved_doc: Option<Document>,
     pub recovery: Option<PathBuf>,
+    pub drag_out: Option<crate::dragdrop::DragSession>,
+    #[cfg(target_os = "linux")]
+    pub xdnd: Option<Option<crate::dragout::DragOut>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -180,6 +183,9 @@ impl App {
             last_autosave: Instant::now(),
             autosaved_doc: None,
             recovery: find_orphan_autosave(),
+            drag_out: None,
+            #[cfg(target_os = "linux")]
+            xdnd: None,
             slicer_pref: cc.storage.and_then(|s| s.get_string("slicer")).filter(|s| !s.is_empty()),
         };
         if let Some(p) = initial {
@@ -718,7 +724,6 @@ pub fn open_dialog() -> Option<PathBuf> {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        let _ = frame;
         let ctx = ui.ctx().clone();
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32().min(0.1);
@@ -766,6 +771,7 @@ impl eframe::App for App {
         });
         crate::panels::dialogs(self, &ctx);
         crate::print::dialog(self, &ctx);
+        crate::dragdrop::update(self, &ctx, frame);
         crate::panels::toasts(self, &ctx);
     }
 

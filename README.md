@@ -33,7 +33,8 @@ No cloud, no login, no telemetry. Designs are plain JSON files (`.l360`) you can
 - A "project" is simply a folder. The Project tab lists the designs and 3D files in it.
 
 **Files**
-- Open/view: native `.l360`, **STEP**, BREP, **STL**, **3MF** (including Bambu Studio files), **OBJ**, **glTF/GLB**, **PLY**, **OFF**. You can also drag & drop files onto the window.
+- Open/view: native `.l360`, **STEP**, BREP, **STL**, **3MF** (including Bambu Studio files), **OBJ**, **glTF/GLB**, **PLY**, **OFF**. You can also drag & drop files onto the window. A `.l360` opens; mesh/STEP files are added to the current design.
+- **Drag out** (X11): grab a body in the viewport or the browser, or drag the **3D Print** / **Print** button, and drop it onto Bambu Studio, another slicer or a file manager. The bodies are written to a 3MF in `~/.cache/lusion360/drag/` and handed over as a normal file drop. Esc cancels.
 - Export: STEP, STL, 3MF, OBJ, BREP. Use **Print** (top right) to write a 3MF and optionally open it straight in **Bambu Studio**, OrcaSlicer, PrusaSlicer or Cura. Installed slicers are detected from PATH, flatpak and `~/Applications` AppImages.
 - Undo/redo, crash-safe **autosave with recovery**, and an atomic save.
 

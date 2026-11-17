@@ -1858,9 +1858,11 @@ dependencies = [
  "lusion-core",
  "lusion-kernel",
  "lusion-meshio",
+ "raw-window-handle",
  "rfd",
  "serde",
  "serde_json",
+ "x11rb",
 ]
 
 [[package]]

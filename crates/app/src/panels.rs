@@ -15,7 +15,7 @@ fn tool_button(ui: &mut egui::Ui, icon: &str, label: &str, tip: &str) -> egui::R
 
 /// Ribbon button; `active` draws it highlighted (the running command).
 fn tool_button_active(ui: &mut egui::Ui, icon: &str, label: &str, tip: &str, active: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(52.0, 46.0), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(52.0, 46.0), egui::Sense::click_and_drag());
     let p = ui.painter();
     let hovered = resp.hovered();
     if active {
@@ -136,8 +136,13 @@ pub fn top_bar(app: &mut App, ui: &mut egui::Ui) {
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(RichText::new(format!("{:.0} fps", 1000.0 / app.frame_ms.max(0.1))).small().color(theme::TEXT_DIM));
-                if ui.add(egui::Button::new(RichText::new(format!("{} Print", ic::PRINTER))).fill(theme::ACCENT_DIM)).on_hover_text("Export visible bodies as 3MF for Bambu Studio / PrusaSlicer / Orca").clicked() {
+                let pr = ui.add(egui::Button::new(RichText::new(format!("{} Print", ic::PRINTER))).fill(theme::ACCENT_DIM).sense(egui::Sense::click_and_drag())).on_hover_text("Export visible bodies as 3MF for Bambu Studio / PrusaSlicer / Orca.\nTip: drag this button (or a body) straight onto the slicer window.");
+                if pr.clicked() {
                     crate::print::export_for_print(app);
+                }
+                if pr.drag_started() {
+                    let bodies = crate::dragdrop::visible_bodies(app);
+                    crate::dragdrop::begin(app, bodies);
                 }
                 if ui.add_enabled(!app.redo.is_empty(), egui::Button::new(ic::ARROW_U_UP_RIGHT).frame(false)).on_hover_text("Redo").clicked() {
                     app.redo();
@@ -225,8 +230,13 @@ pub fn top_bar(app: &mut App, ui: &mut egui::Ui) {
             if tool_button(ui, ic::EXPORT, "Export", "STEP / STL / 3MF / OBJ (Ctrl+E)").clicked() {
                 app.export(None);
             }
-            if tool_button_active(ui, ic::PRINTER, "3D Print", "Export 3MF for your slicer", app.print.is_some()).clicked() {
+            let r = tool_button_active(ui, ic::PRINTER, "3D Print", "Export 3MF for your slicer — or drag this onto Bambu Studio", app.print.is_some());
+            if r.clicked() {
                 crate::print::export_for_print(app);
+            }
+            if r.drag_started() {
+                let bodies = crate::dragdrop::visible_bodies(app);
+                crate::dragdrop::begin(app, bodies);
             }
         });
     });
@@ -688,6 +698,11 @@ fn component_tree(app: &mut App, ui: &mut egui::Ui, cid: CompId, depth: usize) {
                                 }
                                 if r.dragged() {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                                    // left the window: hand the body to other apps
+                                    if crate::dragdrop::pointer_outside(ui.ctx()) && app.drag_out.is_none() {
+                                        let bodies = if selected { crate::dragdrop::bodies_for_grab(app, b) } else { vec![b] };
+                                        crate::dragdrop::begin(app, bodies);
+                                    }
                                 }
                                 if let Some(c) = color {
                                     let rc = r.rect;

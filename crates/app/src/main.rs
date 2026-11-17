@@ -3,6 +3,9 @@
 mod app;
 mod camera;
 mod commands;
+#[cfg(target_os = "linux")]
+mod dragout;
+mod dragdrop;
 #[allow(dead_code)]
 mod icons;
 mod panels;
