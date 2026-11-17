@@ -774,6 +774,11 @@ impl Ctx<'_> {
     fn sketch(&mut self, f: &Feature, s: &Sketch, st: &mut ModelState) -> Result<(), String> {
         let (frame, _) = self.resolve_plane(st, &s.plane)?;
         let mut solved = s.clone();
+        for w in apply_links(&mut solved, st, &frame) {
+            if !self.warnings.contains(&w) {
+                self.warnings.push(w);
+            }
+        }
         let report = solved.solve(self.params, &[], true);
         if !report.converged {
             self.warnings.push("sketch constraints could not all be satisfied".into());
@@ -1557,8 +1562,12 @@ impl Ctx<'_> {
             match pr {
                 PathRef::SketchCurve { sketch, curve } => {
                     let ss = st.sketches.get(sketch).ok_or("path sketch is missing")?;
-                    let e = curve_edge(&ss.sketch, *curve, &ss.frame).ok_or("path curve no longer exists")?.map_err(|e| e.0)?;
-                    out.push(e);
+                    if let Some(sp) = ss.sketch.spline(*curve) {
+                        out.extend(spline_edges(&ss.sketch, sp, &ss.frame).map_err(|e| e.0)?);
+                    } else {
+                        let e = curve_edge(&ss.sketch, *curve, &ss.frame).ok_or("path curve no longer exists")?.map_err(|e| e.0)?;
+                        out.push(e);
+                    }
                 }
                 PathRef::Edge(er) => {
                     let body = st.bodies.get(&er.body).ok_or("path body is missing")?.clone();
@@ -1782,7 +1791,60 @@ pub fn find_profile<'a>(ss: &'a SolvedSketch, curves: &[u32], hint: DVec2) -> Op
         .min_by(|a, b| a.area.total_cmp(&b.area))
 }
 
-/// 3D edge of a sketch curve (None if the curve is missing or degenerate).
+/// 3D edges of a sketch spline: one cubic Bézier per segment (tangent-continuous).
+/// Separate polynomial pieces keep OCCT's area/volume integration exact.
+pub fn spline_edges(s: &Sketch, sp: &crate::sketch::SkSpline, frame: &Frame) -> k::KResult<Vec<Shape>> {
+    s.spline_beziers(sp)
+        .iter()
+        .filter(|b| (b[3] - b[0]).length() > 1e-9)
+        .map(|b| k::bspline(&[frame.to3(b[0]), frame.to3(b[1]), frame.to3(b[2]), frame.to3(b[3])], &[0.0, 1.0], &[4, 4], 3))
+        .collect()
+}
+
+/// Refresh linked projections of `sk` from the model state `st` (fixed points
+/// follow their edges, circle radii their dimension). Returns warnings.
+pub fn apply_links(sk: &mut Sketch, st: &ModelState, frame: &Frame) -> Vec<String> {
+    let mut warn = Vec::new();
+    let links = sk.links.clone();
+    for l in &links {
+        let Some(body) = st.bodies.get(&l.edge.body) else {
+            warn.push("a projected edge's body is gone; the projection stays where it was".into());
+            continue;
+        };
+        let edges = body.shape.edges();
+        let e = body.edge_index(&l.edge.name).and_then(|i| edges.get(i)).or_else(|| {
+            let hint = DVec3::from_array(l.edge.hint);
+            edges.iter().filter_map(|e| e.edge_info().ok().map(|i| (e, (i.mid - hint).length()))).filter(|x| x.1 < 1e-3).min_by(|a, b| a.1.total_cmp(&b.1)).map(|x| x.0)
+        });
+        let Some(info) = e.and_then(|e| e.edge_info().ok()) else {
+            warn.push(format!("projected edge '{}' was lost", l.edge.name));
+            continue;
+        };
+        for (pid, role) in &l.points {
+            let w = match role {
+                crate::sketch::LinkRole::Start => info.start,
+                crate::sketch::LinkRole::End => info.end,
+                crate::sketch::LinkRole::Center => info.center,
+            };
+            let p = frame.to2(w);
+            if let Some(pt) = sk.point_mut(*pid) {
+                pt.x = p.x;
+                pt.y = p.y;
+            }
+        }
+        if let Some(kid) = l.radius {
+            if let Some(c) = sk.constraints.iter_mut().find(|c| c.id == kid) {
+                if let crate::sketch::Constraint::Dimension { expr, value, .. } = &mut c.c {
+                    *expr = crate::expr::fmt_num(info.radius);
+                    *value = info.radius;
+                }
+            }
+        }
+    }
+    warn
+}
+
+/// 3D edge of a sketch curve (None if missing or degenerate; splines: see `spline_edges`).
 pub fn curve_edge(s: &Sketch, cid: u32, frame: &Frame) -> Option<k::KResult<Shape>> {
     let c = s.curve(cid)?;
     Some(match &c.geom {
@@ -1814,6 +1876,11 @@ pub fn compute_profiles(s: &Sketch, frame: &Frame, sid: FeatureId, params: &Para
     for c in s.curves.iter().filter(|c| !c.construction) {
         if let Some(Ok(e)) = curve_edge(s, c.id, frame) {
             edges.push(e);
+        }
+    }
+    for sp in s.splines.iter().filter(|sp| !sp.construction) {
+        if let Ok(es) = spline_edges(s, sp, frame) {
+            edges.extend(es);
         }
     }
     // text outlines become closed polygons of line edges
@@ -1855,6 +1922,7 @@ pub fn compute_profiles(s: &Sketch, frame: &Frame, sid: FeatureId, params: &Para
                 .iter()
                 .filter(|c| !c.construction)
                 .map(|c| (c.id, s.curve_distance(c, m2)))
+                .chain(s.splines.iter().filter(|sp| !sp.construction).map(|sp| (sp.id, s.spline_distance(sp, m2))))
                 .min_by(|a, b| a.1.total_cmp(&b.1));
             let tol = scale * 1e-5 + 1e-6;
             match best {

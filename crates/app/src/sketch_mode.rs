@@ -75,6 +75,7 @@ pub enum SkTool {
     CenterRect,
     Circle,
     Arc,
+    Spline,
     Point,
     Dimension,
     Trim,
@@ -94,6 +95,7 @@ impl SkTool {
             SkTool::CenterRect => "Click the centre, then a corner.",
             SkTool::Circle => "Click the centre, then a point on the circle.",
             SkTool::Arc => "Click start, end, then a point the arc passes through.",
+            SkTool::Spline => "Click points the curve passes through. Click the first point to close; double-click, Enter or right-click to finish.",
             SkTool::Point => "Click to place points.",
             SkTool::Dimension => "Click a line, circle, two points, point + line or two lines. Click again to place.",
             SkTool::Trim => "Click the part of a curve to remove.",
@@ -296,7 +298,15 @@ fn sketch_mut(app: &mut App, fid: FeatureId) -> Option<&mut Sketch> {
 fn solve(app: &mut App, pinned: &[PId], analyze: bool) -> bool {
     let Some(fid) = session(app).map(|s| s.fid) else { return false };
     let params = app.model.params.clone();
+    // linked projections follow the model as it is before this sketch
+    let pre = app.doc.feature_index(fid).map(|i| app.model.state_after(i).clone());
+    let frame = frame_of(app, fid);
     let Some(sk) = sketch_mut(app, fid) else { return false };
+    if let (Some(pre), Some(frame)) = (pre, frame) {
+        if !sk.links.is_empty() {
+            lusion_core::model::apply_links(sk, &pre, &frame);
+        }
+    }
     let rep = sk.solve(&params, pinned, analyze);
     let ok = rep.converged;
     if let Some(s) = session(app) {
@@ -672,6 +682,7 @@ fn nearest_curve(sk: &Sketch, p: DVec2, tol: f64) -> Option<CId> {
     sk.curves
         .iter()
         .map(|c| (c.id, sk.curve_distance(c, p)))
+        .chain(sk.splines.iter().map(|sp| (sp.id, sk.spline_distance(sp, p))))
         .filter(|(_, d)| *d < tol)
         .min_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(id, _)| id)
@@ -1029,6 +1040,9 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
     }
 
     // ---- clicks
+    if resp.secondary_clicked() && finish_spline(app) {
+        return;
+    }
     if resp.secondary_clicked() {
         let s = session(app).unwrap();
         if !s.chain.is_empty() || !s.picks.is_empty() {
@@ -1051,6 +1065,10 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
         }
         if tool == SkTool::Line {
             session(app).unwrap().chain.clear();
+            return;
+        }
+        if tool == SkTool::Spline {
+            finish_spline(app);
             return;
         }
     }
@@ -1079,7 +1097,7 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
                     }
                 }
             }
-            SkTool::Line | SkTool::Rect | SkTool::CenterRect | SkTool::Circle | SkTool::Arc | SkTool::Point => {
+            SkTool::Line | SkTool::Rect | SkTool::CenterRect | SkTool::Circle | SkTool::Arc | SkTool::Spline | SkTool::Point => {
                 draw_click(app, fid, cursor, snap);
             }
             SkTool::Dimension => dim_click(app, fid, hover, p),
@@ -1193,6 +1211,7 @@ fn keyboard(app: &mut App, ui: &egui::Ui) {
         (Key::R, SkTool::Rect),
         (Key::C, SkTool::Circle),
         (Key::A, SkTool::Arc),
+        (Key::B, SkTool::Spline),
         (Key::P, SkTool::Project),
         (Key::O, SkTool::Offset),
         (Key::D, SkTool::Dimension),
@@ -1203,6 +1222,12 @@ fn keyboard(app: &mut App, ui: &egui::Ui) {
         if pressed(k) {
             set_tool(app, t);
         }
+    }
+    if pressed(Key::Escape) && finish_spline(app) {
+        return;
+    }
+    if pressed(Key::Enter) && finish_spline(app) {
+        return;
     }
     if pressed(Key::Escape) {
         let s = session(app).unwrap();
@@ -1234,6 +1259,7 @@ fn keyboard(app: &mut App, ui: &egui::Ui) {
 }
 
 pub fn set_tool(app: &mut App, t: SkTool) {
+    finish_spline(app);
     if let SkTool::Con(k) = t {
         // apply directly to the current selection when possible
         let Some(s) = session(app) else { return };
@@ -1273,6 +1299,9 @@ pub fn toggle_construction(app: &mut App) {
     if let Some(sk) = sketch_mut(app, fid) {
         for c in sk.curves.iter_mut().filter(|c| curves.contains(&c.id)) {
             c.construction = !c.construction;
+        }
+        for sp in sk.splines.iter_mut().filter(|sp| curves.contains(&sp.id)) {
+            sp.construction = !sp.construction;
         }
     }
     commit(app, before);
@@ -1394,6 +1423,35 @@ fn draw_click(app: &mut App, fid: FeatureId, p: DVec2, snap: Option<Snap>) {
                 }
             }
         }
+        SkTool::Spline => {
+            // clicking the first point again closes the curve
+            let n = chain.len();
+            let first = chain[0];
+            let closes = n >= 4 && (matches!(snap, Some(Snap::Point(id)) if Some(id) == first.1) || (chain[n - 1].0 - first.0).length() < px * 6.0);
+            if closes {
+                let mut ids = Vec::new();
+                for (q, sid) in &chain[..n - 1] {
+                    ids.push(point_at(sk, *q, snap_of(*sid), &mut cons));
+                }
+                ids.dedup();
+                if ids.len() >= 3 {
+                    sk.add_spline(ids, true);
+                }
+                done = true;
+            } else {
+                // nothing to create until the curve is finished
+                let s = match &mut app.mode {
+                    Mode::Sketch(s) => s,
+                    _ => return,
+                };
+                // a double click lands twice on the same spot
+                let n = s.chain.len();
+                if n >= 2 && (s.chain[n - 1].0 - s.chain[n - 2].0).length() < px * 2.0 {
+                    s.chain.pop();
+                }
+                return;
+            }
+        }
         SkTool::Rect | SkTool::CenterRect => {
             if chain.len() == 2 {
                 let (c0, c1) = if tool == SkTool::Rect {
@@ -1461,6 +1519,34 @@ fn draw_click(app: &mut App, fid: FeatureId, p: DVec2, snap: Option<Snap>) {
             s.chain.clear();
         }
     }
+}
+
+/// Turn the clicked spline points into an open spline (Enter / right-click / double-click).
+fn finish_spline(app: &mut App) -> bool {
+    let Some(s) = session(app) else { return false };
+    if s.tool != SkTool::Spline || s.chain.len() < 2 {
+        return false;
+    }
+    let fid = s.fid;
+    let chain = std::mem::take(&mut s.chain);
+    let before = app.doc.clone();
+    let mut cons = Vec::new();
+    let Some(sk) = sketch_mut(app, fid) else { return false };
+    let mut ids = Vec::new();
+    for (q, sid) in &chain {
+        ids.push(point_at(sk, *q, snap_of(*sid), &mut cons));
+    }
+    ids.dedup();
+    if ids.len() < 2 {
+        return false;
+    }
+    sk.add_spline(ids, false);
+    for c in cons {
+        sk.add_constraint(c);
+    }
+    solve(app, &[], true);
+    commit(app, before);
+    true
 }
 
 /// Create geometry from a typed value while drawing.
@@ -1941,6 +2027,18 @@ pub fn draw(app: &mut App, scene: &mut Scene, view: &View) {
             push_polyline(&mut scene.overlay_lines, &pts, col, w);
         }
     }
+    // splines
+    for sp in &sk.splines {
+        let pts: Vec<Vec3> = sk.spline_polyline(sp, tol).iter().map(|p| f.to3(*p).as_vec3()).collect();
+        let fixed = sp.pts.iter().all(|p| s.report.fixed_points.contains(p));
+        let col = sk_color(s, SkEnt::Curve(sp.id), fixed, sp.construction, false);
+        let w = if s.hover == Some(SkEnt::Curve(sp.id)) || s.selection.contains(&SkEnt::Curve(sp.id)) { 3.0 } else { 2.0 };
+        if sp.construction {
+            push_dashed(&mut scene.overlay_lines, &pts, col, w * 0.8, (s.px * 6.0) as f32);
+        } else {
+            push_polyline(&mut scene.overlay_lines, &pts, col, w);
+        }
+    }
     // points
     for p in &sk.points {
         let fixed = s.report.fixed_points.contains(&p.id);
@@ -1996,6 +2094,18 @@ pub fn draw(app: &mut App, scene: &mut Scene, view: &View) {
                     push_line(&mut scene.overlay_lines, to3(*last), to3(cur), accent, 2.0);
                 }
             }
+            SkTool::Spline => {
+                if !chain.is_empty() {
+                    let mut pts: Vec<DVec2> = chain.iter().map(|c| c.0).collect();
+                    pts.push(cur);
+                    let poly = lusion_core::sketch::beziers_polyline(&lusion_core::sketch::catmull_rom_beziers(&pts, false), tol);
+                    let p3: Vec<Vec3> = poly.iter().map(|p| to3(*p)).collect();
+                    push_polyline(&mut scene.overlay_lines, &p3, accent, 2.0);
+                    for (q, _) in chain {
+                        scene.points.push(PointInst { p: to3(*q).to_array(), color: accent, size: 7.0 });
+                    }
+                }
+            }
             SkTool::Rect | SkTool::CenterRect => {
                 if let Some((first, _)) = chain.first() {
                     let (c0, c1) = if s.tool == SkTool::Rect { (*first, cur) } else { (*first - (cur - *first), cur) };
@@ -2039,7 +2149,7 @@ pub fn draw(app: &mut App, scene: &mut Scene, view: &View) {
                 Snap::Model(_) => [1.0, 0.55, 0.85, 1.0],
             };
             scene.points.push(PointInst { p: to3(cur).to_array(), color: col, size: 11.0 });
-        } else if matches!(s.tool, SkTool::Line | SkTool::Rect | SkTool::CenterRect | SkTool::Circle | SkTool::Arc | SkTool::Point) {
+        } else if matches!(s.tool, SkTool::Line | SkTool::Rect | SkTool::CenterRect | SkTool::Circle | SkTool::Arc | SkTool::Spline | SkTool::Point) {
             scene.points.push(PointInst { p: to3(cur).to_array(), color: [0.9, 0.95, 1.0, 0.9], size: 6.0 });
         }
     }
@@ -2453,24 +2563,41 @@ pub fn project_face_edges(app: &mut App) {
         return;
     };
     let edges = body.shape.faces()[fi].edges();
-    project_edges(app, &edges);
+    let refs = edge_refs(&st, fr.body, &edges);
+    project_edges(app, &edges, &refs);
+}
+
+/// Persistent references of `edges` (sub-shapes of `body`), for linked projection.
+fn edge_refs(st: &lusion_core::model::ModelState, body: lusion_core::doc::BodyId, edges: &[lusion_kernel::Shape]) -> Vec<Option<lusion_core::doc::EdgeRef>> {
+    let Some(b) = st.bodies.get(&body) else { return vec![None; edges.len()] };
+    let all = b.shape.edges();
+    edges
+        .iter()
+        .map(|e| {
+            let i = all.iter().position(|x| x.same(e))?;
+            crate::commands::edge_ref(st, body, i as u32)
+        })
+        .collect()
 }
 
 /// Project a picked face (its outline) or edge.
 fn project_pick(app: &mut App, pick: crate::app::Pick) {
     let st = app.pick_state().clone();
     let edges = match pick {
-        crate::app::Pick::Face { body, face } => st.bodies.get(&body).and_then(|b| b.shape.faces().get(face as usize).map(|f| f.edges())),
-        crate::app::Pick::Edge { body, edge } => st.bodies.get(&body).and_then(|b| b.shape.edges().get(edge as usize).cloned()).map(|e| vec![e]),
+        crate::app::Pick::Face { body, face } => st.bodies.get(&body).and_then(|b| b.shape.faces().get(face as usize).map(|f| (body, f.edges()))),
+        crate::app::Pick::Edge { body, edge } => st.bodies.get(&body).and_then(|b| b.shape.edges().get(edge as usize).cloned()).map(|e| (body, vec![e])),
         _ => None,
     };
-    if let Some(edges) = edges {
-        project_edges(app, &edges);
+    if let Some((body, edges)) = edges {
+        let refs = edge_refs(&st, body, &edges);
+        project_edges(app, &edges, &refs);
     }
 }
 
 /// Project 3D edges orthogonally onto the sketch plane as fixed geometry.
-fn project_edges(app: &mut App, edges: &[lusion_kernel::Shape]) -> usize {
+/// Edges with a reference stay linked: they follow the model when it changes.
+fn project_edges(app: &mut App, edges: &[lusion_kernel::Shape], refs: &[Option<lusion_core::doc::EdgeRef>]) -> usize {
+    use lusion_core::sketch::{LinkRole, SkLink};
     let Some(fid) = session(app).map(|s| s.fid) else { return 0 };
     let Some(frame) = frame_of(app, fid) else { return 0 };
     let before = app.doc.clone();
@@ -2484,8 +2611,14 @@ fn project_edges(app: &mut App, edges: &[lusion_kernel::Shape]) -> usize {
         id
     };
     let mut n = 0;
-    for e in edges {
+    for (ei, e) in edges.iter().enumerate() {
         let Ok(info) = e.edge_info() else { continue };
+        let eref = refs.get(ei).cloned().flatten();
+        let mut link = |skm: &mut Sketch, points: Vec<(PId, LinkRole)>, radius: Option<KId>| {
+            if let Some(er) = &eref {
+                skm.links.push(SkLink { edge: er.clone(), points, radius });
+            }
+        };
         // circles stay circles only when they lie parallel to the sketch plane
         let flat_circle = info.kind == lusion_kernel::CurveKind::Circle && info.axis.normalize().cross(frame.n).length() < 1e-6;
         match info.kind {
@@ -2494,23 +2627,28 @@ fn project_edges(app: &mut App, edges: &[lusion_kernel::Shape]) -> usize {
                 let b = fixed_pt(skm, frame.to2(info.end));
                 if a != b && (skm.pos(a) - skm.pos(b)).length() > 1e-7 {
                     skm.add_line(a, b);
+                    link(skm, vec![(a, LinkRole::Start), (b, LinkRole::End)], None);
                     n += 1;
                 }
             }
             lusion_kernel::CurveKind::Circle if flat_circle && info.closed => {
                 let c = fixed_pt(skm, frame.to2(info.center));
                 let ci = skm.add_curve(CurveGeom::Circle { c, r: info.radius }, false);
-                skm.add_constraint(Constraint::Dimension { kind: DimKind::Radius(ci), expr: fmt_num(info.radius), value: info.radius, offset: [info.radius * 0.7, info.radius * 0.7] });
+                let k = skm.add_constraint(Constraint::Dimension { kind: DimKind::Radius(ci), expr: fmt_num(info.radius), value: info.radius, offset: [info.radius * 0.7, info.radius * 0.7] });
+                link(skm, vec![(c, LinkRole::Center)], Some(k));
                 n += 1;
             }
             lusion_kernel::CurveKind::Circle if flat_circle => {
                 let c = fixed_pt(skm, frame.to2(info.center));
                 let (mut a, mut b) = (fixed_pt(skm, frame.to2(info.start)), fixed_pt(skm, frame.to2(info.end)));
                 let (cc, pa, pb, pm) = (skm.pos(c), skm.pos(a), skm.pos(b), frame.to2(info.mid));
+                let (mut ra, mut rb) = (LinkRole::Start, LinkRole::End);
                 if !angle_in_arc(cc, pa, pb, pm) {
                     std::mem::swap(&mut a, &mut b);
+                    std::mem::swap(&mut ra, &mut rb);
                 }
                 skm.add_curve(CurveGeom::Arc { c, a, b }, false);
+                link(skm, vec![(c, LinkRole::Center), (a, ra), (b, rb)], None);
                 n += 1;
             }
             lusion_kernel::CurveKind::Degenerated => {}
@@ -2852,6 +2990,7 @@ pub fn toolbar(app: &mut App, ui: &mut egui::Ui) {
     tool_btn(ui, SkTool::CenterRect, ic::SQUARE_HALF, "Center rectangle");
     tool_btn(ui, SkTool::Circle, ic::CIRCLE, "Circle (C)");
     tool_btn(ui, SkTool::Arc, ic::CIRCLE_HALF, "3-point arc (A)");
+    tool_btn(ui, SkTool::Spline, ic::WAVE_SINE, "Spline: smooth curve through points (B)");
     tool_btn(ui, SkTool::Point, ic::DOT_OUTLINE, "Point (P)");
     ui.separator();
     tool_btn(ui, SkTool::Dimension, ic::RULER, "Dimension (D)");

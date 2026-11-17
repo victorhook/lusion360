@@ -762,3 +762,105 @@ fn sweep_loft_and_joint() {
     assert!((hi.y - 40.0).abs() < 1e-6);
     assert!((moved.shape.volume().unwrap() - frustum.shape.volume().unwrap()).abs() < 1e-6);
 }
+
+#[test]
+fn splines_make_profiles_and_paths() {
+    let mut doc = Document::default();
+    let mut model = Model::new();
+    // closed spline through 4 points (a rounded blob)
+    let mut s = Sketch::new(PlaneRef::Origin(OriginPlane::XY));
+    let pts: Vec<u32> = [(0.0, -10.0), (10.0, 0.0), (0.0, 10.0), (-10.0, 0.0)].iter().map(|(x, y)| s.add_point(DVec2::new(*x, *y))).collect();
+    s.add_spline(pts, true);
+    // open spline closed by a line
+    let a = s.add_point(DVec2::new(30.0, 0.0));
+    let m = s.add_point(DVec2::new(40.0, 8.0));
+    let b = s.add_point(DVec2::new(50.0, 0.0));
+    s.add_spline(vec![a, m, b], false);
+    s.add_line(b, a);
+    let sid = doc.insert_feature("S".into(), ROOT, FeatureKind::Sketch(s));
+    model.update(&doc);
+    ok(&model);
+    let ss = model.current(&doc).sketches[&sid].clone();
+    assert_eq!(ss.profiles.len(), 2, "blob + arch");
+    let blob = ss.profiles.iter().find(|p| p.hint.x < 20.0).unwrap();
+    // a Catmull-Rom loop through (±10, 0), (0, ±10) bulges between circle-ish and the square
+    assert!(blob.area > 200.0 && blob.area < 400.0, "blob area {}", blob.area);
+    let pr = profile_ref(&model, &doc, sid, |p| p.hint.x < 20.0);
+    doc.insert_feature("E".into(), ROOT, FeatureKind::Extrude(Extrude { profiles: vec![pr], distance: "5".into(), distance2: String::new(), mode: ExtentMode::OneSide, start_offset: String::new(), op: Operation::NewBody, targets: vec![] }));
+    model.update(&doc);
+    ok(&model);
+    let body = model.current(&doc).bodies.values().next().unwrap().clone();
+    assert!((body.shape.volume().unwrap() - blob.area * 5.0).abs() < 1e-2, "volume {} vs area*5 {}", body.shape.volume().unwrap(), blob.area * 5.0);
+    assert!(body.face_names.iter().any(|n| n.contains(".side(s")), "spline side face named: {:?}", body.face_names);
+
+    // a spline as sweep path
+    let mut ps = Sketch::new(PlaneRef::Origin(OriginPlane::YZ));
+    let p0 = ps.add_point(DVec2::new(0.0, 20.0));
+    let p1 = ps.add_point(DVec2::new(15.0, 30.0));
+    let p2 = ps.add_point(DVec2::new(30.0, 25.0));
+    let path = ps.add_spline(vec![p0, p1, p2], false);
+    let psk = doc.insert_feature("P".into(), ROOT, FeatureKind::Sketch(ps));
+    let mut cs = Sketch::new(PlaneRef::Origin(OriginPlane::XZ));
+    let c = cs.add_point(DVec2::new(0.0, 20.0));
+    cs.add_curve(CurveGeom::Circle { c, r: 1.5 }, false);
+    let csk = doc.insert_feature("C".into(), ROOT, FeatureKind::Sketch(cs));
+    model.update(&doc);
+    ok(&model);
+    let cpr = profile_ref(&model, &doc, csk, |_| true);
+    doc.insert_feature("Sw".into(), ROOT, FeatureKind::Sweep(Sweep { profiles: vec![cpr], path: vec![PathRef::SketchCurve { sketch: psk, curve: path }], op: Operation::NewBody, targets: vec![], frenet: false }));
+    model.update(&doc);
+    ok(&model);
+    assert_eq!(model.current(&doc).bodies.len(), 2);
+}
+
+#[test]
+fn linked_projection_follows_the_model() {
+    let mut doc = Document::default();
+    doc.parameters.push(lusion_core::expr::Parameter { name: "w".into(), expr: "40".into(), comment: String::new() });
+    let mut model = Model::new();
+    let mut s = Sketch::new(PlaneRef::Origin(OriginPlane::XY));
+    let l = rect(&mut s, 0.0, 0.0, 40.0, 20.0);
+    s.add_constraint(Constraint::Dimension { kind: DimKind::Length(l[0]), expr: "w".into(), value: 0.0, offset: [0.0; 2] });
+    // pin the corner at the origin
+    let p0 = match s.curve(l[0]).unwrap().geom { CurveGeom::Line { a, .. } => a, _ => unreachable!() };
+    s.point_mut(p0).unwrap().fixed = true;
+    let sid = doc.insert_feature("S".into(), ROOT, FeatureKind::Sketch(s));
+    model.update(&doc);
+    let pr = profile_ref(&model, &doc, sid, |_| true);
+    let e = doc.insert_feature("E".into(), ROOT, FeatureKind::Extrude(Extrude { profiles: vec![pr], distance: "10".into(), distance2: String::new(), mode: ExtentMode::OneSide, start_offset: String::new(), op: Operation::NewBody, targets: vec![] }));
+    model.update(&doc);
+    ok(&model);
+    let body = model.current(&doc).bodies.values().next().unwrap().clone();
+    // the top edge at x = w (vertical side face of the right edge meets the top)
+    let (ei, ename) = body
+        .edge_names
+        .iter()
+        .enumerate()
+        .find(|(i, n)| n.contains(&format!("f{e}.end")) && body.shape.edges()[*i].edge_info().map(|inf| (inf.start.x - 40.0).abs() < 1e-6 && (inf.end.x - 40.0).abs() < 1e-6).unwrap_or(false))
+        .map(|(i, n)| (i, n.clone()))
+        .unwrap();
+    let _ = ei;
+    // sketch on top with a linked projection of that edge
+    let top = FaceRef { body: body.id, name: format!("f{e}.end"), hint: [20.0, 10.0, 10.0] };
+    let mut s2 = Sketch::new(PlaneRef::Face(top));
+    let a = s2.add_point(DVec2::new(40.0, 0.0));
+    let b = s2.add_point(DVec2::new(40.0, 20.0));
+    s2.point_mut(a).unwrap().fixed = true;
+    s2.point_mut(b).unwrap().fixed = true;
+    s2.add_line(a, b);
+    s2.links.push(lusion_core::sketch::SkLink { edge: EdgeRef { body: body.id, name: ename, hint: [40.0, 10.0, 10.0] }, points: vec![(a, lusion_core::sketch::LinkRole::Start), (b, lusion_core::sketch::LinkRole::End)], radius: None });
+    let s2id = doc.insert_feature("S2".into(), ROOT, FeatureKind::Sketch(s2));
+    model.update(&doc);
+    ok(&model);
+    let xs = |model: &Model, doc: &Document| {
+        let ss = &model.current(doc).sketches[&s2id];
+        let p = ss.sketch.pos(a);
+        ss.frame.to3(p).x
+    };
+    assert!((xs(&model, &doc) - 40.0).abs() < 1e-6);
+    // widen the box: the projected line follows
+    doc.parameters[0].expr = "55".into();
+    model.update(&doc);
+    ok(&model);
+    assert!((xs(&model, &doc) - 55.0).abs() < 1e-6, "linked point moved to {}", xs(&model, &doc));
+}

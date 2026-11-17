@@ -10,7 +10,7 @@ No cloud, no login, no telemetry. Designs are plain JSON files (`.l360`) you can
 ## Features
 
 **Modelling**
-- **Sketches** on origin planes, construction planes or any planar face. Tools: line (chained), rectangle, centre rectangle, circle, 3-point arc, point, **sketch fillet** (rounds corners and keeps virtual sharps, so the overall dimensions still hold), trim, **text** (for embossed or engraved labels), construction toggle.
+- **Sketches** on origin planes, construction planes or any planar face. Tools: line (chained), rectangle, centre rectangle, circle, 3-point arc, **spline** (`B`, smooth curve through points), point, **offset** (`O`), **project** (`P`, linked: projected edges follow the model when it changes), **sketch fillet** (rounds corners and keeps virtual sharps, so the overall dimensions still hold), trim, **text** (for embossed or engraved labels), construction toggle.
 - **Type while drawing**, like Fusion: start a line and type `40`, start a rectangle and type `60x40`, or start a circle and type the diameter. The matching dimensions are added automatically.
 - **Constraints**: coincident, point-on-curve, horizontal/vertical, parallel, perpendicular, equal, tangent, concentric, midpoint, fix. Lines that are nearly horizontal or vertical get H/V automatically while you draw. The sketch shows its remaining degrees of freedom: free geometry is blue, fully constrained geometry is white.
 - **Dimensions** (length, distance, horizontal/vertical, point-to-line, radius, diameter, angle). Each one takes an **expression**, e.g. `width/2 + 3`, `1.5 in`, `sin(30deg)*r`.
@@ -18,15 +18,26 @@ No cloud, no login, no telemetry. Designs are plain JSON files (`.l360`) you can
 - **Profiles** are detected automatically, including overlapping shapes and holes. You can click any closed region.
 - **Extrude**: one side, symmetric or two sides; start offset; new body / join / cut / intersect. Drag the arrow in the viewport to set the distance. Pulling into a body switches to cut automatically. You can also extrude ("press-pull") planar faces.
 - **Revolve** around an origin axis, a sketch line or an edge.
-- **Fillet** and **chamfer**. Click edges, or click a face to take all of its edges.
+- **Fillet** and **chamfer**. Click edges, or click a face to take all of its edges. Drag the arrow or type a value.
+- **Hole** (`H`): click on a face (snaps to circle centres) or use sketch points. Simple, counterbore or countersink, with print-oriented presets for M2–M8: clearance, socket head, flat head, tap drill and heat-set insert.
+- **Thread**: modelled, printable ISO metric threads on rods and holes, with a clearance setting for printed fits.
+- **Sweep** a profile along sketch curves or edges, **loft** between profiles.
+- **Split** bodies with a plane or planar face (keep both halves or one side).
 - **Shell**, **combine** (join/cut/intersect bodies), **move/copy**, **pattern** (circular or linear/grid) and **mirror**.
-- **Offset construction planes**, useful for sketching at different heights.
+- **Construction planes**: offset, at an angle through a line, midplane, normal to an edge.
+- **Joints**: snap one part onto another face to face or centre to centre; rigid, revolute (drag the ring) or slider.
 
 **Parametric timeline**
 - Every operation is a feature in the timeline. Double-click a feature to edit it. You can drag the marker to roll back, suppress, reorder or delete.
 - **Stable references.** Faces and edges get persistent names from the operation history, so a sketch on a face, or a fillet on an edge, keeps working after you change an upstream dimension. This is the "topological naming problem" that makes FreeCAD fragile.
 - **User parameters** (Edit → Parameters) can be referenced from any value.
 - Recompute is **incremental**: only the changed feature and the ones after it are rebuilt. Typical edits recompute in a few milliseconds.
+
+**Inspect**
+- **Measure** (`I`): face, edge and body sizes, volume, approximate PLA weight, distances, angles.
+- **Section view**: cut the model open with a draggable plane; cut faces are hatched.
+- **X-ray** (`Alt+X`) and per-body see-through.
+- Slow features recompute in the background while you drag, so previews stay smooth.
 
 **Organisation**
 - Components can be nested to any depth. You can activate a component, move bodies between components, colour and hide them, and export per component.
@@ -55,7 +66,9 @@ No cloud, no login, no telemetry. Designs are plain JSON files (`.l360`) you can
 | Command search | `S` |
 | Extrude | Double-click a profile/face, or the toolbar |
 | Fillet | `F` |
-| Sketch tools | `L` line, `R` rectangle, `C` circle, `A` arc, `P` point, `D` dimension, `T` trim, `G` corner fillet, `X` construction, `Del` delete |
+| Hole / measure | `H` / `I` |
+| X-ray | `Alt+X` |
+| Sketch tools | `L` line, `R` rectangle, `C` circle, `A` arc, `B` spline, `O` offset, `P` project, `D` dimension, `T` trim, `G` corner fillet, `X` construction, `Del` delete |
 | While drawing | Type a number (or `60x40` for rectangles) + Enter |
 | Finish sketch / cancel | `Esc` (steps back: tool → selection → finish) |
 | Undo / redo | Ctrl+Z / Ctrl+Y |
@@ -126,9 +139,8 @@ Persistent naming: every face is named after the feature and the sketch curve or
 
 ## Known limitations / roadmap
 
-- Projected model geometry snaps to positions but is not linked: if the model changes, the sketch point stays where it was.
-- No sketch offset/spline tools yet. No sweep/loft/hole/thread features yet. Text uses one bundled font (DejaVu Sans Bold).
-- No assembly joints; components are organisational only.
+- Text uses one bundled font (DejaVu Sans Bold). Splines cannot be dimensioned along their length (constrain their points instead).
+- Joints position parts but there is no motion study or collision check.
 - Mesh bodies (STL/3MF imports) can be viewed, exported, hidden and recoloured, but not used in booleans.
 - Windows builds are untested.
 

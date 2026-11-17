@@ -156,6 +156,37 @@ pub struct SkText {
     pub height: String,
 }
 
+/// Smooth curve through sketch points (uniform Catmull-Rom, exported as a C1 cubic B-spline).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkSpline {
+    /// shares the id space with curves
+    pub id: CId,
+    pub pts: Vec<PId>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub closed: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub construction: bool,
+}
+
+/// Which feature of a projected edge a fixed sketch point follows.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LinkRole {
+    Start,
+    End,
+    Center,
+}
+
+/// Projected model edge that stays linked: its fixed points (and circle radius)
+/// are refreshed from the model each time the sketch is evaluated.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkLink {
+    pub edge: crate::doc::EdgeRef,
+    pub points: Vec<(PId, LinkRole)>,
+    /// radius dimension of a projected circle
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radius: Option<KId>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Sketch {
     pub plane: PlaneRef,
@@ -167,6 +198,10 @@ pub struct Sketch {
     pub constraints: Vec<SkConstraint>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub texts: Vec<SkText>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub splines: Vec<SkSpline>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<SkLink>,
     #[serde(default = "one")]
     pub next_id: u32,
 }
@@ -230,7 +265,7 @@ impl SolveReport {
 
 impl Sketch {
     pub fn new(plane: PlaneRef) -> Self {
-        Sketch { plane, points: vec![], curves: vec![], constraints: vec![], texts: vec![], next_id: 1 }
+        Sketch { plane, points: vec![], curves: vec![], constraints: vec![], texts: vec![], splines: vec![], links: vec![], next_id: 1 }
     }
     fn alloc(&mut self) -> u32 {
         let id = self.next_id;
@@ -311,7 +346,30 @@ impl Sketch {
         let live_p: HashSet<PId> = self.points.iter().map(|p| p.id).collect();
         // texts are addressed like curves (by id); their anchor must survive
         self.texts.retain(|t| !dead_c.contains(&t.id) && live_p.contains(&t.anchor));
+        // splines lose deleted points; fewer than two left removes them
+        let dead_spl: HashSet<CId> = self.splines.iter().filter(|sp| dead_c.contains(&sp.id)).map(|sp| sp.id).collect();
+        let spl_orphans: HashSet<PId> = self.splines.iter().filter(|sp| dead_spl.contains(&sp.id)).flat_map(|sp| sp.pts.iter().copied()).collect();
+        self.splines.retain(|sp| !dead_spl.contains(&sp.id));
+        for sp in &mut self.splines {
+            sp.pts.retain(|p| live_p.contains(p));
+        }
+        self.splines.retain(|sp| sp.pts.len() >= 2);
+        let used_now: HashSet<PId> =
+            self.curves.iter().flat_map(|c| c.points()).chain(self.splines.iter().flat_map(|sp| sp.pts.iter().copied())).collect();
+        self.points.retain(|p| !(spl_orphans.contains(&p.id) && !used_now.contains(&p.id) && !self.links.iter().any(|l| l.points.iter().any(|q| q.0 == p.id))));
+        let live_p: HashSet<PId> = self.points.iter().map(|p| p.id).collect();
+        for l in &mut self.links {
+            l.points.retain(|(p, _)| live_p.contains(p));
+        }
+        self.links.retain(|l| !l.points.is_empty());
         let live_c: HashSet<CId> = self.curves.iter().map(|c| c.id).collect();
+        for l in &mut self.links {
+            if let Some(k) = l.radius {
+                if dead_k.contains(&k) {
+                    l.radius = None;
+                }
+            }
+        }
         self.constraints.retain(|k| {
             !dead_k.contains(&k.id)
                 && k.c.refs_points().iter().all(|p| live_p.contains(p))
@@ -631,9 +689,40 @@ impl Sketch {
         }
     }
 
+    pub fn spline(&self, id: CId) -> Option<&SkSpline> {
+        self.splines.iter().find(|s| s.id == id)
+    }
+
+    pub fn add_spline(&mut self, pts: Vec<PId>, closed: bool) -> CId {
+        let id = self.alloc();
+        self.splines.push(SkSpline { id, pts, closed, construction: false });
+        id
+    }
+
+    /// Cubic Bézier segments [p0, c1, c2, p3] of a spline (uniform Catmull-Rom).
+    pub fn spline_beziers(&self, sp: &SkSpline) -> Vec<[DVec2; 4]> {
+        let p: Vec<DVec2> = sp.pts.iter().map(|id| self.pos(*id)).collect();
+        catmull_rom_beziers(&p, sp.closed)
+    }
+
+    /// Polyline approximation of a spline.
+    pub fn spline_polyline(&self, sp: &SkSpline, tol: f64) -> Vec<DVec2> {
+        beziers_polyline(&self.spline_beziers(sp), tol)
+    }
+
+    pub fn spline_distance(&self, sp: &SkSpline, p: DVec2) -> f64 {
+        self.spline_polyline(sp, 0.05).windows(2).map(|w| dist_point_segment(p, w[0], w[1])).fold(f64::INFINITY, f64::min)
+    }
+
     pub fn bounds(&self) -> Option<(DVec2, DVec2)> {
         let mut lo = DVec2::splat(f64::INFINITY);
         let mut hi = DVec2::splat(f64::NEG_INFINITY);
+        for sp in &self.splines {
+            for p in self.spline_polyline(sp, 0.5) {
+                lo = lo.min(p);
+                hi = hi.max(p);
+            }
+        }
         for c in &self.curves {
             for p in self.curve_polyline(c, 0.5) {
                 lo = lo.min(p);
@@ -976,6 +1065,54 @@ impl Ctx<'_> {
         }
         j
     }
+}
+
+/// Uniform Catmull-Rom through `pts` as cubic Bézier segments (open ends use
+/// reflected phantom points).
+pub fn catmull_rom_beziers(pts: &[DVec2], closed: bool) -> Vec<[DVec2; 4]> {
+    let mut p: Vec<DVec2> = pts.to_vec();
+    p.dedup_by(|a, b| (*a - *b).length() < 1e-12);
+    let n = p.len();
+    if n < 2 {
+        return vec![];
+    }
+    let closed = closed && n >= 3;
+    let at = |i: isize| -> DVec2 {
+        if closed {
+            p[i.rem_euclid(n as isize) as usize]
+        } else if i < 0 {
+            p[0] * 2.0 - p[1]
+        } else if i as usize >= n {
+            p[n - 1] * 2.0 - p[n - 2]
+        } else {
+            p[i as usize]
+        }
+    };
+    let segs = if closed { n } else { n - 1 };
+    (0..segs as isize)
+        .map(|i| {
+            let (p0, p1, p2, p3) = (at(i - 1), at(i), at(i + 1), at(i + 2));
+            [p1, p1 + (p2 - p0) / 6.0, p2 - (p3 - p1) / 6.0, p2]
+        })
+        .collect()
+}
+
+/// Sample Bézier segments into a polyline.
+pub fn beziers_polyline(segs: &[[DVec2; 4]], tol: f64) -> Vec<DVec2> {
+    let mut out = Vec::new();
+    for b in segs {
+        let len = (b[1] - b[0]).length() + (b[2] - b[1]).length() + (b[3] - b[2]).length();
+        let n = ((len / tol.max(1e-6)).sqrt() * 2.0).ceil().clamp(4.0, 64.0) as usize;
+        for k in 0..n {
+            let t = k as f64 / n as f64;
+            let u = 1.0 - t;
+            out.push(b[0] * u * u * u + b[1] * 3.0 * u * u * t + b[2] * 3.0 * u * t * t + b[3] * t * t * t);
+        }
+    }
+    if let Some(b) = segs.last() {
+        out.push(b[3]);
+    }
+    out
 }
 
 #[cfg(test)]
