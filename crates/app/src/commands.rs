@@ -800,7 +800,7 @@ impl Command {
                     _ => return,
                 };
                 if self.fid.is_none() {
-                    self.insert(app, FeatureKind::Plane(OffsetPlane { base, offset: "10".into() }));
+                    self.insert(app, FeatureKind::Plane(OffsetPlane { base, offset: "10".into(), mode: PlaneMode::Offset }));
                 } else if let Some(FeatureKind::Plane(p)) = self.feature_mut(app) {
                     p.base = base;
                 }

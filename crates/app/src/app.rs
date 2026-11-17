@@ -735,8 +735,16 @@ impl eframe::App for App {
         self.timeline_hover = None;
         self.autosave();
         // keep the model up to date
-        if self.model.update(&self.doc) {
+        // slow recomputes (fillets on big bodies...) run in the background while
+        // the last result stays on screen, so dragging stays smooth
+        if self.model.update_interactive(&self.doc, 14.0) {
             self.prune_selection();
+        }
+        for (shape, m, tool) in self.model.premeshed.drain(..) {
+            self.meshes.insert_premeshed(&shape, m, tool);
+        }
+        if self.model.busy() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(8));
         }
         self.meshes.tick();
         self.picks.tick();

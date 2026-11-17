@@ -76,6 +76,18 @@ std::unique_ptr<Op> make_chamfer(const Shape& solid, const std::vector<Shape>& e
 std::unique_ptr<Op> make_shell(const Shape& solid, const std::vector<Shape>& faces, double thickness);
 std::unique_ptr<Op> make_transform(const Shape& s, rust::Slice<const double> m);
 std::unique_ptr<Op> make_mirror(const Shape& s, double ox, double oy, double oz, double nx, double ny, double nz);
+// ---- added: split / sweep / loft / splines / threads / measuring ----
+std::unique_ptr<Op> make_split(const Shape& solid, const std::vector<Shape>& tools);
+std::unique_ptr<Op> make_pipe(const Shape& profile, const std::vector<Shape>& path, uint32_t mode);
+std::unique_ptr<Op> make_loft(const std::vector<Shape>& faces, bool ruled);
+std::unique_ptr<Shape> make_bspline_edge(rust::Slice<const double> poles, rust::Slice<const double> knots,
+                                         rust::Slice<const int32_t> mults, int32_t degree);
+std::unique_ptr<Shape> make_thread(rust::Slice<const double> frame, double r_in, double w_in, double r_out, double w_out,
+                                   double pitch, double length, bool left);
+rust::Vec<double> face_point_normal(const Shape& f);
+rust::Vec<double> edge_eval(const Shape& e, double t);
+rust::Vec<double> shape_distance(const Shape& a, const Shape& b);
+rust::Vec<double> shape_props(const Shape& s);
 std::unique_ptr<Shape> op_shape(const Op& op);
 std::unique_ptr<std::vector<Shape>> op_modified(const Op& op, const Shape& s);
 std::unique_ptr<std::vector<Shape>> op_generated(const Op& op, const Shape& s);

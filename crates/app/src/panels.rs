@@ -264,7 +264,12 @@ pub fn status_bar(app: &mut App, ui: &mut egui::Ui) {
             };
             ui.label(RichText::new(hint).color(theme::TEXT_DIM));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new(format!("recompute {:.1} ms", app.model.last_update_ms)).small().color(theme::TEXT_DIM));
+                if app.model.busy() || app.meshes.busy() {
+                    ui.add(egui::Spinner::new().size(11.0).color(theme::ACCENT));
+                    ui.label(RichText::new("updating…").small().color(theme::ACCENT));
+                } else {
+                    ui.label(RichText::new(format!("recompute {:.1} ms", app.model.last_update_ms)).small().color(theme::TEXT_DIM));
+                }
                 ui.separator();
                 let st = app.display_state();
                 let nb = st.bodies.len();
@@ -346,6 +351,12 @@ fn feature_icon(k: &FeatureKind) -> &'static str {
         FeatureKind::Mirror(_) => ic::FLIP_HORIZONTAL,
         FeatureKind::ImportShape(_) => ic::FILE_ARROW_DOWN,
         FeatureKind::ImportMesh(_) => ic::TRIANGLE,
+        FeatureKind::Split(_) => ic::KNIFE,
+        FeatureKind::Hole(_) => ic::RECORD,
+        FeatureKind::Thread(_) => ic::SPIRAL,
+        FeatureKind::Sweep(_) => ic::PATH,
+        FeatureKind::Loft(_) => ic::STACK,
+        FeatureKind::Joint(_) => ic::LINK,
     }
 }
 

@@ -104,6 +104,15 @@ pub mod bridge {
         fn make_shell(solid: &Shape, faces: &CxxVector<Shape>, thickness: f64) -> Result<UniquePtr<Op>>;
         fn make_transform(s: &Shape, m: &[f64]) -> Result<UniquePtr<Op>>;
         fn make_mirror(s: &Shape, ox: f64, oy: f64, oz: f64, nx: f64, ny: f64, nz: f64) -> Result<UniquePtr<Op>>;
+        fn make_split(solid: &Shape, tools: &CxxVector<Shape>) -> Result<UniquePtr<Op>>;
+        fn make_pipe(profile: &Shape, path: &CxxVector<Shape>, mode: u32) -> Result<UniquePtr<Op>>;
+        fn make_loft(faces: &CxxVector<Shape>, ruled: bool) -> Result<UniquePtr<Op>>;
+        fn make_bspline_edge(poles: &[f64], knots: &[f64], mults: &[i32], degree: i32) -> Result<UniquePtr<Shape>>;
+        fn make_thread(frame: &[f64], r_in: f64, w_in: f64, r_out: f64, w_out: f64, pitch: f64, length: f64, left: bool) -> Result<UniquePtr<Shape>>;
+        fn face_point_normal(f: &Shape) -> Vec<f64>;
+        fn edge_eval(e: &Shape, t: f64) -> Vec<f64>;
+        fn shape_distance(a: &Shape, b: &Shape) -> Vec<f64>;
+        fn shape_props(s: &Shape) -> Vec<f64>;
         fn op_shape(op: &Op) -> UniquePtr<Shape>;
         fn op_modified(op: &Op, s: &Shape) -> UniquePtr<CxxVector<Shape>>;
         fn op_generated(op: &Op, s: &Shape) -> UniquePtr<CxxVector<Shape>>;

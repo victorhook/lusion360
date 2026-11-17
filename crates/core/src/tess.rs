@@ -224,6 +224,15 @@ impl MeshCache {
         Some(m)
     }
 
+    /// Add a mesh computed elsewhere (e.g. by a background recompute).
+    pub fn insert_premeshed(&mut self, shape: &Shape, m: BodyMesh, tool: bool) {
+        if shape.is_null() {
+            return;
+        }
+        let key = if tool { shape.hash() ^ 0x5bd1_e995 } else { shape.hash() };
+        self.map.insert(key, (Arc::new(m), self.generation));
+    }
+
     /// Call once per frame/update; drops meshes unused for a while.
     pub fn tick(&mut self) {
         self.generation += 1;

@@ -94,11 +94,72 @@ pub struct Model {
     states: Vec<ModelState>,
     pub status: Vec<FeatureStatus>,
     fingerprints: Vec<u64>,
+    /// feature id per cached state (to tell edits from structural changes)
+    ids: Vec<FeatureId>,
     param_fp: u64,
     pub params: ParamValues,
     empty: ModelState,
     /// total milliseconds spent in the last update
     pub last_update_ms: f64,
+    /// last evaluation time per feature (ms), used to decide sync vs background
+    cost: HashMap<FeatureId, f64>,
+    /// background recompute in flight
+    job: Option<Job>,
+    /// a background job crashed: stay synchronous for the next update
+    job_failed: bool,
+    /// display meshes produced by background jobs (shape, mesh, is_tool) for the mesh cache
+    pub premeshed: Vec<(Shape, crate::tess::BodyMesh, bool)>,
+}
+
+/// `Shape` is `Send` but not `Sync` (OCCT handles are reference counted with
+/// atomics, but geometry caches are not locked). States handed to a worker get
+/// deep-copied bodies; sketch profiles and tool shapes are only read there.
+struct SendBox<T>(T);
+unsafe impl<T> Send for SendBox<T> {}
+
+struct JobOut {
+    states: Vec<ModelState>,
+    status: Vec<FeatureStatus>,
+    fingerprints: Vec<u64>,
+    ids: Vec<FeatureId>,
+    meshes: Vec<(Shape, crate::tess::BodyMesh, bool)>,
+}
+
+struct Job {
+    start: usize,
+    /// fingerprints of features 0..start at launch (must still match to install)
+    prefix: Vec<u64>,
+    param_fp: u64,
+    params: ParamValues,
+    /// deep-copy hash → original shape, to restore untouched bodies on install
+    originals: HashMap<u64, Shape>,
+    rx: std::sync::mpsc::Receiver<SendBox<JobOut>>,
+}
+
+/// Evaluate one feature on top of `prev`.
+fn eval_feature(doc: &Document, params: &ParamValues, f: &Feature, prev: &ModelState) -> (ModelState, FeatureStatus) {
+    let mut st = prev.clone();
+    let mut status = FeatureStatus::default();
+    let ft = Instant::now();
+    if !f.suppressed {
+        let mut ctx = Ctx { doc, params, warnings: vec![] };
+        // a kernel/logic panic in one feature must not take down the app
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.eval(f, &mut st)));
+        match r {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                status.error = Some(e);
+                st = prev.clone();
+            }
+            Err(_) => {
+                status.error = Some("internal error while computing this feature".into());
+                st = prev.clone();
+            }
+        }
+        status.warnings = ctx.warnings;
+    }
+    status.millis = ft.elapsed().as_secs_f64() * 1000.0;
+    (st, status)
 }
 
 fn fingerprint(f: &Feature) -> u64 {
@@ -136,15 +197,159 @@ impl Model {
         Self::default()
     }
 
+    fn param_hash(doc: &Document) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        serde_json::to_string(&doc.parameters).unwrap_or_default().hash(&mut h);
+        h.finish()
+    }
+
+    /// True while a background recompute runs (the shown states are stale).
+    pub fn busy(&self) -> bool {
+        self.job.is_some()
+    }
+
+    /// Install a finished background job. Returns true if states changed.
+    fn poll_job(&mut self) -> bool {
+        let Some(job) = &self.job else { return false };
+        match job.rx.try_recv() {
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.job = None;
+                self.job_failed = true;
+                false
+            }
+            Ok(SendBox(mut out)) => {
+                let job = self.job.take().unwrap();
+                // the prefix it was built on must still be cached
+                if self.fingerprints.len() < job.start || self.fingerprints[..job.start] != job.prefix[..] {
+                    return false;
+                }
+                // untouched bodies: back to the original shapes (keeps mesh/pick caches warm)
+                for st in &mut out.states {
+                    for b in st.bodies.values_mut() {
+                        if b.shape.is_null() {
+                            continue;
+                        }
+                        if let Some(orig) = job.originals.get(&b.shape.hash()) {
+                            b.shape = orig.clone();
+                        }
+                    }
+                }
+                for (id, s) in out.ids.iter().zip(&out.status) {
+                    self.cost.insert(*id, s.millis);
+                }
+                self.truncate(job.start);
+                self.states.extend(out.states);
+                self.status.extend(out.status);
+                self.fingerprints.extend(out.fingerprints);
+                self.ids.extend(out.ids);
+                if job.param_fp != self.param_fp {
+                    self.param_fp = job.param_fp;
+                    self.params = job.params;
+                }
+                self.premeshed.extend(out.meshes);
+                true
+            }
+        }
+    }
+
+    /// Like `update`, but slow recomputes run on a worker thread while the
+    /// previous result stays visible (for live previews while dragging).
+    /// Returns true if the visible states changed.
+    pub fn update_interactive(&mut self, doc: &Document, budget_ms: f64) -> bool {
+        let mut changed = self.poll_job();
+        if self.job.is_some() {
+            return changed;
+        }
+        if self.job_failed {
+            self.job_failed = false;
+            return self.update(doc) || changed;
+        }
+        let pfp = Self::param_hash(doc);
+        let n = self.states.len().min(doc.features.len());
+        let mut first_bad = if pfp != self.param_fp { 0 } else { n };
+        for i in 0..first_bad {
+            if fingerprint(&doc.features[i]) != self.fingerprints[i] {
+                first_bad = i;
+                break;
+            }
+        }
+        let marker = doc.marker.min(doc.features.len());
+        if first_bad >= marker && self.states.len() >= marker {
+            return changed;
+        }
+        // background only for edits of existing features with stale states to show meanwhile
+        let same_shape = self.states.len() >= marker && (first_bad..marker).all(|i| self.ids.get(i) == Some(&doc.features[i].id));
+        let est: f64 = (first_bad..marker).map(|i| self.cost.get(&doc.features[i].id).copied().unwrap_or(0.0)).sum();
+        if !same_shape || est < budget_ms {
+            changed |= self.update(doc);
+            return changed;
+        }
+        self.launch(doc, first_bad, marker, pfp);
+        changed
+    }
+
+    fn launch(&mut self, doc: &Document, start: usize, end: usize, pfp: u64) {
+        let params = if pfp != self.param_fp { ParamValues::evaluate(&doc.parameters) } else { self.params.clone() };
+        let mut base = self.state_after(start).clone();
+        let mut originals = HashMap::new();
+        for b in base.bodies.values_mut() {
+            if b.shape.is_null() {
+                continue;
+            }
+            let copy = b.shape.deep_copy();
+            originals.insert(copy.hash(), b.shape.clone());
+            b.shape = copy;
+        }
+        let copies: HashSet<u64> = originals.keys().copied().collect();
+        let doc = doc.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let input = SendBox((base, params.clone()));
+        std::thread::Builder::new()
+            .name("recompute".into())
+            .spawn(move || {
+                let input = input;
+                let SendBox((base, params)) = input;
+                let mut out = JobOut { states: vec![], status: vec![], fingerprints: vec![], ids: vec![], meshes: vec![] };
+                let mut prev = base;
+                for f in &doc.features[start..end] {
+                    let (st, status) = eval_feature(&doc, &params, f, &prev);
+                    out.states.push(st.clone());
+                    out.status.push(status);
+                    out.fingerprints.push(fingerprint(f));
+                    out.ids.push(f.id);
+                    prev = st;
+                }
+                // tessellate what changed here, not on the UI thread
+                for b in prev.bodies.values() {
+                    if b.shape.is_null() || b.mesh.is_some() || copies.contains(&b.shape.hash()) {
+                        continue;
+                    }
+                    if let Ok(m) = crate::tess::BodyMesh::from_shape(&b.shape) {
+                        out.meshes.push((b.shape.clone(), m, false));
+                    }
+                }
+                for f in &doc.features[start..end] {
+                    if let Some((t, _)) = prev.tools.get(&f.id) {
+                        if let Ok(m) = crate::tess::BodyMesh::from_shape(t) {
+                            out.meshes.push((t.clone(), m, true));
+                        }
+                    }
+                }
+                let _ = tx.send(SendBox(out));
+            })
+            .ok();
+        self.job = Some(Job { start, prefix: self.fingerprints[..start].to_vec(), param_fp: pfp, params, originals, rx });
+    }
+
     /// Bring cached states up to date with `doc` (up to the timeline marker).
     /// Returns true if anything was recomputed.
     pub fn update(&mut self, doc: &Document) -> bool {
         let t0 = Instant::now();
-        let pfp = {
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            serde_json::to_string(&doc.parameters).unwrap_or_default().hash(&mut h);
-            h.finish()
-        };
+        // a finished background result may still be useful; a running one is dropped
+        let mut changed = self.poll_job();
+        self.job = None;
+        let pfp = Self::param_hash(doc);
         if pfp != self.param_fp {
             self.param_fp = pfp;
             self.params = ParamValues::evaluate(&doc.parameters);
@@ -162,35 +367,18 @@ impl Model {
             self.truncate(first_bad);
         }
         let marker = doc.marker.min(doc.features.len());
-        let mut changed = false;
         while self.states.len() < marker {
             let i = self.states.len();
             let f = &doc.features[i];
-            let prev = if i == 0 { self.empty.clone() } else { self.states[i - 1].clone() };
-            let mut st = prev.clone();
-            let mut status = FeatureStatus::default();
-            let ft = Instant::now();
-            if !f.suppressed {
-                let mut ctx = Ctx { doc, params: &self.params, warnings: vec![] };
-                // a kernel/logic panic in one feature must not take down the app
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.eval(f, &mut st)));
-                match r {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        status.error = Some(e);
-                        st = prev;
-                    }
-                    Err(_) => {
-                        status.error = Some("internal error while computing this feature".into());
-                        st = prev;
-                    }
-                }
-                status.warnings = ctx.warnings;
-            }
-            status.millis = ft.elapsed().as_secs_f64() * 1000.0;
+            let (st, status) = {
+                let prev = if i == 0 { &self.empty } else { &self.states[i - 1] };
+                eval_feature(doc, &self.params, f, prev)
+            };
+            self.cost.insert(f.id, status.millis);
             self.states.push(st);
             self.status.push(status);
             self.fingerprints.push(fingerprint(f));
+            self.ids.push(f.id);
             changed = true;
         }
         self.last_update_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -201,9 +389,11 @@ impl Model {
         self.states.truncate(n);
         self.status.truncate(n);
         self.fingerprints.truncate(n);
+        self.ids.truncate(n);
     }
 
     pub fn invalidate(&mut self) {
+        self.job = None;
         self.truncate(0);
         self.param_fp = 0;
     }
@@ -411,11 +601,16 @@ impl Ctx<'_> {
             FeatureKind::Chamfer(x) => self.fillet_chamfer(f, &x.edges, &x.distance, false, st),
             FeatureKind::Shell(s) => self.shell(f, s, st),
             FeatureKind::Plane(p) => {
-                let base = self.resolve_plane(st, &p.base)?;
-                let d = self.eval_expr("offset", &p.offset)?;
-                st.planes.insert(f.id, base.0.offset(d));
+                let fr = self.plane_frame(st, p)?;
+                st.planes.insert(f.id, fr);
                 Ok(())
             }
+            FeatureKind::Split(x) => self.split(f, x, st),
+            FeatureKind::Hole(x) => self.hole(f, x, st),
+            FeatureKind::Thread(x) => self.thread(f, x, st),
+            FeatureKind::Sweep(x) => self.sweep(f, x, st),
+            FeatureKind::Loft(x) => self.loft(f, x, st),
+            FeatureKind::Joint(x) => self.joint(f, x, st),
             FeatureKind::Combine(c) => self.combine(f, c, st),
             FeatureKind::Move(m) => self.move_bodies(f, m, st),
             FeatureKind::Pattern(p) => self.pattern(f, p, st),
@@ -1059,6 +1254,430 @@ impl Ctx<'_> {
         }
         Ok(())
     }
+
+    // ---- construction planes
+
+    fn plane_frame(&mut self, st: &ModelState, p: &OffsetPlane) -> Result<Frame, String> {
+        let d = self.eval_expr("offset", &p.offset)?;
+        let fr = match &p.mode {
+            PlaneMode::Offset => self.resolve_plane(st, &p.base)?.0,
+            PlaneMode::Angle { axis, angle } => {
+                let base = self.resolve_plane(st, &p.base)?.0;
+                let (o, a) = self.resolve_axis(st, axis)?;
+                let a = a.normalize();
+                let mut n0 = base.n - a * base.n.dot(a);
+                if n0.length() < 1e-9 {
+                    n0 = a.any_orthonormal_vector();
+                }
+                let ang = self.eval_expr("angle", angle)?.to_radians();
+                let n = DQuat::from_axis_angle(a, ang) * n0.normalize();
+                Frame::new(o, n, a)
+            }
+            PlaneMode::Midplane { other } => {
+                let a = self.resolve_plane(st, &p.base)?.0;
+                let b = self.resolve_plane(st, other)?.0;
+                let bn = if a.n.dot(b.n) < 0.0 { -b.n } else { b.n };
+                if a.n.cross(bn).length() < 1e-9 {
+                    let mid = a.origin + a.n * (a.n.dot(b.origin - a.origin) * 0.5);
+                    Frame::new(mid, a.n, a.x)
+                } else {
+                    // bisector through the intersection line
+                    let u = a.n.cross(bn);
+                    let (d1, d2) = (a.n.dot(a.origin), bn.dot(b.origin));
+                    let pt = (a.n * 0.0 + bn.cross(u) * d1 + u.cross(a.n) * d2) / u.length_squared();
+                    let n = (a.n - bn).normalize();
+                    Frame::new(pt, n, u)
+                }
+            }
+            PlaneMode::NormalToEdge { edge, at } => {
+                let body = st.bodies.get(&edge.body).ok_or("edge body is missing")?.clone();
+                let e = self.resolve_edge(&body, edge)?;
+                let t = self.eval_expr("position", at)? / 100.0;
+                let (pt, tan) = e.edge_at(t).ok_or("cannot evaluate the edge")?;
+                Frame::new(pt, tan, tan.any_orthonormal_vector())
+            }
+        };
+        Ok(fr.offset(d))
+    }
+
+    // ---- split
+
+    fn split(&mut self, f: &Feature, sp: &Split, st: &mut ModelState) -> Result<(), String> {
+        if sp.bodies.is_empty() {
+            return Err("no bodies selected".into());
+        }
+        let (fr, _) = self.resolve_plane(st, &sp.tool)?;
+        let mut next = 0u32;
+        let mut cut_any = false;
+        for bid in &sp.bodies {
+            let body = st.bodies.get(bid).ok_or("body no longer exists")?.clone();
+            if body.is_mesh() {
+                self.warnings.push("mesh bodies cannot be split".into());
+                continue;
+            }
+            let Some((lo, hi)) = body.shape.bbox() else { continue };
+            let c = (lo + hi) * 0.5;
+            let centre = c - fr.n * fr.n.dot(c - fr.origin);
+            let tool = k::plane_face(centre, fr.n, (hi - lo).length() + 10.0).map_err(|e| e.0)?;
+            let op = k::split(&body.shape, &[&tool]).map_err(|e| e.0)?;
+            let bn = body_named(&body);
+            let tn = Named { shape: tool.clone(), names: vec![format!("f{}.cut", f.id)] };
+            let named = propagate(&op, &[&bn, &tn], &[], op.shape(), &format!("f{}.cut", f.id));
+            let parts = named.shape.solids();
+            if parts.len() < 2 {
+                continue;
+            }
+            cut_any = true;
+            let side = |p: &Shape| p.props().map(|(_, _, c)| fr.n.dot(c - fr.origin)).unwrap_or(0.0);
+            let mut kept: Vec<Shape> = parts
+                .into_iter()
+                .filter(|p| match sp.keep {
+                    SplitKeep::Both => true,
+                    SplitKeep::Front => side(p) > 0.0,
+                    SplitKeep::Back => side(p) <= 0.0,
+                })
+                .collect();
+            // the original id goes to the back-most piece (stable for downstream references)
+            kept.sort_by(|a, b| side(a).total_cmp(&side(b)));
+            st.bodies.remove(bid);
+            for (i, part) in kept.into_iter().enumerate() {
+                let id = if i == 0 {
+                    *bid
+                } else {
+                    let id = BodyId::new(f.id, next);
+                    next += 1;
+                    id
+                };
+                st.bodies.insert(id, make_body(id, body.component, sub_named(&named, part)));
+            }
+        }
+        if !cut_any {
+            return Err("the plane does not cross the selected bodies".into());
+        }
+        Ok(())
+    }
+
+    // ---- holes
+
+    fn hole(&mut self, f: &Feature, h: &Hole, st: &mut ModelState) -> Result<(), String> {
+        let (body, face) = self.resolve_face(st, &h.face)?;
+        let body = body.clone();
+        let info = face.face_info().map_err(|e| e.0)?;
+        if info.kind != SurfaceKind::Plane {
+            return Err("holes start on a planar face".into());
+        }
+        let n = info.normal.normalize();
+        let frame = face_frame(info.origin, n);
+        let mut centres: Vec<DVec3> = h.points.iter().map(|p| frame.to3(DVec2::from_array(*p))).collect();
+        if let Some(sid) = h.sketch {
+            let ss = st.sketches.get(&sid).ok_or("hole sketch is missing")?;
+            let used: HashSet<u32> = ss.sketch.curves.iter().flat_map(|c| c.points()).collect();
+            for p in &ss.sketch.points {
+                if used.contains(&p.id) || p.fixed {
+                    continue;
+                }
+                let p3 = ss.frame.to3(p.pos());
+                centres.push(p3 - n * n.dot(p3 - info.origin));
+            }
+        }
+        if centres.is_empty() {
+            return Err("no hole positions (click on the face or pick a sketch with points)".into());
+        }
+        let r = self.eval_expr("diameter", &h.diameter)? / 2.0;
+        if r <= 0.0 {
+            return Err("diameter must be positive".into());
+        }
+        let depth = if h.through {
+            body.shape.bbox().map(|(a, b)| (b - a).length() * 2.0 + 10.0).unwrap_or(1000.0)
+        } else {
+            self.eval_expr("depth", &h.depth)?
+        };
+        if depth <= 0.0 {
+            return Err("depth must be positive".into());
+        }
+        let e = (r * 0.05).max(0.05);
+        // half profile (radius, depth below the face), labelled per segment
+        let mut prof: Vec<(f64, f64, &str)> = vec![(0.0, -e, "top")];
+        match h.kind {
+            HoleKind::Simple => {
+                prof.push((r, -e, "wall"));
+            }
+            HoleKind::Counterbore => {
+                let cr = self.eval_expr("counterbore diameter", &h.cb_diameter)? / 2.0;
+                let cd = self.eval_expr("counterbore depth", &h.cb_depth)?;
+                if cr <= r || cd <= 0.0 || cd >= depth {
+                    return Err("counterbore must be wider than the hole and shallower than its depth".into());
+                }
+                prof.push((cr, -e, "cbwall"));
+                prof.push((cr, cd, "cbfloor"));
+                prof.push((r, cd, "wall"));
+            }
+            HoleKind::Countersink => {
+                let cr = self.eval_expr("countersink diameter", &h.cs_diameter)? / 2.0;
+                let ang = self.eval_expr("countersink angle", &h.cs_angle)?;
+                if cr <= r || !(1.0..179.0).contains(&ang) {
+                    return Err("countersink must be wider than the hole (angle 1..179°)".into());
+                }
+                let cd = (cr - r) / (ang.to_radians() / 2.0).tan();
+                prof.push((cr, -e, "csrim"));
+                prof.push((cr, 0.0, "cs"));
+                prof.push((r, cd, "wall"));
+            }
+        }
+        prof.push((r, depth, "floor"));
+        if h.drill_point && !h.through {
+            prof.push((0.0, depth + r / 59f64.to_radians().tan(), "axis"));
+        } else {
+            prof.push((0.0, depth, "axis"));
+        }
+        let w = -n;
+        let u = frame.x;
+        let mut tools: Vec<Named> = Vec::new();
+        for (hi, c) in centres.iter().enumerate() {
+            let pts: Vec<DVec3> = prof.iter().map(|(rr, z, _)| *c + u * *rr + w * *z).collect();
+            let mut edges = Vec::new();
+            let mut names = HashMap::new();
+            for i in 0..pts.len() {
+                let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+                if (a - b).length() < 1e-9 {
+                    continue;
+                }
+                let ed = k::line(a, b).map_err(|e| e.0)?;
+                names.insert(ed.hash(), format!("h{hi}.{}", prof[i].2));
+                edges.push(ed);
+            }
+            let region = k::planar_regions(&edges).map_err(|e| e.0)?;
+            let face = region.into_iter().next().ok_or("hole profile is degenerate")?;
+            // planar_regions rebuilds edges: map names by midpoint
+            let mut fnames = HashMap::new();
+            for fe in face.edges() {
+                let Ok(fi) = fe.edge_info() else { continue };
+                for (i, ed) in edges.iter().enumerate() {
+                    let _ = i;
+                    if let Ok(ei) = ed.edge_info() {
+                        if (ei.mid - fi.mid).length() < 1e-7 {
+                            if let Some(nm) = names.get(&ed.hash()) {
+                                fnames.insert(fe.hash(), nm.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            let op = k::revolve(&face, *c, w, std::f64::consts::TAU).map_err(|e| e.0)?;
+            tools.push(self.name_sweep(f.id, &op, &face, &fnames));
+        }
+        let tool = if tools.len() == 1 {
+            tools.pop().unwrap()
+        } else {
+            let shapes: Vec<&Shape> = tools.iter().map(|t| &t.shape).collect();
+            let shape = Shape::compound(shapes);
+            let names = tools.iter().flat_map(|t| t.names.iter().cloned()).collect();
+            Named { shape, names }
+        };
+        st.tools.insert(f.id, (tool.shape.clone(), Operation::Cut));
+        self.apply_tool(f, Operation::Cut, &[body.id], Some(body.id), tool, st)
+    }
+
+    // ---- threads
+
+    fn thread(&mut self, f: &Feature, t: &Thread, st: &mut ModelState) -> Result<(), String> {
+        let (body, face) = self.resolve_face(st, &t.face)?;
+        let body = body.clone();
+        let info = face.face_info().map_err(|e| e.0)?;
+        if info.kind != SurfaceKind::Cylinder {
+            return Err("threads go on a cylindrical face".into());
+        }
+        let axis = info.normal.normalize();
+        let o = info.origin;
+        let (pt, nrm) = face.point_normal().ok_or("cannot evaluate the face")?;
+        let radial = (pt - o) - axis * axis.dot(pt - o);
+        let external = radial.dot(nrm) > 0.0;
+        // axial extent of the face
+        let (mut smin, mut smax) = (f64::INFINITY, f64::NEG_INFINITY);
+        for e in face.edges() {
+            for p in e.edge_polyline(0.01, 0.2) {
+                let s = axis.dot(p - o);
+                smin = smin.min(s);
+                smax = smax.max(s);
+            }
+        }
+        if !(smax > smin) {
+            return Err("cannot measure the cylinder".into());
+        }
+        let d = self.eval_expr("size", &t.size)?;
+        let p = self.eval_expr("pitch", &t.pitch)?;
+        let c = self.eval_expr("clearance", &t.clearance)?;
+        if d <= 0.0 || p <= 0.0 || p > d {
+            return Err("size and pitch must be positive (pitch < size)".into());
+        }
+        let full = smax - smin;
+        let len = if t.length.trim().is_empty() { full } else { self.eval_expr("length", &t.length)?.clamp(p, full) };
+        // run out past the starting end so the groove is open there
+        let (a, b) = if !t.flip { (smin - 1.5 * p, smin + len) } else { (smax - len, smax + 1.5 * p) };
+        let tan30 = 30f64.to_radians().tan();
+        // trapezoid (r_in, half width at r_in, r_out, half width at r_out); ISO 68 basic profile
+        let (r_in, w_in, r_out, w_out) = if external {
+            let rmaj = d / 2.0 - c;
+            let h = 0.6134 * p;
+            // small run-out past the surface; the groove must stay narrower than the pitch
+            let ext = 0.08 * p;
+            let top = 0.875 * p / 2.0 + ext * tan30;
+            let bot = (0.875 * p - 2.0 * h * tan30) / 2.0;
+            if info.radius < rmaj - h {
+                self.warnings.push("the cylinder is thinner than the thread's root diameter".into());
+            }
+            (rmaj - h, bot, rmaj + ext, top)
+        } else {
+            let rmin = (d - 1.0825 * p) / 2.0 + c;
+            let h = 0.5413 * p + c;
+            let ext = 0.15 * p;
+            let top = 0.75 * p / 2.0 + ext * tan30;
+            let bot = ((0.75 * p - 2.0 * h * tan30) / 2.0).max(0.02 * p);
+            if info.radius > rmin + 0.25 * h {
+                self.warnings.push(format!("the hole (Ø{:.2}) is larger than the thread's minor diameter (Ø{:.2}); threads will be shallow", info.radius * 2.0, rmin * 2.0));
+            }
+            (rmin - ext, top, rmin + h, bot)
+        };
+        let xdir = if radial.length() > 1e-9 { radial.normalize() } else { axis.any_orthonormal_vector() };
+        let shape = k::thread(o + axis * a, axis, xdir, r_in, w_in, r_out, w_out, p, b - a, t.left).map_err(|e| e.0)?;
+        let names = vec![format!("f{}.thread", f.id); shape.faces().len()];
+        let tool = Named { shape, names };
+        st.tools.insert(f.id, (tool.shape.clone(), Operation::Cut));
+        self.apply_tool(f, Operation::Cut, &[body.id], Some(body.id), tool, st)
+    }
+
+    // ---- sweep / loft
+
+    fn path_edges(&mut self, st: &ModelState, path: &[PathRef]) -> Result<Vec<Shape>, String> {
+        let mut out = Vec::new();
+        for pr in path {
+            match pr {
+                PathRef::SketchCurve { sketch, curve } => {
+                    let ss = st.sketches.get(sketch).ok_or("path sketch is missing")?;
+                    let e = curve_edge(&ss.sketch, *curve, &ss.frame).ok_or("path curve no longer exists")?.map_err(|e| e.0)?;
+                    out.push(e);
+                }
+                PathRef::Edge(er) => {
+                    let body = st.bodies.get(&er.body).ok_or("path body is missing")?.clone();
+                    out.push(self.resolve_edge(&body, er)?);
+                }
+            }
+        }
+        if out.is_empty() {
+            return Err("no path selected".into());
+        }
+        Ok(out)
+    }
+
+    fn sweep(&mut self, f: &Feature, sw: &Sweep, st: &mut ModelState) -> Result<(), String> {
+        let prof = self.resolve_profiles(st, &sw.profiles)?;
+        let path = self.path_edges(st, &sw.path)?;
+        let mut parts = Vec::new();
+        for face in &prof.faces {
+            let op = k::sweep(face, &path, sw.frenet).map_err(|e| e.0)?;
+            parts.push(self.name_sweep(f.id, &op, face, &prof.edge_names));
+        }
+        let tool = if parts.len() == 1 {
+            parts.pop().unwrap()
+        } else {
+            let shape = Shape::compound(parts.iter().map(|p| &p.shape));
+            Named { shape, names: parts.iter().flat_map(|p| p.names.iter().cloned()).collect() }
+        };
+        st.tools.insert(f.id, (tool.shape.clone(), sw.op));
+        self.apply_tool(f, sw.op, &sw.targets, prof.default_target, tool, st)
+    }
+
+    fn loft(&mut self, f: &Feature, l: &Loft, st: &mut ModelState) -> Result<(), String> {
+        if l.profiles.len() < 2 {
+            return Err("pick at least two profiles".into());
+        }
+        let mut faces = Vec::new();
+        let mut names = HashMap::new();
+        let mut target = None;
+        for pr in &l.profiles {
+            let p = self.resolve_profiles(st, std::slice::from_ref(pr))?;
+            faces.push(p.faces[0].clone());
+            names.extend(p.edge_names);
+            target = target.or(p.default_target);
+        }
+        let op = k::loft(&faces, l.ruled).map_err(|e| e.0)?;
+        let all = Shape::compound(faces.iter());
+        let tool = self.name_sweep(f.id, &op, &all, &names);
+        st.tools.insert(f.id, (tool.shape.clone(), l.op));
+        self.apply_tool(f, l.op, &l.targets, target, tool, st)
+    }
+
+    // ---- joints
+
+    fn joint_frame(&mut self, st: &ModelState, r: &JointRef) -> Result<(Frame, BodyId), String> {
+        match r {
+            JointRef::Face(fr) => {
+                let (body, face) = self.resolve_face(st, fr)?;
+                let bid = body.id;
+                let i = face.face_info().map_err(|e| e.0)?;
+                Ok((
+                    match i.kind {
+                        SurfaceKind::Plane => Frame::new(i.center, i.normal, i.xdir),
+                        _ => {
+                            let a = i.normal.normalize();
+                            Frame::new(i.origin + a * a.dot(i.center - i.origin), a, i.xdir)
+                        }
+                    },
+                    bid,
+                ))
+            }
+            JointRef::Edge(er) => {
+                let body = st.bodies.get(&er.body).ok_or("joint body is missing")?.clone();
+                let e = self.resolve_edge(&body, er)?;
+                let i = e.edge_info().map_err(|e| e.0)?;
+                Ok((
+                    match i.kind {
+                        CurveKind::Circle => Frame::new(i.center, i.axis, i.start - i.center),
+                        _ => {
+                            let d = (i.end - i.start).normalize_or_zero();
+                            Frame::new(i.mid, d, d.any_orthonormal_vector())
+                        }
+                    },
+                    body.id,
+                ))
+            }
+        }
+    }
+
+    fn joint(&mut self, f: &Feature, j: &Joint, st: &mut ModelState) -> Result<(), String> {
+        let (fa, ba) = self.joint_frame(st, &j.a)?;
+        let (fb, bb) = self.joint_frame(st, &j.b)?;
+        let comp_of = |doc: &Document, b: &Body| doc.body_props(b.id).component.unwrap_or(b.component);
+        let moving: Vec<BodyId> = st.bodies.values().filter(|b| self.doc.is_ancestor(j.moving, comp_of(self.doc, b))).map(|b| b.id).collect();
+        if moving.is_empty() {
+            return Err("the moving component has no bodies".into());
+        }
+        if !moving.contains(&ba) {
+            return Err("the first pick must be on the moving component".into());
+        }
+        if moving.contains(&bb) {
+            return Err("the second pick must be on another component".into());
+        }
+        let ang = self.eval_expr("angle", &j.angle)?.to_radians();
+        let off = self.eval_expr("offset", &j.offset)?;
+        let nt = if j.flip { fb.n } else { -fb.n };
+        let xt = DQuat::from_axis_angle(fb.n, ang) * fb.x;
+        let target = Frame::new(fb.origin + fb.n * off, nt, xt);
+        let ma = glam::DMat3::from_cols(fa.x, fa.y, fa.n);
+        let mt = glam::DMat3::from_cols(target.x, target.y, target.n);
+        let rot = mt * ma.transpose();
+        let mat = DMat4::from_translation(target.origin) * DMat4::from_mat3(rot) * DMat4::from_translation(-fa.origin);
+        for bid in moving {
+            let body = st.bodies[&bid].clone();
+            if body.is_mesh() {
+                continue;
+            }
+            let op = k::transform(&body.shape, &mat).map_err(|e| e.0)?;
+            let named = propagate(&op, &[&body_named(&body)], &[], op.shape(), &format!("f{}.moved", f.id));
+            st.bodies.insert(bid, make_body(bid, body.component, named));
+        }
+        Ok(())
+    }
 }
 
 /// Profiles that make up the filled glyphs of text `tid` (excludes counters
@@ -1130,34 +1749,38 @@ pub fn find_profile<'a>(ss: &'a SolvedSketch, curves: &[u32], hint: DVec2) -> Op
         .min_by(|a, b| a.area.total_cmp(&b.area))
 }
 
+/// 3D edge of a sketch curve (None if the curve is missing or degenerate).
+pub fn curve_edge(s: &Sketch, cid: u32, frame: &Frame) -> Option<k::KResult<Shape>> {
+    let c = s.curve(cid)?;
+    Some(match &c.geom {
+        CurveGeom::Line { a, b } => {
+            let (pa, pb) = (s.pos(*a), s.pos(*b));
+            if (pa - pb).length() < 1e-9 {
+                return None;
+            }
+            k::line(frame.to3(pa), frame.to3(pb))
+        }
+        CurveGeom::Circle { c, r } => {
+            if *r < 1e-9 {
+                return None;
+            }
+            k::circle(frame.to3(s.pos(*c)), frame.n, *r)
+        }
+        CurveGeom::Arc { c, a, b } => {
+            if (s.pos(*a) - s.pos(*c)).length() < 1e-9 || (s.pos(*a) - s.pos(*b)).length() < 1e-9 {
+                return None;
+            }
+            k::arc(frame.to3(s.pos(*c)), frame.n, frame.to3(s.pos(*a)), frame.to3(s.pos(*b)))
+        }
+    })
+}
+
 /// Closed regions of a solved sketch.
 pub fn compute_profiles(s: &Sketch, frame: &Frame, sid: FeatureId, params: &ParamValues) -> Result<Vec<Profile>, String> {
     let mut edges = Vec::new();
     for c in s.curves.iter().filter(|c| !c.construction) {
-        let e = match c.geom {
-            CurveGeom::Line { a, b } => {
-                let (pa, pb) = (s.pos(a), s.pos(b));
-                if (pa - pb).length() < 1e-9 {
-                    continue;
-                }
-                k::line(frame.to3(pa), frame.to3(pb))
-            }
-            CurveGeom::Circle { c, r } => {
-                if r < 1e-9 {
-                    continue;
-                }
-                k::circle(frame.to3(s.pos(c)), frame.n, r)
-            }
-            CurveGeom::Arc { c, a, b } => {
-                if (s.pos(a) - s.pos(c)).length() < 1e-9 || (s.pos(a) - s.pos(b)).length() < 1e-9 {
-                    continue;
-                }
-                k::arc(frame.to3(s.pos(c)), frame.n, frame.to3(s.pos(a)), frame.to3(s.pos(b)))
-            }
-        };
-        match e {
-            Ok(e) => edges.push(e),
-            Err(_) => continue,
+        if let Some(Ok(e)) = curve_edge(s, c.id, frame) {
+            edges.push(e);
         }
     }
     // text outlines become closed polygons of line edges

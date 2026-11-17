@@ -38,6 +38,12 @@ No cloud, no login, no telemetry. Designs are plain JSON files (`.l360`) you can
 - Export: STEP, STL, 3MF, OBJ, BREP. Use **Print** (top right) to write a 3MF and optionally open it straight in **Bambu Studio**, OrcaSlicer, PrusaSlicer or Cura. Installed slicers are detected from PATH, flatpak and `~/Applications` AppImages.
 - Undo/redo, crash-safe **autosave with recovery**, and an atomic save.
 
+**Scan real objects (photogrammetry)**
+- **Scan** (Insert ribbon, or File → Scan object from photos…) turns photos or a video of a real object into a printable mesh. Drop photos, a folder or a video onto the window, pick a quality and start. The scan runs in the background with per-step progress, and you can keep working. Failed scans can be retried from the last finished step.
+- **Prepare for printing**: the table the object stood on is detected and the object is stood upright on it, the table and background are cut away, and you type the real size (photos carry no scale). The result is rebuilt as a **watertight, manifold solid with a flat base**: holes up to a chosen size are sealed and the mesh is simplified. A live preview is shown in the viewport; **Insert** adds it as a mesh body (one undo step) and **Insert & print** opens it straight in the slicer. "Clean up a mesh file…" applies the same steps to an existing scan (PLY/OBJ/STL…).
+- Uses [COLMAP](https://colmap.github.io/) (camera solving) and [OpenMVS](https://github.com/cdcseacave/openMVS) (dense mesh) as external programs, CPU-only, with all cores but two at low priority: `sudo apt install colmap ffmpeg`, then `tools/photogrammetry/build-openmvs.sh` (builds OpenMVS into `~/.local/opt/openmvs`, no sudo). Without a CUDA GPU, a 40–80 photo scan takes roughly 5–30 min at Normal quality.
+- Headless: `lusion-scan run <photos|folder|video>… -o raw.ply` and `lusion-scan prepare raw.ply --height 80 -o part.3mf`; `lusion360 --scan <photos|folder|mesh>` opens the scan window pre-filled.
+
 ## Controls
 
 | Action | Input |
@@ -64,6 +70,13 @@ sudo apt install build-essential libgtk-3-dev   # Ubuntu/Debian
 cargo build --release
 ./target/release/lusion360 [file-or-folder]
 ./install.sh            # optional: installs to ~/.local/bin + desktop entry
+```
+
+**Debian / Ubuntu package** (desktop launcher, icon, `.l360` file association, plus `lusion-mcp`):
+
+```bash
+tools/package-deb.sh                                  # builds target/deb/lusion360_<version>_amd64.deb
+sudo apt install ./target/deb/lusion360_*_amd64.deb   # upgrade later the same way
 ```
 
 The geometry kernel is **OpenCASCADE 8** (the same kernel FreeCAD uses). On the first build a prebuilt static OCCT is downloaded automatically, about 70 MB. It comes from the [cadrum](https://github.com/lzpel/cadrum) project's release assets, and builds exist for Linux x86-64/aarch64 and Windows MSVC/GNU. To use your own build, set `OCCT_ROOT=/path/to/occt-install` (it needs `include/opencascade` and `lib`), or set `LUSION_OCCT_URL` to point at a tarball.
@@ -94,6 +107,9 @@ crates/
             with cached per-feature states and persistent face/edge naming,
             import/export.
   meshio/   Fast STL/OBJ/glTF/3MF/PLY/OFF readers and STL/OBJ/3MF writers.
+  photo/    Photogrammetry: drives COLMAP + OpenMVS (subprocesses, progress,
+            cancel, resume), table detection, background removal, scaling and
+            voxel solidify (closing + marching tetrahedra → watertight).
   app/      egui + wgpu UI: viewport renderer (MSAA, thick lines, silhouettes),
             picking (BVH), sketch mode, feature dialogs, timeline, browser.
 ```

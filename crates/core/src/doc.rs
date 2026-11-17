@@ -164,6 +164,170 @@ pub struct Shell {
 pub struct OffsetPlane {
     pub base: PlaneRef,
     pub offset: String,
+    /// how the plane is built from `base` (offset by default)
+    #[serde(default)]
+    pub mode: PlaneMode,
+}
+
+/// Construction plane variants. `base` / `offset` of the owning
+/// [`OffsetPlane`] apply to all of them (offset along the resulting normal).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub enum PlaneMode {
+    /// parallel to `base`
+    #[default]
+    Offset,
+    /// through `axis`, rotated by `angle` (degrees) from `base`
+    Angle { axis: AxisRef, angle: String },
+    /// halfway between `base` and `other` (angle bisector if they are not parallel)
+    Midplane { other: PlaneRef },
+    /// perpendicular to an edge, at `at` percent of its length
+    NormalToEdge { edge: EdgeRef, at: String },
+}
+
+/// Which side(s) of a split to keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SplitKeep {
+    #[default]
+    Both,
+    /// the side the plane normal points to
+    Front,
+    Back,
+}
+
+/// Cut bodies with a plane (or planar face) into separate bodies.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Split {
+    pub bodies: Vec<BodyId>,
+    pub tool: PlaneRef,
+    #[serde(default)]
+    pub keep: SplitKeep,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum HoleKind {
+    #[default]
+    Simple,
+    Counterbore,
+    Countersink,
+}
+
+/// Holes drilled into a planar face.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Hole {
+    pub face: FaceRef,
+    /// hole centres in the face's sketch frame (2D, see `model::face_frame`)
+    #[serde(default)]
+    pub points: Vec<[f64; 2]>,
+    /// also drill at every point of this sketch (parametric placement)
+    #[serde(default)]
+    pub sketch: Option<FeatureId>,
+    #[serde(default)]
+    pub kind: HoleKind,
+    pub diameter: String,
+    pub depth: String,
+    #[serde(default)]
+    pub through: bool,
+    #[serde(default)]
+    pub cb_diameter: String,
+    #[serde(default)]
+    pub cb_depth: String,
+    #[serde(default)]
+    pub cs_diameter: String,
+    #[serde(default)]
+    pub cs_angle: String,
+    /// 118° drill point instead of a flat bottom
+    #[serde(default)]
+    pub drill_point: bool,
+}
+
+/// Modelled (printable) ISO metric thread on a cylindrical face.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Thread {
+    pub face: FaceRef,
+    /// nominal (major) diameter
+    pub size: String,
+    pub pitch: String,
+    /// thread length; empty = the whole face
+    #[serde(default)]
+    pub length: String,
+    /// extra play for printing: external threads shrink, internal grow (radially)
+    #[serde(default)]
+    pub clearance: String,
+    #[serde(default)]
+    pub left: bool,
+    /// start from the other end of the face
+    #[serde(default)]
+    pub flip: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum PathRef {
+    SketchCurve { sketch: FeatureId, curve: CId },
+    Edge(EdgeRef),
+}
+
+/// Sweep profiles along a path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Sweep {
+    pub profiles: Vec<ProfileRef>,
+    pub path: Vec<PathRef>,
+    #[serde(default)]
+    pub op: Operation,
+    #[serde(default)]
+    pub targets: Vec<BodyId>,
+    /// pure Frenet frame (helical paths)
+    #[serde(default)]
+    pub frenet: bool,
+}
+
+/// Loft through profiles (one section each, in order).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Loft {
+    pub profiles: Vec<ProfileRef>,
+    #[serde(default)]
+    pub ruled: bool,
+    #[serde(default)]
+    pub op: Operation,
+    #[serde(default)]
+    pub targets: Vec<BodyId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum JointKind {
+    #[default]
+    Rigid,
+    Revolute,
+    Slider,
+}
+
+/// Where a joint attaches: a face (planar: centre + normal, cylindrical: axis)
+/// or an edge (circle: centre + axis, line: midpoint + direction).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum JointRef {
+    Face(FaceRef),
+    Edge(EdgeRef),
+}
+
+/// Positions a component by mating one of its faces/edges onto another part.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Joint {
+    /// component that moves
+    pub moving: CompId,
+    /// attachment on the moving component
+    pub a: JointRef,
+    /// attachment it snaps to
+    pub b: JointRef,
+    #[serde(default)]
+    pub kind: JointKind,
+    /// rotation about the joint axis (degrees)
+    #[serde(default)]
+    pub angle: String,
+    /// distance along the joint axis
+    #[serde(default)]
+    pub offset: String,
+    /// face the same way instead of mating face to face
+    #[serde(default)]
+    pub flip: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -290,6 +454,12 @@ pub enum FeatureKind {
     Mirror(Mirror),
     ImportShape(ImportShape),
     ImportMesh(ImportMesh),
+    Split(Split),
+    Hole(Hole),
+    Thread(Thread),
+    Sweep(Sweep),
+    Loft(Loft),
+    Joint(Joint),
 }
 
 impl FeatureKind {
@@ -308,6 +478,12 @@ impl FeatureKind {
             FeatureKind::Mirror(_) => "Mirror",
             FeatureKind::ImportShape(_) => "Import",
             FeatureKind::ImportMesh(_) => "Mesh",
+            FeatureKind::Split(_) => "Split",
+            FeatureKind::Hole(_) => "Hole",
+            FeatureKind::Thread(_) => "Thread",
+            FeatureKind::Sweep(_) => "Sweep",
+            FeatureKind::Loft(_) => "Loft",
+            FeatureKind::Joint(_) => "Joint",
         }
     }
 }

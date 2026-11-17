@@ -421,6 +421,61 @@ pub fn transform(s: &Shape, m: &DMat4) -> KResult<Op> {
 }
 
 /// Mirror copy across the plane through `origin` with normal `n`.
+/// Split `solid` with tool shapes (faces, planes, solids); the result is a compound of pieces.
+pub fn split(solid: &Shape, tools: &[&Shape]) -> KResult<Op> {
+    op(sys::make_split(solid.raw(), &to_cxx(tools.iter().copied())))
+}
+
+/// Sweep a profile face along a chain of edges. `frenet` = pure Frenet frame
+/// (better for helices), otherwise corrected Frenet.
+pub fn sweep(profile: &Shape, path: &[Shape], frenet: bool) -> KResult<Op> {
+    op(sys::make_pipe(profile.raw(), &to_cxx(path.iter()), if frenet { 1 } else { 0 }))
+}
+
+/// Loft through the outer wires of profile faces (in order).
+pub fn loft(faces: &[Shape], ruled: bool) -> KResult<Op> {
+    op(sys::make_loft(&to_cxx(faces.iter()), ruled))
+}
+
+/// B-spline edge from poles, knots, multiplicities.
+pub fn bspline(poles: &[DVec3], knots: &[f64], mults: &[i32], degree: i32) -> KResult<Shape> {
+    let flat: Vec<f64> = poles.iter().flat_map(|p| [p.x, p.y, p.z]).collect();
+    Ok(wrap(sys::make_bspline_edge(&flat, knots, mults, degree)?))
+}
+
+/// Helical thread tooth/groove: a trapezoid with half-width `w_in` at radius
+/// `r_in` and `w_out` at `r_out`, following a helix of `pitch` for `length`
+/// along `axis` from `origin` (helix starts in the `xdir` direction).
+#[allow(clippy::too_many_arguments)]
+pub fn thread(origin: DVec3, axis: DVec3, xdir: DVec3, r_in: f64, w_in: f64, r_out: f64, w_out: f64, pitch: f64, length: f64, left: bool) -> KResult<Shape> {
+    let frame = [origin.x, origin.y, origin.z, axis.x, axis.y, axis.z, xdir.x, xdir.y, xdir.z];
+    Ok(wrap(sys::make_thread(&frame, r_in, w_in, r_out, w_out, pitch, length, left)?))
+}
+
+/// Minimum distance between two shapes and the closest points.
+pub fn distance(a: &Shape, b: &Shape) -> Option<(f64, DVec3, DVec3)> {
+    let v = sys::shape_distance(a.raw(), b.raw());
+    (v.len() == 7).then(|| (v[0], DVec3::new(v[1], v[2], v[3]), DVec3::new(v[4], v[5], v[6])))
+}
+
+impl Shape {
+    /// A point in the middle of a face and its outward normal.
+    pub fn point_normal(&self) -> Option<(DVec3, DVec3)> {
+        let v = sys::face_point_normal(self.raw());
+        (v.len() == 6).then(|| (DVec3::new(v[0], v[1], v[2]), DVec3::new(v[3], v[4], v[5])))
+    }
+    /// Point and tangent at normalized arc length `t` (0..1) along an edge.
+    pub fn edge_at(&self, t: f64) -> Option<(DVec3, DVec3)> {
+        let v = sys::edge_eval(self.raw(), t);
+        (v.len() == 6).then(|| (DVec3::new(v[0], v[1], v[2]), DVec3::new(v[3], v[4], v[5])))
+    }
+    /// (volume, surface area, centre of mass)
+    pub fn props(&self) -> Option<(f64, f64, DVec3)> {
+        let v = sys::shape_props(self.raw());
+        (v.len() == 5).then(|| (v[0], v[1], DVec3::new(v[2], v[3], v[4])))
+    }
+}
+
 pub fn mirror(s: &Shape, origin: DVec3, n: DVec3) -> KResult<Op> {
     op(sys::make_mirror(s.raw(), origin.x, origin.y, origin.z, n.x, n.y, n.z))
 }
@@ -545,5 +600,71 @@ mod tests {
         let s = a.to_brep_string().unwrap();
         let b = Shape::from_brep_string(&s).unwrap();
         assert!((b.volume().unwrap() - 12.).abs() < 1e-9);
+    }
+
+    fn cube(a: f64) -> Shape {
+        prism(&planar_regions(&rect(a, a)).unwrap()[0], DVec3::Z * a).unwrap().shape()
+    }
+
+    #[test]
+    fn split_by_plane() {
+        let c = cube(10.);
+        let plane = plane_face(DVec3::new(0., 0., 4.), DVec3::Z, 100.).unwrap();
+        let op = split(&c, &[&plane]).unwrap();
+        let parts = op.shape().solids();
+        assert_eq!(parts.len(), 2);
+        let mut v: Vec<f64> = parts.iter().map(|p| p.volume().unwrap()).collect();
+        v.sort_by(|a, b| a.total_cmp(b));
+        assert!((v[0] - 400.).abs() < 1e-6 && (v[1] - 600.).abs() < 1e-6, "{v:?}");
+    }
+
+    #[test]
+    fn sweep_and_loft() {
+        let disk = planar_regions(&[circle(DVec3::ZERO, DVec3::Z, 1.).unwrap()]).unwrap();
+        let path = [line(DVec3::ZERO, DVec3::new(0., 0., 10.)).unwrap(), line(DVec3::new(0., 0., 10.), DVec3::new(0., 5., 15.)).unwrap()];
+        let sw = sweep(&disk[0], &path, false).unwrap();
+        let s = sw.shape();
+        assert_eq!(s.solids().len(), 1, "sweep makes a solid");
+        assert!(s.volume().unwrap() > std::f64::consts::PI * 10.);
+        let sq = planar_regions(&rect(10., 10.)).unwrap();
+        let top = sq[0].transformed(&(DMat4::from_translation(DVec3::new(2.5, 2.5, 10.)) * DMat4::from_scale(DVec3::splat(0.5)))).unwrap();
+        let l = loft(&[sq[0].clone(), top], true).unwrap();
+        // frustum of a pyramid: h/3 (A1 + A2 + sqrt(A1 A2))
+        let v = 10. / 3. * (100. + 25. + 50.);
+        assert!((l.shape().volume().unwrap() - v).abs() < 1e-3, "{}", l.shape().volume().unwrap());
+        assert!(!l.first().is_null() && !l.last().is_null());
+    }
+
+    #[test]
+    fn spline_and_thread() {
+        let poles = [DVec3::ZERO, DVec3::new(1., 2., 0.), DVec3::new(3., 2., 0.), DVec3::new(4., 0., 0.)];
+        let e = bspline(&poles, &[0., 1.], &[4, 4], 3).unwrap();
+        let (p, _) = e.edge_at(1.0).unwrap();
+        assert!((p - poles[3]).length() < 1e-9);
+        // M6 external thread groove: 1 mm pitch, 10 mm long
+        let t = thread(DVec3::ZERO, DVec3::Z, DVec3::X, 2.39, 0.08, 3.08, 0.48, 1.0, 10.0, false).unwrap();
+        assert_eq!(t.solids().len(), 10, "one piece per turn");
+        let v = t.volume().unwrap();
+        assert!(v > 5.0 && v < 200.0, "thread groove volume {v}");
+        // a face of a cylinder tells inside from outside
+        let (pt, n) = cube(10.).faces()[0].point_normal().unwrap();
+        assert!(n.length() > 0.99 && pt.is_finite());
+        let (d, _, _) = distance(&cube(1.), &cube(1.).transformed(&DMat4::from_translation(DVec3::X * 3.)).unwrap()).unwrap();
+        assert!((d - 2.).abs() < 1e-9);
+        let (vol, area, c) = cube(2.).props().unwrap();
+        assert!((vol - 8.).abs() < 1e-9 && (area - 24.).abs() < 1e-9 && (c - DVec3::ONE).length() < 1e-9);
+    }
+
+    #[test]
+    fn thread_cuts_cylinder() {
+        let disk = planar_regions(&[circle(DVec3::ZERO, DVec3::Z, 3.).unwrap()]).unwrap();
+        let cyl = prism(&disk[0], DVec3::Z * 12.).unwrap().shape();
+        let t = thread(DVec3::new(0., 0., -1.5), DVec3::Z, DVec3::X, 3.0 - 0.6134, 0.083, 3.08, 0.484, 1.0, 15.0, false).unwrap();
+        let v0 = cyl.volume().unwrap();
+        let c = boolean(BoolKind::Cut, &[&cyl], &[&t], true).unwrap().shape();
+        let v1 = c.volume().unwrap();
+        // ~5.55 mm³ per turn inside the cylinder (12 turns inside, plus the run-out)
+        assert!(v0 - v1 > 60.0 && v0 - v1 < 75.0, "groove removed {}", v0 - v1);
+        assert!(c.is_valid());
     }
 }

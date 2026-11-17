@@ -505,3 +505,260 @@ fn exports_are_manifold() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Interactive (background) recompute must give exactly the synchronous result,
+/// keep showing the old state while it runs, and hand over display meshes.
+#[test]
+fn background_recompute_matches_sync() {
+    let mut doc = Document::default();
+    let mut model = Model::new();
+    let mut s = Sketch::new(PlaneRef::Origin(OriginPlane::XY));
+    rect(&mut s, 0.0, 0.0, 40.0, 20.0);
+    let s1 = doc.insert_feature("Sketch1".into(), ROOT, FeatureKind::Sketch(s));
+    model.update(&doc);
+    let pr = profile_ref(&model, &doc, s1, |_| true);
+    let e1 = doc.insert_feature(
+        "Extrude1".into(),
+        ROOT,
+        FeatureKind::Extrude(Extrude { profiles: vec![pr], distance: "10".into(), distance2: String::new(), mode: ExtentMode::OneSide, start_offset: String::new(), op: Operation::NewBody, targets: vec![] }),
+    );
+    model.update(&doc);
+    let body = model.current(&doc).bodies.values().next().unwrap().clone();
+    let edge = body.edge_names.iter().find(|n| n.contains(&format!("f{e1}.side")) && n.matches("side").count() == 2).cloned().unwrap();
+    doc.insert_feature("Fillet1".into(), ROOT, FeatureKind::Fillet(Fillet { edges: vec![EdgeRef { body: body.id, name: edge.clone(), hint: [0.0; 3] }], radius: "2".into() }));
+    model.update(&doc);
+    ok(&model);
+    let v2 = model.current(&doc).bodies[&body.id].shape.volume().unwrap();
+
+    // drag the radius: budget 0 forces the background path
+    if let FeatureKind::Fillet(f) = &mut doc.features.last_mut().unwrap().kind {
+        f.radius = "5".into();
+    }
+    model.update_interactive(&doc, 0.0);
+    assert!(model.busy(), "edit of a known feature should run in the background");
+    // meanwhile the old result is still shown
+    assert!((model.current(&doc).bodies[&body.id].shape.volume().unwrap() - v2).abs() < 1e-9);
+    let t0 = std::time::Instant::now();
+    while model.busy() {
+        assert!(t0.elapsed().as_secs() < 20, "background recompute hangs");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        model.update_interactive(&doc, 0.0);
+    }
+    ok(&model);
+    let v5 = model.current(&doc).bodies[&body.id].shape.volume().unwrap();
+    let mut sync = Model::new();
+    sync.update(&doc);
+    let v5s = sync.current(&doc).bodies[&body.id].shape.volume().unwrap();
+    assert!((v5 - v5s).abs() < 1e-9, "background {v5} vs sync {v5s}");
+    assert!(v5 < v2);
+    assert!(!model.premeshed.is_empty(), "the worker tessellates the new body");
+    // untouched prefix states keep their original shapes (warm caches)
+    assert!(model.state_after(2).bodies[&body.id].shape.same(&body.shape));
+    // a later sync update is a no-op
+    assert!(!model.update(&doc));
+}
+
+fn boxed(doc: &mut Document, model: &mut Model, w: f64, h: f64, d: f64) -> (FeatureId, BodyId) {
+    let mut s = Sketch::new(PlaneRef::Origin(OriginPlane::XY));
+    rect(&mut s, 0.0, 0.0, w, h);
+    let sid = doc.insert_feature("S".into(), ROOT, FeatureKind::Sketch(s));
+    model.update(doc);
+    let pr = profile_ref(model, doc, sid, |_| true);
+    let e = doc.insert_feature(
+        "E".into(),
+        ROOT,
+        FeatureKind::Extrude(Extrude { profiles: vec![pr], distance: d.to_string(), distance2: String::new(), mode: ExtentMode::OneSide, start_offset: String::new(), op: Operation::NewBody, targets: vec![] }),
+    );
+    model.update(doc);
+    ok(model);
+    let bid = *model.current(doc).bodies.keys().last().unwrap();
+    (e, bid)
+}
+
+fn vol(model: &Model, doc: &Document, b: BodyId) -> f64 {
+    model.current(doc).bodies[&b].shape.volume().unwrap()
+}
+
+#[test]
+fn planes_and_split() {
+    let mut doc = Document::default();
+    let mut model = Model::new();
+    let (e, bid) = boxed(&mut doc, &mut model, 40.0, 20.0, 10.0);
+    // plane at 30° through the X axis, midplane between XY and the box top, plane normal to an edge
+    let p1 = doc.insert_feature("P1".into(), ROOT, FeatureKind::Plane(OffsetPlane { base: PlaneRef::Origin(OriginPlane::XY), offset: "0".into(), mode: PlaneMode::Angle { axis: AxisRef::X, angle: "30".into() } }));
+    let top = FaceRef { body: bid, name: format!("f{e}.end"), hint: [20.0, 10.0, 10.0] };
+    let p2 = doc.insert_feature("P2".into(), ROOT, FeatureKind::Plane(OffsetPlane { base: PlaneRef::Origin(OriginPlane::XY), offset: "0".into(), mode: PlaneMode::Midplane { other: PlaneRef::Face(top) } }));
+    let body = model.current(&doc).bodies[&bid].clone();
+    let long_edge = body.edge_names.iter().zip(body.shape.edges()).find(|(_, e)| e.edge_info().map(|i| (i.length - 40.0).abs() < 1e-6).unwrap_or(false)).map(|(n, _)| n.clone()).unwrap();
+    let p3 = doc.insert_feature("P3".into(), ROOT, FeatureKind::Plane(OffsetPlane { base: PlaneRef::Origin(OriginPlane::XY), offset: "0".into(), mode: PlaneMode::NormalToEdge { edge: EdgeRef { body: bid, name: long_edge, hint: [0.0; 3] }, at: "25".into() } }));
+    model.update(&doc);
+    ok(&model);
+    let st = model.current(&doc);
+    let n1 = st.planes[&p1].n;
+    assert!((n1.angle_between(glam::DVec3::Z).to_degrees() - 30.0).abs() < 1e-6, "angle plane normal {n1:?}");
+    assert!((st.planes[&p2].origin.z - 5.0).abs() < 1e-9);
+    assert!((st.planes[&p3].n.x.abs() - 1.0).abs() < 1e-9 && (st.planes[&p3].origin.x - 10.0).abs() < 1e-6 || (st.planes[&p3].origin.x - 30.0).abs() < 1e-6);
+    // split the box with the midplane: two bodies, volumes add up
+    doc.insert_feature("Split".into(), ROOT, FeatureKind::Split(Split { bodies: vec![bid], tool: PlaneRef::Plane(p2), keep: SplitKeep::Both }));
+    model.update(&doc);
+    ok(&model);
+    let st = model.current(&doc);
+    assert_eq!(st.bodies.len(), 2);
+    for b in st.bodies.values() {
+        assert!((b.shape.volume().unwrap() - 4000.0).abs() < 1e-6);
+        assert!(b.face_names.iter().any(|n| n.contains(".cut")), "cut face named: {:?}", b.face_names);
+    }
+    // keep only the front half
+    if let FeatureKind::Split(s) = &mut doc.features.last_mut().unwrap().kind {
+        s.keep = SplitKeep::Front;
+    }
+    model.update(&doc);
+    ok(&model);
+    let st = model.current(&doc);
+    assert_eq!(st.bodies.len(), 1);
+    assert!(st.bodies.values().next().unwrap().shape.bbox().unwrap().0.z > 4.99);
+}
+
+#[test]
+fn holes_and_threads() {
+    let mut doc = Document::default();
+    let mut model = Model::new();
+    let (e, bid) = boxed(&mut doc, &mut model, 40.0, 20.0, 10.0);
+    let top = FaceRef { body: bid, name: format!("f{e}.end"), hint: [20.0, 10.0, 10.0] };
+    let v0 = vol(&model, &doc, bid);
+    // face frame origin = projection of the world origin: point (x, y) in face coords = (x, y) world here
+    let mk = |kind, pts: Vec<[f64; 2]>| {
+        FeatureKind::Hole(Hole {
+            face: top.clone(),
+            points: pts,
+            sketch: None,
+            kind,
+            diameter: "5".into(),
+            depth: "6".into(),
+            through: false,
+            cb_diameter: "9".into(),
+            cb_depth: "3".into(),
+            cs_diameter: "10".into(),
+            cs_angle: "90".into(),
+            drill_point: false,
+        })
+    };
+    doc.insert_feature("H1".into(), ROOT, mk(HoleKind::Simple, vec![[5.0, 5.0], [15.0, 5.0]]));
+    model.update(&doc);
+    ok(&model);
+    let v1 = vol(&model, &doc, bid);
+    let pi = std::f64::consts::PI;
+    assert!((v0 - v1 - 2.0 * pi * 6.25 * 6.0).abs() < 1e-3, "two simple holes: {}", v0 - v1);
+    doc.insert_feature("H2".into(), ROOT, mk(HoleKind::Counterbore, vec![[25.0, 10.0]]));
+    model.update(&doc);
+    ok(&model);
+    let v2 = vol(&model, &doc, bid);
+    let cb = pi * 20.25 * 3.0 + pi * 6.25 * 3.0;
+    assert!((v1 - v2 - cb).abs() < 1e-3, "counterbore: {}", v1 - v2);
+    doc.insert_feature("H3".into(), ROOT, mk(HoleKind::Countersink, vec![[35.0, 10.0]]));
+    model.update(&doc);
+    ok(&model);
+    assert!(vol(&model, &doc, bid) < v2);
+
+    // external M6 thread on a 6 mm boss
+    let mut s = Sketch::new(PlaneRef::Face(top.clone()));
+    let c = s.add_point(DVec2::new(10.0, 15.0));
+    s.add_curve(CurveGeom::Circle { c, r: 3.0 }, false);
+    let sid = doc.insert_feature("S2".into(), ROOT, FeatureKind::Sketch(s));
+    model.update(&doc);
+    ok(&model);
+    let pr = profile_ref(&model, &doc, sid, |p| p.area < 50.0);
+    let e2 = doc.insert_feature("Boss".into(), ROOT, FeatureKind::Extrude(Extrude { profiles: vec![pr], distance: "12".into(), distance2: String::new(), mode: ExtentMode::OneSide, start_offset: String::new(), op: Operation::Join, targets: vec![] }));
+    model.update(&doc);
+    ok(&model);
+    let body = model.current(&doc).bodies[&bid].clone();
+    let side = body.face_names.iter().find(|n| n.starts_with(&format!("f{e2}.side"))).cloned().unwrap();
+    let vb = vol(&model, &doc, bid);
+
+    doc.insert_feature("Thread".into(), ROOT, FeatureKind::Thread(Thread { face: FaceRef { body: bid, name: side, hint: [0.0; 3] }, size: "6".into(), pitch: "1".into(), length: String::new(), clearance: "0".into(), left: false, flip: false }));
+    let t0 = std::time::Instant::now();
+    model.update(&doc);
+    ok(&model);
+    let vt = vol(&model, &doc, bid);
+    // removed groove ≈ π·D·depth·(mean groove width / pitch) · length ≈ π·6·0.61·0.52·12
+    assert!(vb - vt > 30.0 && vb - vt < 120.0, "thread removed {} mm³ (in {:?})", vb - vt, t0.elapsed());
+    // printable: valid B-rep and a watertight mesh
+    let sh = &model.current(&doc).bodies[&bid].shape;
+    assert!(sh.is_valid(), "threaded body is valid");
+    let m = lusion_core::tess::BodyMesh::from_shape(sh).unwrap();
+    let (_, idx) = lusion_core::io::weld(&m.positions, &m.indices);
+    assert_eq!(manifold_errors(&idx), 0, "threaded body meshes watertight");
+}
+
+#[test]
+fn sweep_loft_and_joint() {
+    let mut doc = Document::default();
+    let mut model = Model::new();
+    // sweep a circle (XZ plane) along a sketch line in XY... path: line from origin along +Y
+    let mut ps = Sketch::new(PlaneRef::Origin(OriginPlane::YZ));
+    let a = ps.add_point(DVec2::new(0.0, 0.0));
+    let b = ps.add_point(DVec2::new(30.0, 0.0));
+    let line = ps.add_line(a, b);
+    let path_sk = doc.insert_feature("Path".into(), ROOT, FeatureKind::Sketch(ps));
+    let mut cs = Sketch::new(PlaneRef::Origin(OriginPlane::XZ));
+    let c = cs.add_point(DVec2::new(0.0, 0.0));
+    cs.add_curve(CurveGeom::Circle { c, r: 2.0 }, false);
+    let prof_sk = doc.insert_feature("Prof".into(), ROOT, FeatureKind::Sketch(cs));
+    model.update(&doc);
+    ok(&model);
+    let pr = profile_ref(&model, &doc, prof_sk, |_| true);
+    let sw = doc.insert_feature("Sweep".into(), ROOT, FeatureKind::Sweep(Sweep { profiles: vec![pr], path: vec![PathRef::SketchCurve { sketch: path_sk, curve: line }], op: Operation::NewBody, targets: vec![], frenet: false }));
+    model.update(&doc);
+    ok(&model);
+    let tube = *model.current(&doc).bodies.keys().next().unwrap();
+    assert!((vol(&model, &doc, tube) - std::f64::consts::PI * 4.0 * 30.0).abs() < 1e-3);
+    assert!(model.current(&doc).bodies[&tube].face_names.iter().any(|n| n == &format!("f{sw}.end")));
+
+    // loft from a 20x20 square at z=0 to a 10x10 square on a plane at z=10
+    let mut s1 = Sketch::new(PlaneRef::Origin(OriginPlane::XY));
+    rect(&mut s1, 50.0, 0.0, 70.0, 20.0);
+    let k1 = doc.insert_feature("L1".into(), ROOT, FeatureKind::Sketch(s1));
+    let pl = doc.insert_feature("PL".into(), ROOT, FeatureKind::Plane(OffsetPlane { base: PlaneRef::Origin(OriginPlane::XY), offset: "10".into(), mode: PlaneMode::Offset }));
+    let mut s2 = Sketch::new(PlaneRef::Plane(pl));
+    rect(&mut s2, 55.0, 5.0, 65.0, 15.0);
+    let k2 = doc.insert_feature("L2".into(), ROOT, FeatureKind::Sketch(s2));
+    model.update(&doc);
+    ok(&model);
+    let r1 = profile_ref(&model, &doc, k1, |_| true);
+    let r2 = profile_ref(&model, &doc, k2, |_| true);
+    let lf = doc.insert_feature("Loft".into(), 1, FeatureKind::Loft(Loft { profiles: vec![r1, r2], ruled: true, op: Operation::NewBody, targets: vec![] }));
+    // the loft lives in a second component so the joint can move it
+    let comp = doc.add_component("Part2", ROOT);
+    doc.feature_mut(lf).unwrap().component = comp;
+    model.update(&doc);
+    ok(&model);
+    let st = model.current(&doc);
+    let frustum = st.bodies.values().find(|b| b.id.feature() == lf).unwrap().clone();
+    assert!((frustum.shape.volume().unwrap() - 10.0 / 3.0 * (400.0 + 100.0 + 200.0)).abs() < 1e-3);
+
+    // joint: put the loft's bottom face onto the tube's end cap
+    let bottom = frustum.face_names.iter().find(|n| n.ends_with(".start")).cloned().unwrap();
+    let cap = model.current(&doc).bodies[&tube].face_names.iter().find(|n| n.ends_with(".end")).cloned().unwrap();
+    doc.insert_feature(
+        "Joint".into(),
+        ROOT,
+        FeatureKind::Joint(Joint {
+            moving: comp,
+            a: JointRef::Face(FaceRef { body: frustum.id, name: bottom, hint: [0.0; 3] }),
+            b: JointRef::Face(FaceRef { body: tube, name: cap, hint: [0.0; 3] }),
+            kind: JointKind::Revolute,
+            angle: "45".into(),
+            offset: "0".into(),
+            flip: false,
+        }),
+    );
+    model.update(&doc);
+    ok(&model);
+    let st = model.current(&doc);
+    let moved = &st.bodies[&frustum.id];
+    let (lo, hi) = moved.shape.bbox().unwrap();
+    // the tube ends at y = 30; the frustum now starts there and grows along +y
+    assert!((lo.y - 30.0).abs() < 1e-6, "joined at the cap: {lo:?} {hi:?}");
+    assert!((hi.y - 40.0).abs() < 1e-6);
+    assert!((moved.shape.volume().unwrap() - frustum.shape.volume().unwrap()).abs() < 1e-6);
+}
