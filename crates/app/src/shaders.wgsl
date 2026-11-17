@@ -7,11 +7,15 @@ struct Globals {
     fwd: vec4<f32>,
     bg_top: vec4<f32>,
     bg_bottom: vec4<f32>,
+    // section plane: dot(clip.xyz, p) > clip.w is cut away
+    clip: vec4<f32>,
+    // x = section active
+    clip_on: vec4<f32>,
 };
 
 struct Draw {
     color: vec4<f32>,
-    // x = line width scale, y = depth bias, z = shading mix (0 = flat color), w = unused
+    // x = line width scale, y = depth bias, z = shading mix (0 = flat color), w = 1 if the section plane applies
     params: vec4<f32>,
 };
 
@@ -34,6 +38,14 @@ fn bias_pos(p: vec3<f32>, b: f32) -> vec3<f32> {
         return p - g.fwd.xyz * b * g.fwd.w;
     }
     return p + (g.eye.xyz - p) * b;
+}
+
+fn sectioned() -> bool {
+    return g.clip_on.x > 0.5 && d.params.w > 0.5;
+}
+
+fn clipped(p: vec3<f32>) -> bool {
+    return sectioned() && dot(g.clip.xyz, p) > g.clip.w;
 }
 
 fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
@@ -84,6 +96,17 @@ fn vs_mesh(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>) -> MeshOut {
 
 @fragment
 fn fs_mesh(i: MeshOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    if (clipped(i.wpos)) {
+        discard;
+    }
+    if (sectioned() && !front) {
+        // looking into a cut solid: draw the cap (flat, hatched)
+        let base = srgb_to_linear(d.color.rgb);
+        let lit = 0.55 + 0.35 * abs(dot(normalize(g.clip.xyz), normalize(g.light.xyz)));
+        let hatch = fract((i.pos.x + i.pos.y) / 9.0) < 0.5;
+        let c = base * lit * select(0.78, 0.92, hatch);
+        return vec4<f32>(to_output(c), d.color.a);
+    }
     var n = normalize(i.n);
     var v = normalize(g.eye.xyz - i.wpos);
     if (g.viewport.w > 0.5) {
@@ -121,6 +144,7 @@ fn vs_outline(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>) -> FillOut {
     let off = dir * d.params.x / g.viewport.xy * 2.0;
     o.pos = vec4<f32>(c.xy + off * c.w, c.z, c.w);
     o.color = d.color;
+    o.wpos = p;
     return o;
 }
 
@@ -129,6 +153,7 @@ fn vs_outline(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>) -> FillOut {
 struct FillOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) color: vec4<f32>,
+    @location(1) wpos: vec3<f32>,
 };
 
 @vertex
@@ -136,11 +161,15 @@ fn vs_fill(@location(0) p: vec3<f32>, @location(1) color: vec4<f32>) -> FillOut 
     var o: FillOut;
     o.pos = g.view_proj * vec4<f32>(bias_pos(p, d.params.y), 1.0);
     o.color = color;
+    o.wpos = p;
     return o;
 }
 
 @fragment
 fn fs_fill(i: FillOut) -> @location(0) vec4<f32> {
+    if (clipped(i.wpos)) {
+        discard;
+    }
     return vec4<f32>(to_output(srgb_to_linear(i.color.rgb)), i.color.a);
 }
 
@@ -151,6 +180,7 @@ struct LineOut {
     @location(0) color: vec4<f32>,
     @location(1) dist: f32,
     @location(2) width: f32,
+    @location(3) wpos: vec3<f32>,
 };
 
 @vertex
@@ -168,6 +198,7 @@ fn vs_line(
     if (c0.w < eps && c1.w < eps) {
         var o: LineOut;
         o.pos = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+        o.wpos = p0;
         return o;
     }
     if (c0.w < eps) {
@@ -209,11 +240,15 @@ fn vs_line(
     o.color = color * d.color;
     o.dist = sd * w;
     o.width = w;
+    o.wpos = select(p0, p1, e > 0.5);
     return o;
 }
 
 @fragment
 fn fs_line(i: LineOut) -> @location(0) vec4<f32> {
+    if (clipped(i.wpos)) {
+        discard;
+    }
     let a = clamp(i.width - abs(i.dist) + 0.5, 0.0, 1.0);
     return vec4<f32>(to_output(srgb_to_linear(i.color.rgb)), i.color.a * a);
 }

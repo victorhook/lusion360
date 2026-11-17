@@ -22,6 +22,8 @@ struct Globals {
     fwd: [f32; 4],
     bg_top: [f32; 4],
     bg_bottom: [f32; 4],
+    clip: [f32; 4],
+    clip_on: [f32; 4],
 }
 
 #[repr(C)]
@@ -94,6 +96,8 @@ pub struct Scene {
     pub points: Vec<PointInst>,
     /// an animation is running (ask egui for another frame)
     pub wants_repaint: bool,
+    /// section view: bodies are cut away where dot(n, p) > d (n.xyz, d)
+    pub clip: Option<[f32; 4]>,
 }
 
 struct GpuMesh {
@@ -448,6 +452,8 @@ impl Renderer {
             fwd: scene.fwd.extend(scene.cam_dist).to_array(),
             bg_top: [scene.bg_top[0], scene.bg_top[1], scene.bg_top[2], 1.0],
             bg_bottom: [scene.bg_bottom[0], scene.bg_bottom[1], scene.bg_bottom[2], 1.0],
+            clip: scene.clip.unwrap_or([0.0, 0.0, 1.0, 0.0]),
+            clip_on: [if scene.clip.is_some() { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
 
@@ -468,10 +474,10 @@ impl Renderer {
             let key = Arc::as_ptr(&b.mesh) as usize;
             if b.color[3] >= 0.999 {
                 if b.show_edges {
-                    let o = push(b.edge_color, [1.3, 0.0, 0.0, 0.0]);
+                    let o = push(b.edge_color, [1.3, 0.0, 0.0, 1.0]);
                     plan.push(Cmd::Outline { key, draw: o });
                 }
-                let d = push(b.color, [1.0, 0.0, 1.0, 0.0]);
+                let d = push(b.color, [1.0, 0.0, 1.0, 1.0]);
                 plan.push(Cmd::Mesh { key, draw: d, range: None, overlay: false });
             }
         }
@@ -482,7 +488,7 @@ impl Renderer {
             for (f, c) in &b.face_hl {
                 if let Some(r) = gm.face_ranges.get(*f as usize) {
                     if !r.is_empty() {
-                        let d = push(*c, [1.0, 0.0008, 0.35, 0.0]);
+                        let d = push(*c, [1.0, 0.0008, 0.35, 1.0]);
                         plan.push(Cmd::Mesh { key, draw: d, range: Some(r.clone()), overlay: true });
                     }
                 }
@@ -493,13 +499,13 @@ impl Renderer {
             let key = Arc::as_ptr(&b.mesh) as usize;
             let gm = &self.meshes[&key];
             if b.show_edges && gm.n_edges > 0 {
-                let d = push(b.edge_color, [1.4, 0.0015, 0.0, 0.0]);
+                let d = push(b.edge_color, [1.4, 0.0015, 0.0, 1.0]);
                 plan.push(Cmd::Edges { key, draw: d, range: 0..gm.n_edges });
             }
             for (e, c) in &b.edge_hl {
                 if let Some(r) = gm.edge_ranges.get(*e as usize) {
                     if !r.is_empty() {
-                        let d = push(*c, [3.5, 0.002, 0.0, 0.0]);
+                        let d = push(*c, [3.5, 0.002, 0.0, 1.0]);
                         plan.push(Cmd::Edges { key, draw: d, range: r.clone() });
                     }
                 }
@@ -510,7 +516,7 @@ impl Renderer {
             let key = Arc::as_ptr(&b.mesh) as usize;
             if b.color[3] < 0.999 {
                 // slight bias: translucent overlays (previews) win over coincident opaque faces
-                let d = push(b.color, [1.0, 0.0006, 1.0, 0.0]);
+                let d = push(b.color, [1.0, 0.0006, 1.0, 1.0]);
                 plan.push(Cmd::Mesh { key, draw: d, range: None, overlay: true });
             }
         }

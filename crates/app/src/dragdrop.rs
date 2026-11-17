@@ -256,7 +256,7 @@ pub fn update(app: &mut App, ctx: &egui::Context, frame: &eframe::Frame) {
             // only on a real X11 window (on native Wayland XWayland would not see the drag)
             app.xdnd = Some(own_window(frame).and_then(|w| crate::dragout::DragOut::new(Some(w))));
             if app.xdnd.as_ref().map(|x| x.is_none()).unwrap_or(false) {
-                app.info("Dragging out of the app needs an X11 session (use File → Export or Print)");
+                app.info("Dragging out of the app needs an X11 session (use File > Export or Print)");
             }
         }
         let Some(Some(x)) = app.xdnd.as_ref() else {

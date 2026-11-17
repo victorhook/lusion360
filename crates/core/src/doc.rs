@@ -526,6 +526,9 @@ pub struct BodyProps {
     pub visible: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<[f32; 3]>,
+    /// drawn see-through
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ghost: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

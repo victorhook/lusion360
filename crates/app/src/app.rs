@@ -49,6 +49,8 @@ pub struct Filter {
     pub planes: bool,
     pub axes: bool,
     pub sketch_lines: bool,
+    /// any sketch curve (lines, arcs, circles, splines), reported as `Pick::SketchLine`
+    pub sketch_curves: bool,
 }
 
 impl Filter {
@@ -63,8 +65,33 @@ pub struct Toast {
     pub until: f64,
 }
 
+/// Section view: everything on the positive side of the plane is cut away.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SectionView {
+    pub normal: glam::Vec3,
+    /// a point the plane passes through at offset 0
+    pub origin: glam::Vec3,
+    pub offset: f32,
+}
+
+impl SectionView {
+    /// Plane as (n.xyz, d) for the shaders.
+    pub fn plane(&self) -> [f32; 4] {
+        let n = self.normal.normalize_or_zero();
+        let p = self.origin + n * self.offset;
+        [n.x, n.y, n.z, n.dot(p)]
+    }
+    pub fn cuts(&self, p: glam::Vec3) -> bool {
+        let pl = self.plane();
+        glam::Vec3::new(pl[0], pl[1], pl[2]).dot(p) > pl[3] + 1e-4
+    }
+}
+
 pub struct App {
     pub doc: Document,
+    /// see-through bodies
+    pub xray: bool,
+    pub section: Option<SectionView>,
     pub model: Model,
     pub meshes: MeshCache,
     pub picks: PickCache,
@@ -146,6 +173,8 @@ impl App {
         let light_bg = cc.storage.and_then(|s| s.get_string("light_bg")).map(|s| s == "1").unwrap_or(false);
         let mut app = App {
             doc: Document::default(),
+            xray: false,
+            section: None,
             model: Model::new(),
             meshes: MeshCache::default(),
             picks: PickCache::default(),
@@ -862,6 +891,15 @@ impl App {
         let model_idle = matches!(self.mode, Mode::Model) && self.cmd.is_none();
         if model_idle && fire(KS::new(M::NONE, Key::E)) {
             crate::commands::start(self, crate::commands::CmdKind::Extrude);
+        }
+        if model_idle && fire(KS::new(M::NONE, Key::H)) {
+            crate::commands::start(self, crate::commands::CmdKind::Hole);
+        }
+        if model_idle && fire(KS::new(M::NONE, Key::I)) {
+            crate::commands::start(self, crate::commands::CmdKind::Measure);
+        }
+        if matches!(self.mode, Mode::Model) && fire(KS::new(M::ALT, Key::X)) {
+            self.xray = !self.xray;
         }
         if model_idle && fire(KS::new(M::NONE, Key::Escape)) {
             self.selection.clear();

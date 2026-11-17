@@ -1388,7 +1388,10 @@ impl Ctx<'_> {
             return Err("diameter must be positive".into());
         }
         let depth = if h.through {
-            body.shape.bbox().map(|(a, b)| (b - a).length() * 2.0 + 10.0).unwrap_or(1000.0)
+            // just past the far side of the body (keeps the preview tidy)
+            let (a, b) = body.shape.bbox().ok_or("body has no extent")?;
+            let corners = (0..8).map(|i| DVec3::new(if i & 1 == 0 { a.x } else { b.x }, if i & 2 == 0 { a.y } else { b.y }, if i & 4 == 0 { a.z } else { b.z }));
+            corners.map(|c| n.dot(info.origin - c)).fold(0.0f64, f64::max) + 1.0
         } else {
             self.eval_expr("depth", &h.depth)?
         };
@@ -1677,6 +1680,36 @@ impl Ctx<'_> {
             st.bodies.insert(bid, make_body(bid, body.component, named));
         }
         Ok(())
+    }
+}
+
+/// Frame of a joint attachment in `st` (for manipulators), without warnings.
+pub fn joint_frame(st: &ModelState, r: &JointRef) -> Option<Frame> {
+    match r {
+        JointRef::Face(fr) => {
+            let b = st.bodies.get(&fr.body)?;
+            let f = b.shape.faces().get(b.face_index(&fr.name)?)?.clone();
+            let i = f.face_info().ok()?;
+            Some(match i.kind {
+                SurfaceKind::Plane => Frame::new(i.center, i.normal, i.xdir),
+                _ => {
+                    let a = i.normal.normalize();
+                    Frame::new(i.origin + a * a.dot(i.center - i.origin), a, i.xdir)
+                }
+            })
+        }
+        JointRef::Edge(er) => {
+            let b = st.bodies.get(&er.body)?;
+            let e = b.shape.edges().get(b.edge_index(&er.name)?)?.clone();
+            let i = e.edge_info().ok()?;
+            Some(match i.kind {
+                CurveKind::Circle => Frame::new(i.center, i.axis, i.start - i.center),
+                _ => {
+                    let d = (i.end - i.start).normalize_or_zero();
+                    Frame::new(i.mid, d, d.any_orthonormal_vector())
+                }
+            })
+        }
     }
 }
 

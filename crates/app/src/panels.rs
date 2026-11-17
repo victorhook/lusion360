@@ -15,7 +15,7 @@ fn tool_button(ui: &mut egui::Ui, icon: &str, label: &str, tip: &str) -> egui::R
 
 /// Ribbon button; `active` draws it highlighted (the running command).
 fn tool_button_active(ui: &mut egui::Ui, icon: &str, label: &str, tip: &str, active: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(52.0, 46.0), egui::Sense::click_and_drag());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(47.0, 46.0), egui::Sense::click_and_drag());
     let p = ui.painter();
     let hovered = resp.hovered();
     if active {
@@ -205,13 +205,22 @@ pub fn top_bar(app: &mut App, ui: &mut egui::Ui) {
                     commands::start(app, k);
                 }
             }
-            let plane_active = app.cmd.as_ref().map(|c| c.kind == CmdKind::Plane).unwrap_or(false);
-            if tool_button_active(ui, CmdKind::Plane.icon(), "Plane", "Offset construction plane", plane_active).clicked() {
-                commands::start(app, CmdKind::Plane);
+            let items: [(CmdKind, &str, &str); 5] = [
+                (CmdKind::Sweep, "Sweep", "Sweep a profile along a path"),
+                (CmdKind::Loft, "Loft", "Blend between profiles"),
+                (CmdKind::Hole, "Hole", "Holes with screw presets: clearance, counterbore, countersink, heat-set insert (H)"),
+                (CmdKind::Thread, "Thread", "Modelled, printable ISO thread on a rod or hole"),
+                (CmdKind::Plane, "Plane", "Construction plane: offset, at angle, midplane, normal to edge"),
+            ];
+            for (k, l, t) in items {
+                let active = app.cmd.as_ref().map(|c| c.kind == k).unwrap_or(false);
+                if tool_button_active(ui, k.icon(), l, t, active).clicked() {
+                    commands::start(app, k);
+                }
             }
             ui.separator();
             ui.label(RichText::new("MODIFY").small().strong().color(theme::TEXT_DIM));
-            let items: [(CmdKind, &str, &str); 7] = [
+            let items: [(CmdKind, &str, &str); 8] = [
                 (CmdKind::Fillet, "Fillet", "Round edges (F)"),
                 (CmdKind::Chamfer, "Chamfer", "Bevel edges"),
                 (CmdKind::Shell, "Shell", "Hollow out a body"),
@@ -219,12 +228,25 @@ pub fn top_bar(app: &mut App, ui: &mut egui::Ui) {
                 (CmdKind::Move, "Move", "Move or copy bodies"),
                 (CmdKind::Pattern, "Pattern", "Circular / linear pattern of bodies"),
                 (CmdKind::Mirror, "Mirror", "Mirror bodies across a plane"),
+                (CmdKind::Split, "Split", "Cut bodies in two with a plane"),
             ];
             for (k, l, t) in items {
                 let active = app.cmd.as_ref().map(|c| c.kind == k).unwrap_or(false);
                 if tool_button_active(ui, k.icon(), l, t, active).clicked() {
                     commands::start(app, k);
                 }
+            }
+            ui.separator();
+            ui.label(RichText::new("ASSEMBLE").small().strong().color(theme::TEXT_DIM));
+            let active = app.cmd.as_ref().map(|c| c.kind == CmdKind::Joint).unwrap_or(false);
+            if tool_button_active(ui, CmdKind::Joint.icon(), "Joint", "Snap a part onto another (rigid, revolute, slider)", active).clicked() {
+                commands::start(app, CmdKind::Joint);
+            }
+            ui.separator();
+            ui.label(RichText::new("INSPECT").small().strong().color(theme::TEXT_DIM));
+            let active = app.cmd.as_ref().map(|c| c.kind == CmdKind::Measure).unwrap_or(false);
+            if tool_button_active(ui, CmdKind::Measure.icon(), "Measure", "Sizes, distances, angles, volume and mass (I)", active).clicked() {
+                commands::start(app, CmdKind::Measure);
             }
             ui.separator();
             ui.label(RichText::new("INSERT").small().strong().color(theme::TEXT_DIM));
@@ -1138,6 +1160,15 @@ const PALETTE_ITEMS: &[PaletteItem] = &[
     PaletteItem { label: "Move / copy bodies", keys: "translate rotate", run: |a| commands::start(a, CmdKind::Move) },
     PaletteItem { label: "Pattern", keys: "array circular linear repeat copy", run: |a| commands::start(a, CmdKind::Pattern) },
     PaletteItem { label: "Mirror", keys: "symmetry flip", run: |a| commands::start(a, CmdKind::Mirror) },
+    PaletteItem { label: "Split body", keys: "slice cut plane divide", run: |a| commands::start(a, CmdKind::Split) },
+    PaletteItem { label: "Hole", keys: "drill screw bolt counterbore countersink insert", run: |a| commands::start(a, CmdKind::Hole) },
+    PaletteItem { label: "Thread", keys: "screw tap bolt nut metric", run: |a| commands::start(a, CmdKind::Thread) },
+    PaletteItem { label: "Sweep", keys: "pipe path tube", run: |a| commands::start(a, CmdKind::Sweep) },
+    PaletteItem { label: "Loft", keys: "blend transition sections", run: |a| commands::start(a, CmdKind::Loft) },
+    PaletteItem { label: "Joint", keys: "assemble mate attach hinge revolute slider", run: |a| commands::start(a, CmdKind::Joint) },
+    PaletteItem { label: "Measure", keys: "inspect distance angle size volume mass weight", run: |a| commands::start(a, CmdKind::Measure) },
+    PaletteItem { label: "Section view", keys: "cut clip slice inside", run: |a| commands::start(a, CmdKind::Section) },
+    PaletteItem { label: "X-ray (see-through)", keys: "transparent ghost xray", run: |a| a.xray = !a.xray },
     PaletteItem { label: "Parameters", keys: "variables", run: |a| a.show_params = true },
     PaletteItem { label: "Import file", keys: "insert step stl", run: |a| a.import_file() },
     PaletteItem { label: "Export", keys: "save step stl obj", run: |a| a.export(None) },

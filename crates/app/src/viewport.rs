@@ -102,18 +102,45 @@ fn show_planes(app: &App) -> bool {
 pub fn pick(app: &mut App, st: &ModelState, ray: &Ray, view: &View, filter: Filter) -> Option<Hit> {
     let mouse = view.mouse?;
     let bodies = visible_bodies(app, st);
+    // section view: only the kept part of the ray counts
+    let sec = app.section;
+    let (face_ray, t_limit) = match sec {
+        Some(s) => {
+            let pl = s.plane();
+            let n = Vec3::new(pl[0], pl[1], pl[2]);
+            let side = n.dot(ray.o) - pl[3];
+            let dn = n.dot(ray.d);
+            let tc = if dn.abs() > 1e-9 { -side / dn } else { f32::INFINITY };
+            if side > 0.0 {
+                // starts in the cut-away half: begin at the plane
+                if tc.is_finite() && tc > 0.0 {
+                    (Ray { o: ray.at(tc), d: ray.d }, f32::INFINITY)
+                } else {
+                    (*ray, -1.0)
+                }
+            } else {
+                (*ray, if dn > 0.0 { tc } else { f32::INFINITY })
+            }
+        }
+        None => (*ray, f32::INFINITY),
+    };
     // faces
     let mut face_hit: Option<Hit> = None;
     for vb in bodies.iter().filter(|b| !b.stale) {
         let bvh = app.picks.bvh(&vb.mesh);
-        if let Some((t, tri)) = bvh.raycast(&vb.mesh, ray) {
+        if let Some((t, tri)) = bvh.raycast(&vb.mesh, &face_ray) {
+            let pt = face_ray.at(t);
+            let t = (pt - ray.o).dot(ray.d);
+            if t > t_limit || sec.map(|s| s.cuts(pt)).unwrap_or(false) {
+                continue;
+            }
             if face_hit.map(|h| t < h.depth).unwrap_or(true) {
                 let pick = if vb.is_mesh {
                     Pick::Body(vb.id)
                 } else {
                     Pick::Face { body: vb.id, face: vb.mesh.tri_face[tri as usize] }
                 };
-                face_hit = Some(Hit { pick, point: ray.at(t), depth: t });
+                face_hit = Some(Hit { pick, point: pt, depth: t });
             }
         }
     }
@@ -134,12 +161,34 @@ pub fn pick(app: &mut App, st: &ModelState, ray: &Ray, view: &View, filter: Filt
                         if d < 7.0 && best.map(|b| d < b.0).unwrap_or(true) {
                             let wp = pw.lerp(w, t);
                             let depth = (wp - ray.o).dot(ray.d);
-                            if depth <= occl + tol * 4.0 {
+                            if depth <= occl + tol * 4.0 && !sec.map(|s| s.cuts(wp)).unwrap_or(false) {
                                 best = Some((d, Hit { pick: Pick::Edge { body: vb.id, edge: ei as u32 }, point: wp, depth }));
                             }
                         }
                     }
                     prev = s.map(|s| (s, w));
+                }
+            }
+        }
+        if let Some((_, h)) = best {
+            return Some(h);
+        }
+    }
+    // any sketch curve (e.g. sweep paths)
+    if filter.sketch_curves {
+        let mut best: Option<(f32, Hit)> = None;
+        for sid in visible_sketches(app, st) {
+            let ss = &st.sketches[&sid];
+            for c in ss.sketch.curves.iter() {
+                let pts: Vec<Vec3> = ss.sketch.curve_polyline(c, 0.05).into_iter().map(|p| ss.frame.to3(p).as_vec3()).collect();
+                for w in pts.windows(2) {
+                    if let (Some(sa), Some(sb)) = (app.cam.project(w[0], view.size), app.cam.project(w[1], view.size)) {
+                        let (d, t) = crate::pick::seg_dist(mouse, sa, sb);
+                        if d < 7.0 && best.map(|b| d < b.0).unwrap_or(true) {
+                            let wp = w[0].lerp(w[1], t);
+                            best = Some((d, Hit { pick: Pick::SketchLine { sketch: sid, curve: c.id }, point: wp, depth: (wp - ray.o).dot(ray.d) }));
+                        }
+                    }
                 }
             }
         }
@@ -466,6 +515,7 @@ fn build_scene(app: &mut App, view: &View) -> Scene {
         ortho: cam.ortho,
         bg_top: if app.light_bg { theme::BG_TOP_LIGHT } else { theme::BG_TOP },
         bg_bottom: if app.light_bg { theme::BG_BOTTOM_LIGHT } else { theme::BG_BOTTOM },
+        clip: app.section.map(|s| s.plane()),
         ..Default::default()
     };
 
@@ -500,6 +550,9 @@ fn build_scene(app: &mut App, view: &View) -> Scene {
         }
         if in_sketch {
             color[3] = 0.55;
+        }
+        if app.xray || props.ghost == Some(true) {
+            color[3] = color[3].min(0.28);
         }
         let edge_color = if app.light_bg { [0.1, 0.1, 0.12, 1.0] } else { theme::BODY_EDGE };
         scene.bodies.push(BodyDraw { mesh: vb.mesh.clone(), color, edge_color, show_edges: app.show_edges, face_hl: vec![], edge_hl: vec![] });
@@ -697,6 +750,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 (Some(r), false) => pick(app, &st, &r, &view, filter),
                 _ => None,
             };
+
             if resp.clicked_by(PointerButton::Primary) && !consumed {
                 let shift = ui.input(|i| i.modifiers.shift || i.modifiers.command);
                 let hit = app.hover;
@@ -862,6 +916,20 @@ fn context_menu(app: &mut App, resp: &egui::Response) {
                 app.commit(before);
                 ui.close();
             }
+            let ghost = app.doc.body_props(b).ghost == Some(true);
+            if ui.button(format!("{}  {}", crate::icons::CUBE_TRANSPARENT, if ghost { "Solid again" } else { "See-through" })).clicked() {
+                app.view_change(|d| d.bodies.entry(b).or_default().ghost = if ghost { None } else { Some(true) });
+                ui.close();
+            }
+            if ui.button(format!("{}  Measure", crate::icons::RULER)).clicked() {
+                let t = target.unwrap();
+                crate::commands::start(app, crate::commands::CmdKind::Measure);
+                if let Some(mut c) = app.cmd.take() {
+                    c.on_pick(app, crate::app::Hit { pick: t, point: glam::Vec3::ZERO, depth: 0.0 });
+                    app.cmd = Some(c);
+                }
+                ui.close();
+            }
             if ui.button(format!("{}  Rename body…", crate::icons::TEXT_AA)).clicked() {
                 app.rename = Some((crate::app::RenameTarget::Body(b), app.body_name(b)));
                 ui.close();
@@ -995,7 +1063,7 @@ fn point_in_poly(p: Pos2, pts: &[Pos2]) -> bool {
 fn view_controls(app: &mut App, ui: &mut egui::Ui, view: &View) {
     view_cube(app, ui, view);
     let w = 30.0;
-    let pos = view.rect.right_top() + EVec2::new(-(w + 2.0) * 4.0 - 26.0, 140.0);
+    let pos = view.rect.right_top() + EVec2::new(-(w + 2.0) * 6.0 - 26.0, 140.0);
     egui::Area::new(egui::Id::new("view_controls")).fixed_pos(pos).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
         egui::Frame::new().fill(Color32::from_rgba_unmultiplied(30, 33, 38, 200)).corner_radius(8).inner_margin(3).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1012,6 +1080,19 @@ fn view_controls(app: &mut App, ui: &mut egui::Ui, view: &View) {
                 let icon = if app.cam.cam.ortho { crate::icons::CUBE } else { crate::icons::PERSPECTIVE };
                 if b(ui, icon, if app.cam.cam.ortho { "Orthographic (click for perspective)" } else { "Perspective (click for orthographic)" }) {
                     app.cam.cam.ortho = !app.cam.cam.ortho;
+                }
+                let xr = egui::RichText::new(crate::icons::CUBE_TRANSPARENT).size(15.0).color(if app.xray { theme::ACCENT } else { Color32::from_gray(220) });
+                if ui.add_sized([w, 24.0], egui::Button::new(xr).frame(false)).on_hover_text("X-ray: see through bodies (Alt+X)").clicked() {
+                    app.xray = !app.xray;
+                }
+                let on = app.section.is_some();
+                let sc = egui::RichText::new(crate::icons::KNIFE).size(15.0).color(if on { theme::ACCENT } else { Color32::from_gray(220) });
+                if ui.add_sized([w, 24.0], egui::Button::new(sc).frame(false)).on_hover_text(if on { "Section view (click to turn off)" } else { "Section view: cut the model open" }).clicked() {
+                    if on && !matches!(app.cmd.as_ref().map(|c| c.kind), Some(crate::commands::CmdKind::Section)) {
+                        app.section = None;
+                    } else if !on {
+                        crate::commands::start(app, crate::commands::CmdKind::Section);
+                    }
                 }
                 if let Mode::Sketch(s) = &app.mode {
                     let fid = s.fid;

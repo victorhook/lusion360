@@ -25,9 +25,21 @@ pub enum CmdKind {
     Move,
     Pattern,
     Mirror,
+    Split,
+    Hole,
+    Thread,
+    Sweep,
+    Loft,
+    Joint,
+    Measure,
+    Section,
 }
 
 impl CmdKind {
+    /// Inspection tools: no timeline feature, just a panel.
+    pub fn is_tool(self) -> bool {
+        matches!(self, CmdKind::Measure | CmdKind::Section)
+    }
     pub fn title(self) -> &'static str {
         match self {
             CmdKind::NewSketch => "Create Sketch",
@@ -36,11 +48,19 @@ impl CmdKind {
             CmdKind::Fillet => "Fillet",
             CmdKind::Chamfer => "Chamfer",
             CmdKind::Shell => "Shell",
-            CmdKind::Plane => "Offset Plane",
+            CmdKind::Plane => "Construction Plane",
             CmdKind::Combine => "Combine",
             CmdKind::Move => "Move / Copy",
             CmdKind::Pattern => "Pattern",
             CmdKind::Mirror => "Mirror",
+            CmdKind::Split => "Split Body",
+            CmdKind::Hole => "Hole",
+            CmdKind::Thread => "Thread",
+            CmdKind::Sweep => "Sweep",
+            CmdKind::Loft => "Loft",
+            CmdKind::Joint => "Joint",
+            CmdKind::Measure => "Measure",
+            CmdKind::Section => "Section View",
         }
     }
     pub fn icon(self) -> &'static str {
@@ -56,8 +76,26 @@ impl CmdKind {
             CmdKind::Move => ic::ARROWS_OUT_CARDINAL,
             CmdKind::Pattern => ic::DOTS_NINE,
             CmdKind::Mirror => ic::FLIP_HORIZONTAL,
+            CmdKind::Split => ic::KNIFE,
+            CmdKind::Hole => ic::RECORD,
+            CmdKind::Thread => ic::SPIRAL,
+            CmdKind::Sweep => ic::PATH,
+            CmdKind::Loft => ic::STACK,
+            CmdKind::Joint => ic::LINK,
+            CmdKind::Measure => ic::RULER,
+            CmdKind::Section => ic::KNIFE,
         }
     }
+}
+
+/// Construction plane variants offered by the Plane command.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PlaneKind {
+    #[default]
+    Offset,
+    Angle,
+    Midplane,
+    NormalToEdge,
 }
 
 pub struct Command {
@@ -73,6 +111,143 @@ pub struct Command {
     auto_op: Option<Operation>,
     /// guard against re-expanding text picks
     expanding: bool,
+    /// Measure: picked things (max 2)
+    measure: Vec<Hit>,
+    /// Plane: which variant new planes use
+    plane_kind: PlaneKind,
+    /// Joint: first pick (on the moving part) until the second is made
+    joint_a: Option<JointRef>,
+    /// Measure: results for the current picks (computed on pick)
+    measure_res: Option<MeasureResult>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MeasureResult {
+    /// (label, value) rows for the panel
+    pub rows: Vec<(String, String)>,
+    pub distance: f64,
+    /// closest points between the two picks
+    pub points: Option<(Vec3, Vec3)>,
+}
+
+fn measure_two(_app: &App, c: &Command) -> Option<MeasureResult> {
+    c.measure_res.clone().filter(|m| m.points.is_some())
+}
+
+fn pick_shape(st: &ModelState, p: Pick) -> Option<lusion_kernel::Shape> {
+    match p {
+        Pick::Face { body, face } => st.bodies.get(&body)?.shape.faces().get(face as usize).cloned(),
+        Pick::Edge { body, edge } => st.bodies.get(&body)?.shape.edges().get(edge as usize).cloned(),
+        Pick::Body(b) => st.bodies.get(&b).filter(|b| !b.is_mesh()).map(|b| b.shape.clone()),
+        _ => None,
+    }
+}
+
+fn body_of_pick(p: Pick) -> Option<BodyId> {
+    match p {
+        Pick::Face { body, .. } | Pick::Edge { body, .. } | Pick::Body(body) => Some(body),
+        _ => None,
+    }
+}
+
+fn compute_measure(app: &App, st: &ModelState, picks: &[Hit]) -> MeasureResult {
+    let f = |v: f64| lusion_core::expr::fmt_num((v * 1000.0).round() / 1000.0);
+    let mut r = MeasureResult::default();
+    let describe = |r: &mut MeasureResult, p: Pick, prefix: &str| {
+        match p {
+            Pick::Face { body, face } => {
+                if let Some(i) = st.bodies.get(&body).and_then(|b| b.shape.faces().get(face as usize).and_then(|x| x.face_info().ok())) {
+                    use lusion_kernel::SurfaceKind as K;
+                    let kind = match i.kind {
+                        K::Plane => "Planar face".to_string(),
+                        K::Cylinder => format!("Cylinder  Ø {} (R {})", f(i.radius * 2.0), f(i.radius)),
+                        K::Cone => "Conical face".into(),
+                        K::Sphere => format!("Sphere  Ø {}", f(i.radius * 2.0)),
+                        K::Torus => "Toroidal face".into(),
+                        _ => "Freeform face".into(),
+                    };
+                    r.rows.push((format!("{prefix}Face"), kind));
+                    r.rows.push((format!("{prefix}Area"), format!("{} mm²", f(i.area))));
+                    if i.kind == K::Plane {
+                        r.rows.push((format!("{prefix}Normal"), format!("{}, {}, {}", f(i.normal.x), f(i.normal.y), f(i.normal.z))));
+                    }
+                }
+            }
+            Pick::Edge { body, edge } => {
+                if let Some(i) = st.bodies.get(&body).and_then(|b| b.shape.edges().get(edge as usize).and_then(|x| x.edge_info().ok())) {
+                    use lusion_kernel::CurveKind as K;
+                    let kind = match i.kind {
+                        K::Line => "Straight edge".to_string(),
+                        K::Circle => format!("{}  Ø {} (R {})", if i.closed { "Circle" } else { "Arc" }, f(i.radius * 2.0), f(i.radius)),
+                        _ => "Curved edge".into(),
+                    };
+                    r.rows.push((format!("{prefix}Edge"), kind));
+                    r.rows.push((format!("{prefix}Length"), format!("{} mm", f(i.length))));
+                }
+            }
+            _ => {}
+        }
+    };
+    match picks {
+        [a] => {
+            describe(&mut r, a.pick, "");
+            if let Some(b) = body_of_pick(a.pick).and_then(|b| st.bodies.get(&b)) {
+                r.rows.push(("Body".into(), app.body_name(b.id)));
+                if let Some((v, area, c)) = b.shape.props() {
+                    r.rows.push(("Volume".into(), format!("{} cm³", f(v / 1000.0))));
+                    r.rows.push(("Surface".into(), format!("{} cm²", f(area / 100.0))));
+                    r.rows.push(("Mass (PLA, solid)".into(), format!("≈ {} g", f(v / 1000.0 * 1.24))));
+                    r.rows.push(("Centre of mass".into(), format!("{}, {}, {}", f(c.x), f(c.y), f(c.z))));
+                }
+                if let Some((lo, hi)) = b.shape.bbox() {
+                    let d = hi - lo;
+                    r.rows.push(("Size (X × Y × Z)".into(), format!("{} × {} × {} mm", f(d.x), f(d.y), f(d.z))));
+                }
+            }
+            r.rows.push(("Point".into(), format!("{}, {}, {}", f(a.point.x as f64), f(a.point.y as f64), f(a.point.z as f64))));
+        }
+        [a, b] => {
+            if let (Some(sa), Some(sb)) = (pick_shape(st, a.pick), pick_shape(st, b.pick)) {
+                if let Some((d, pa, pb)) = lusion_kernel::distance(&sa, &sb) {
+                    r.distance = d;
+                    r.points = Some((pa.as_vec3(), pb.as_vec3()));
+                    r.rows.push(("Distance".into(), format!("{} mm", f(d))));
+                    let dv = pb - pa;
+                    r.rows.push(("ΔX / ΔY / ΔZ".into(), format!("{} / {} / {}", f(dv.x.abs()), f(dv.y.abs()), f(dv.z.abs()))));
+                }
+                // angle between planes / straight edges / plane and edge
+                let dir = |s: &lusion_kernel::Shape| -> Option<(glam::DVec3, bool)> {
+                    if let Ok(i) = s.face_info() {
+                        return (i.kind == lusion_kernel::SurfaceKind::Plane).then_some((i.normal, true));
+                    }
+                    let i = s.edge_info().ok()?;
+                    (i.kind == lusion_kernel::CurveKind::Line).then(|| ((i.end - i.start).normalize(), false))
+                };
+                if let (Some((da, pa)), Some((db, pb))) = (dir(&sa), dir(&sb)) {
+                    let mut ang = da.angle_between(db).to_degrees();
+                    if pa != pb {
+                        ang = (90.0 - ang).abs();
+                    } else if ang > 90.0 {
+                        ang = 180.0 - ang;
+                    }
+                    r.rows.push(("Angle".into(), format!("{}°", f(ang))));
+                    if pa && pb && ang < 1e-6 {
+                        if let (Ok(ia), Ok(ib)) = (sa.face_info(), sb.face_info()) {
+                            r.rows.push(("Plane gap".into(), format!("{} mm", f(ia.normal.dot(ib.center - ia.center).abs()))));
+                        }
+                    }
+                }
+            }
+            if r.rows.is_empty() {
+                let d = a.point.distance(b.point) as f64;
+                r.distance = d;
+                r.points = Some((a.point, b.point));
+                r.rows.push(("Distance (points)".into(), format!("{} mm", f(d))));
+            }
+        }
+        _ => {}
+    }
+    r
 }
 
 // ------------------------------------------------------------------ manipulators
@@ -292,7 +467,7 @@ pub fn start(app: &mut App, kind: CmdKind) {
     if let Mode::Sketch(_) = app.mode {
         crate::sketch_mode::finish(app);
     }
-    let mut c = Command { kind, fid: None, editing: false, before: app.doc.clone(), prev_marker: app.doc.marker, stage: 0, gdrag: None, ghover: None, auto_op: None, expanding: false };
+    let mut c = Command { kind, fid: None, editing: false, before: app.doc.clone(), prev_marker: app.doc.marker, stage: 0, gdrag: None, ghover: None, auto_op: None, expanding: false, measure: vec![], plane_kind: PlaneKind::Offset, joint_a: None, measure_res: None };
     let sel = std::mem::take(&mut app.selection);
     app.cmd = None;
     // pre-selection
@@ -309,10 +484,98 @@ pub fn start(app: &mut App, kind: CmdKind) {
             }
         }
     }
-    if matches!(kind, CmdKind::Plane) && c.fid.is_none() {
-        // default: offset from XY until something else is picked
+    if kind == CmdKind::Section && app.section.is_none() {
+        // cut away the half facing the camera, through the middle of the model
+        let (lo, hi) = app.scene_bounds().unwrap_or((Vec3::splat(-10.0), Vec3::splat(10.0)));
+        let toward = -app.cam.cam.forward();
+        let axes = [Vec3::X, Vec3::Y, Vec3::Z, Vec3::NEG_X, Vec3::NEG_Y, Vec3::NEG_Z];
+        let n = axes.into_iter().max_by(|a, b| a.dot(toward).total_cmp(&b.dot(toward))).unwrap();
+        app.section = Some(crate::app::SectionView { normal: n, origin: (lo + hi) * 0.5, offset: 0.0 });
     }
     app.cmd = Some(c);
+}
+
+/// ISO metric coarse pitches.
+pub const ISO_COARSE: [(f64, f64); 14] =
+    [(1.6, 0.35), (2.0, 0.4), (2.5, 0.45), (3.0, 0.5), (4.0, 0.7), (5.0, 0.8), (6.0, 1.0), (8.0, 1.25), (10.0, 1.5), (12.0, 1.75), (14.0, 2.0), (16.0, 2.0), (20.0, 2.5), (24.0, 3.0)];
+
+/// Guess the thread for a cylinder of radius `r` (external: the rod, internal: the tap-drilled hole).
+fn guess_thread(r: f64, external: bool) -> (f64, f64) {
+    let score = |(d, p): (f64, f64)| if external { (d - 2.0 * r).abs() } else { (d - 1.0825 * p - 2.0 * r).abs() };
+    ISO_COARSE.into_iter().min_by(|a, b| score(*a).total_cmp(&score(*b))).unwrap_or((6.0, 1.0))
+}
+
+/// Hole presets for printed parts: (label, kind, diameter, cb/cs diameter, cb depth or cs angle).
+pub fn hole_presets() -> Vec<(String, HoleKind, f64, f64, f64)> {
+    let sizes: [(&str, f64, f64, f64, f64, f64, f64, f64); 7] = [
+        // name, clearance, tap, socket head cb Ø, cb depth, csk Ø, insert Ø, insert depth
+        ("M2", 2.4, 1.6, 4.5, 2.5, 4.4, 3.2, 3.5),
+        ("M2.5", 2.9, 2.05, 5.5, 3.0, 5.4, 3.6, 4.0),
+        ("M3", 3.4, 2.5, 6.5, 3.5, 6.5, 4.2, 5.0),
+        ("M4", 4.5, 3.3, 8.0, 4.5, 8.6, 5.6, 6.0),
+        ("M5", 5.5, 4.2, 9.5, 5.5, 10.5, 6.4, 7.0),
+        ("M6", 6.6, 5.0, 11.0, 6.5, 12.5, 8.0, 9.0),
+        ("M8", 9.0, 6.8, 14.0, 8.5, 16.5, 9.6, 11.0),
+    ];
+    let mut v = Vec::new();
+    for (n, clr, tap, cb, cbd, cs, ins, insd) in sizes {
+        v.push((format!("{n} clearance"), HoleKind::Simple, clr, 0.0, 0.0));
+        v.push((format!("{n} socket head (counterbore)"), HoleKind::Counterbore, clr, cb, cbd));
+        v.push((format!("{n} flat head (countersink)"), HoleKind::Countersink, clr, cs, 90.0));
+        v.push((format!("{n} tap drill (for a thread)"), HoleKind::Simple, tap, 0.0, 0.0));
+        v.push((format!("{n} heat-set insert"), HoleKind::Simple, ins, 0.0, insd));
+    }
+    v
+}
+
+fn plane_ref_of(st: &ModelState, pick: Pick) -> Option<PlaneRef> {
+    match pick {
+        Pick::Origin(o) => Some(PlaneRef::Origin(o)),
+        Pick::Plane(f) => Some(PlaneRef::Plane(f)),
+        Pick::Face { body, face } => face_ref(st, body, face).map(PlaneRef::Face),
+        _ => None,
+    }
+}
+
+fn axis_ref_of(st: &ModelState, pick: Pick) -> Option<AxisRef> {
+    match pick {
+        Pick::Axis(0) => Some(AxisRef::X),
+        Pick::Axis(1) => Some(AxisRef::Y),
+        Pick::Axis(_) => Some(AxisRef::Z),
+        Pick::SketchLine { sketch, curve } => Some(AxisRef::SketchLine { sketch, curve }),
+        Pick::Edge { body, edge } => edge_ref(st, body, edge).map(AxisRef::Edge),
+        _ => None,
+    }
+}
+
+/// World plane (point, normal) of a plane-like pick.
+fn plane_of_pick(app: &App, st: &ModelState, pick: Pick) -> Option<(Vec3, Vec3)> {
+    match pick {
+        Pick::Origin(o) => Some(match o {
+            OriginPlane::XY => (Vec3::ZERO, Vec3::Z),
+            OriginPlane::XZ => (Vec3::ZERO, Vec3::NEG_Y),
+            OriginPlane::YZ => (Vec3::ZERO, Vec3::X),
+        }),
+        Pick::Plane(f) => st.planes.get(&f).map(|fr| (fr.origin.as_vec3(), fr.n.as_vec3())),
+        Pick::Face { body, face } => {
+            let i = st.bodies.get(&body)?.shape.faces().get(face as usize)?.face_info().ok()?;
+            let _ = app;
+            (i.kind == lusion_kernel::SurfaceKind::Plane).then(|| (i.center.as_vec3(), i.normal.as_vec3()))
+        }
+        _ => None,
+    }
+}
+
+/// Snap a click on a planar face to circle centres of its edges or the face centre.
+fn snap_on_face(app: &App, st: &ModelState, body: BodyId, face: u32, p: Vec3) -> Vec3 {
+    let tol = app.cam.cam.distance * 0.02;
+    let Some(b) = st.bodies.get(&body) else { return p };
+    let Some(f) = b.shape.faces().get(face as usize).cloned() else { return p };
+    let mut cands: Vec<Vec3> = f.edges().iter().filter_map(|e| e.edge_info().ok()).filter(|i| i.kind == lusion_kernel::CurveKind::Circle).map(|i| i.center.as_vec3()).collect();
+    if let Ok(i) = f.face_info() {
+        cands.push(i.center.as_vec3());
+    }
+    cands.into_iter().filter(|c| c.distance(p) < tol).min_by(|a, b| a.distance(p).total_cmp(&b.distance(p))).unwrap_or(p)
 }
 
 pub fn edit(app: &mut App, fid: FeatureId) {
@@ -332,6 +595,12 @@ pub fn edit(app: &mut App, fid: FeatureId) {
         FeatureKind::Move(_) => CmdKind::Move,
         FeatureKind::Pattern(_) => CmdKind::Pattern,
         FeatureKind::Mirror(_) => CmdKind::Mirror,
+        FeatureKind::Split(_) => CmdKind::Split,
+        FeatureKind::Hole(_) => CmdKind::Hole,
+        FeatureKind::Thread(_) => CmdKind::Thread,
+        FeatureKind::Sweep(_) => CmdKind::Sweep,
+        FeatureKind::Loft(_) => CmdKind::Loft,
+        FeatureKind::Joint(_) => CmdKind::Joint,
         _ => {
             app.info("This feature has no editable parameters");
             return;
@@ -347,7 +616,16 @@ pub fn edit(app: &mut App, fid: FeatureId) {
     let prev_marker = app.doc.marker;
     app.doc.marker = idx + 1;
     app.selection.clear();
-    app.cmd = Some(Command { kind, fid: Some(fid), editing: true, before, prev_marker, stage: 0, gdrag: None, ghover: None, auto_op: None, expanding: false });
+    let plane_kind = match &app.doc.features[idx].kind {
+        FeatureKind::Plane(p) => match p.mode {
+            PlaneMode::Offset => PlaneKind::Offset,
+            PlaneMode::Angle { .. } => PlaneKind::Angle,
+            PlaneMode::Midplane { .. } => PlaneKind::Midplane,
+            PlaneMode::NormalToEdge { .. } => PlaneKind::NormalToEdge,
+        },
+        _ => PlaneKind::Offset,
+    };
+    app.cmd = Some(Command { kind, fid: Some(fid), editing: true, before, prev_marker, stage: 0, gdrag: None, ghover: None, auto_op: None, expanding: false, measure: vec![], plane_kind, joint_a: None, measure_res: None });
 }
 
 pub fn ok(app: &mut App) {
@@ -452,7 +730,8 @@ impl Command {
     }
 
     pub fn wants_planes(&self) -> bool {
-        matches!(self.kind, CmdKind::NewSketch | CmdKind::Plane) || (self.kind == CmdKind::Mirror && self.stage == 1)
+        matches!(self.kind, CmdKind::NewSketch | CmdKind::Plane)
+            || (matches!(self.kind, CmdKind::Mirror | CmdKind::Split) && self.stage == 1)
     }
 
     pub fn filter(&self) -> Filter {
@@ -486,7 +765,61 @@ impl Command {
             CmdKind::Shell => {
                 f.faces = true;
             }
-            CmdKind::Plane => {
+            CmdKind::Plane => match self.plane_kind {
+                PlaneKind::NormalToEdge => f.edges = true,
+                PlaneKind::Angle => {
+                    f.faces = true;
+                    f.planar_only = true;
+                    f.planes = true;
+                    f.edges = true;
+                    f.sketch_lines = true;
+                    f.axes = true;
+                }
+                _ => {
+                    f.faces = true;
+                    f.planar_only = true;
+                    f.planes = true;
+                }
+            },
+            CmdKind::Split => {
+                if self.stage == 0 {
+                    f.bodies = true;
+                } else {
+                    f.faces = true;
+                    f.planar_only = true;
+                    f.planes = true;
+                }
+            }
+            CmdKind::Hole => {
+                f.faces = true;
+                f.planar_only = true;
+            }
+            CmdKind::Thread => f.faces = true,
+            CmdKind::Sweep => {
+                if self.stage == 0 {
+                    f.profiles = true;
+                    f.faces = true;
+                    f.planar_only = true;
+                } else {
+                    f.edges = true;
+                    f.sketch_curves = true;
+                }
+            }
+            CmdKind::Loft => {
+                f.profiles = true;
+                f.faces = true;
+                f.planar_only = true;
+            }
+            CmdKind::Joint => {
+                f.faces = true;
+                f.edges = true;
+            }
+            CmdKind::Measure => {
+                f.faces = true;
+                f.edges = true;
+                f.bodies = true;
+            }
+            CmdKind::Section => {
                 f.faces = true;
                 f.planar_only = true;
                 f.planes = true;
@@ -549,9 +882,62 @@ impl Command {
     /// Picks that show as selected while the command runs.
     pub fn selected_picks(&self, app: &App) -> Vec<Pick> {
         let st = self.pre_state(app);
-        let Some(k) = self.feature(app) else { return vec![] };
+        if self.kind == CmdKind::Measure {
+            return self.measure.iter().map(|h| h.pick).collect();
+        }
+        let joint_pick = |r: &JointRef| match r {
+            JointRef::Face(f) => face_pick(st, f),
+            JointRef::Edge(e) => edge_pick(st, e),
+        };
+        let Some(k) = self.feature(app) else {
+            return self.joint_a.as_ref().and_then(joint_pick).into_iter().collect();
+        };
         let mut v = Vec::new();
+        let plane_pick = |p: &PlaneRef| match p {
+            PlaneRef::Origin(o) => Some(Pick::Origin(*o)),
+            PlaneRef::Plane(f) => Some(Pick::Plane(*f)),
+            PlaneRef::Face(f) => face_pick(st, f),
+        };
+        let axis_pick = |a: &AxisRef| match a {
+            AxisRef::X => Some(Pick::Axis(0)),
+            AxisRef::Y => Some(Pick::Axis(1)),
+            AxisRef::Z => Some(Pick::Axis(2)),
+            AxisRef::SketchLine { sketch, curve } => Some(Pick::SketchLine { sketch: *sketch, curve: *curve }),
+            AxisRef::Edge(e) => edge_pick(st, e),
+        };
         match k {
+            FeatureKind::Plane(p) if p.mode != PlaneMode::Offset => match &p.mode {
+                PlaneMode::Angle { axis, .. } => {
+                    v.extend(plane_pick(&p.base));
+                    v.extend(axis_pick(axis));
+                }
+                PlaneMode::Midplane { other } => {
+                    v.extend(plane_pick(&p.base));
+                    v.extend(plane_pick(other));
+                }
+                PlaneMode::NormalToEdge { edge, .. } => v.extend(edge_pick(st, edge)),
+                PlaneMode::Offset => {}
+            },
+            FeatureKind::Split(sp) => {
+                v.extend(sp.bodies.iter().map(|b| Pick::Body(*b)));
+                v.extend(plane_pick(&sp.tool));
+            }
+            FeatureKind::Hole(h) => v.extend(face_pick(st, &h.face)),
+            FeatureKind::Thread(t) => v.extend(face_pick(st, &t.face)),
+            FeatureKind::Sweep(sw) => {
+                v.extend(sw.profiles.iter().filter_map(|p| profile_pick(st, p)));
+                for p in &sw.path {
+                    match p {
+                        PathRef::SketchCurve { sketch, curve } => v.push(Pick::SketchLine { sketch: *sketch, curve: *curve }),
+                        PathRef::Edge(e) => v.extend(edge_pick(st, e)),
+                    }
+                }
+            }
+            FeatureKind::Loft(l) => v.extend(l.profiles.iter().filter_map(|p| profile_pick(st, p))),
+            FeatureKind::Joint(j) => {
+                v.extend(joint_pick(&j.a));
+                v.extend(joint_pick(&j.b));
+            }
             FeatureKind::Extrude(e) => v.extend(e.profiles.iter().filter_map(|p| profile_pick(st, p))),
             FeatureKind::Revolve(r) => {
                 v.extend(r.profiles.iter().filter_map(|p| profile_pick(st, p)));
@@ -789,7 +1175,7 @@ impl Command {
                     }
                 }
             }
-            CmdKind::Plane => {
+            CmdKind::Plane if self.plane_kind == PlaneKind::Offset => {
                 let base = match hit.pick {
                     Pick::Origin(o) => PlaneRef::Origin(o),
                     Pick::Plane(f) => PlaneRef::Plane(f),
@@ -890,6 +1276,253 @@ impl Command {
                     list.push(b);
                 }
             }
+            CmdKind::Plane if self.plane_kind != PlaneKind::Offset => {
+                let fresh = |mode: PlaneMode| FeatureKind::Plane(OffsetPlane { base: PlaneRef::Origin(OriginPlane::XY), offset: "0".into(), mode });
+                match self.plane_kind {
+                    PlaneKind::Angle => {
+                        if let Some(a) = axis_ref_of(&st, hit.pick) {
+                            if self.fid.is_none() {
+                                self.insert(app, fresh(PlaneMode::Angle { axis: a, angle: "45".into() }));
+                            } else if let Some(FeatureKind::Plane(OffsetPlane { mode: PlaneMode::Angle { axis, .. }, .. })) = self.feature_mut(app) {
+                                *axis = a;
+                            }
+                        } else if let (Some(base), Some(FeatureKind::Plane(p))) = (plane_ref_of(&st, hit.pick), self.feature_mut(app)) {
+                            p.base = base;
+                        }
+                    }
+                    PlaneKind::Midplane => {
+                        let Some(pr) = plane_ref_of(&st, hit.pick) else { return };
+                        if self.fid.is_none() {
+                            // first pick: base; the feature appears with the second
+                            self.insert(app, FeatureKind::Plane(OffsetPlane { base: pr.clone(), offset: "0".into(), mode: PlaneMode::Midplane { other: pr } }));
+                            self.stage = 1;
+                        } else if let Some(FeatureKind::Plane(p)) = self.feature_mut(app) {
+                            if self.stage == 0 {
+                                p.base = pr;
+                                self.stage = 1;
+                            } else if let PlaneMode::Midplane { other } = &mut p.mode {
+                                *other = pr;
+                                self.stage = 0;
+                            }
+                        }
+                    }
+                    PlaneKind::NormalToEdge => {
+                        let Pick::Edge { body, edge } = hit.pick else { return };
+                        let Some(er) = edge_ref(&st, body, edge) else { return };
+                        if self.fid.is_none() {
+                            self.insert(app, fresh(PlaneMode::NormalToEdge { edge: er, at: "50".into() }));
+                        } else if let Some(FeatureKind::Plane(OffsetPlane { mode: PlaneMode::NormalToEdge { edge: e, .. }, .. })) = self.feature_mut(app) {
+                            *e = er;
+                        }
+                    }
+                    PlaneKind::Offset => {}
+                }
+            }
+            CmdKind::Plane => {}
+            CmdKind::Split => {
+                if self.stage == 1 {
+                    if let (Some(pl), Some(FeatureKind::Split(sp))) = (plane_ref_of(&st, hit.pick), self.feature_mut(app)) {
+                        sp.tool = pl;
+                    }
+                    return;
+                }
+                let b = match hit.pick {
+                    Pick::Body(b) | Pick::Face { body: b, .. } => b,
+                    _ => return,
+                };
+                if self.fid.is_none() {
+                    // default tool: an origin plane that passes through the body (prefer the one facing the camera)
+                    let bb = st.bodies.get(&b).and_then(|x| x.shape.bbox());
+                    let fwd = app.cam.cam.forward().abs();
+                    let mut cands = [(OriginPlane::XY, 2usize, fwd.z), (OriginPlane::XZ, 1, fwd.y), (OriginPlane::YZ, 0, fwd.x)];
+                    cands.sort_by(|a, b| b.2.total_cmp(&a.2));
+                    let crosses = |axis: usize| bb.map(|(lo, hi)| lo[axis] < -1e-6 && hi[axis] > 1e-6).unwrap_or(false);
+                    let tool = cands.iter().find(|c| crosses(c.1)).map(|c| c.0).unwrap_or(cands[0].0);
+                    self.insert(app, FeatureKind::Split(Split { bodies: vec![b], tool: PlaneRef::Origin(tool), keep: SplitKeep::Both }));
+                    self.stage = 1;
+                    return;
+                }
+                if let Some(FeatureKind::Split(sp)) = self.feature_mut(app) {
+                    if let Some(i) = sp.bodies.iter().position(|x| *x == b) {
+                        sp.bodies.remove(i);
+                    } else {
+                        sp.bodies.push(b);
+                    }
+                }
+            }
+            CmdKind::Hole => {
+                let Pick::Face { body, face } = hit.pick else { return };
+                let Some(fr) = face_ref(&st, body, face) else { return };
+                let Some(info) = st.bodies.get(&body).and_then(|b| b.shape.faces().get(face as usize).and_then(|f| f.face_info().ok())) else { return };
+                if info.kind != lusion_kernel::SurfaceKind::Plane {
+                    return;
+                }
+                let frame = lusion_core::model::face_frame(info.origin, info.normal);
+                let p = snap_on_face(app, &st, body, face, hit.point);
+                let p2 = frame.to2(p.as_dvec3()).to_array();
+                if self.fid.is_none() {
+                    self.insert(
+                        app,
+                        FeatureKind::Hole(Hole {
+                            face: fr,
+                            points: vec![p2],
+                            sketch: None,
+                            kind: HoleKind::Simple,
+                            diameter: "3.4".into(),
+                            depth: "10".into(),
+                            through: true,
+                            cb_diameter: "6.5".into(),
+                            cb_depth: "3.5".into(),
+                            cs_diameter: "6.5".into(),
+                            cs_angle: "90".into(),
+                            drill_point: false,
+                        }),
+                    );
+                    return;
+                }
+                if let Some(FeatureKind::Hole(h)) = self.feature_mut(app) {
+                    if h.face.body != fr.body || h.face.name != fr.name {
+                        h.face = fr;
+                        h.points.clear();
+                    }
+                    // clicking an existing hole again removes it
+                    if let Some(i) = h.points.iter().position(|q| (glam::DVec2::from_array(*q) - glam::DVec2::from_array(p2)).length() < 0.5) {
+                        h.points.remove(i);
+                    } else {
+                        h.points.push(p2);
+                    }
+                }
+            }
+            CmdKind::Thread => {
+                let Pick::Face { body, face } = hit.pick else { return };
+                let Some(b) = st.bodies.get(&body) else { return };
+                let Some(f) = b.shape.faces().get(face as usize).cloned() else { return };
+                let Ok(info) = f.face_info() else { return };
+                if info.kind != lusion_kernel::SurfaceKind::Cylinder {
+                    app.info("Threads go on cylindrical faces (a rod or a hole)");
+                    return;
+                }
+                let Some(fr) = face_ref(&st, body, face) else { return };
+                let external = f.point_normal().map(|(p, n)| {
+                    let a = info.normal.normalize();
+                    let r = (p - info.origin) - a * a.dot(p - info.origin);
+                    r.dot(n) > 0.0
+                }).unwrap_or(true);
+                let (d, pitch) = guess_thread(info.radius, external);
+                let fmt = lusion_core::expr::fmt_num;
+                if self.fid.is_none() {
+                    self.insert(app, FeatureKind::Thread(Thread { face: fr, size: fmt(d), pitch: fmt(pitch), length: String::new(), clearance: "0.1".into(), left: false, flip: false }));
+                } else if let Some(FeatureKind::Thread(t)) = self.feature_mut(app) {
+                    t.face = fr;
+                    t.size = fmt(d);
+                    t.pitch = fmt(pitch);
+                }
+            }
+            CmdKind::Sweep | CmdKind::Loft => {
+                if self.kind == CmdKind::Sweep && self.stage == 1 {
+                    let pr = match hit.pick {
+                        Pick::SketchLine { sketch, curve } => PathRef::SketchCurve { sketch, curve },
+                        Pick::Edge { body, edge } => match edge_ref(&st, body, edge) {
+                            Some(e) => PathRef::Edge(e),
+                            None => return,
+                        },
+                        _ => return,
+                    };
+                    if let Some(FeatureKind::Sweep(sw)) = self.feature_mut(app) {
+                        if let Some(i) = sw.path.iter().position(|p| *p == pr) {
+                            sw.path.remove(i);
+                        } else {
+                            sw.path.push(pr);
+                        }
+                    }
+                    return;
+                }
+                let pr = match hit.pick {
+                    Pick::Profile { sketch, index } => profile_ref(&st, sketch, index),
+                    Pick::Face { body, face } => face_ref(&st, body, face).map(ProfileRef::Face),
+                    _ => None,
+                };
+                let Some(pr) = pr else { return };
+                if self.fid.is_none() {
+                    let kind = if self.kind == CmdKind::Sweep {
+                        FeatureKind::Sweep(Sweep { profiles: vec![pr], path: vec![], op: Operation::NewBody, targets: vec![], frenet: false })
+                    } else {
+                        FeatureKind::Loft(Loft { profiles: vec![pr], ruled: false, op: Operation::NewBody, targets: vec![] })
+                    };
+                    self.insert(app, kind);
+                    if self.kind == CmdKind::Sweep {
+                        self.stage = 1;
+                    }
+                    return;
+                }
+                let list = match self.feature_mut(app) {
+                    Some(FeatureKind::Sweep(x)) => &mut x.profiles,
+                    Some(FeatureKind::Loft(x)) => &mut x.profiles,
+                    _ => return,
+                };
+                if let Some(i) = list.iter().position(|p| same_profile(p, &pr)) {
+                    list.remove(i);
+                } else {
+                    list.push(pr);
+                }
+            }
+            CmdKind::Joint => {
+                let jr = match hit.pick {
+                    Pick::Face { body, face } => face_ref(&st, body, face).map(JointRef::Face),
+                    Pick::Edge { body, edge } => edge_ref(&st, body, edge).map(JointRef::Edge),
+                    _ => None,
+                };
+                let Some(jr) = jr else { return };
+                let body_of = |r: &JointRef| match r {
+                    JointRef::Face(f) => f.body,
+                    JointRef::Edge(e) => e.body,
+                };
+                if self.fid.is_some() {
+                    // re-pick: stage 0 = moving attachment, 1 = target
+                    if let Some(FeatureKind::Joint(j)) = self.feature_mut(app) {
+                        if self.stage == 0 {
+                            j.a = jr;
+                        } else {
+                            j.b = jr;
+                        }
+                    }
+                    return;
+                }
+                let Some(a) = self.joint_a.take() else {
+                    self.joint_a = Some(jr);
+                    self.stage = 1;
+                    return;
+                };
+                let (ba, bb) = (body_of(&a), body_of(&jr));
+                if ba == bb {
+                    self.joint_a = Some(a);
+                    app.info("Pick the second attachment on another part");
+                    return;
+                }
+                // the moving part needs its own component (not one containing the target)
+                let mut comp = app.body_component(&st, ba);
+                let target_comp = app.body_component(&st, bb);
+                if comp == ROOT || app.doc.is_ancestor(comp, target_comp) {
+                    let name = format!("Part{}", app.doc.components.len());
+                    comp = app.doc.add_component(&name, ROOT);
+                    app.doc.bodies.entry(ba).or_default().component = Some(comp);
+                }
+                self.insert(app, FeatureKind::Joint(Joint { moving: comp, a, b: jr, kind: JointKind::Rigid, angle: "0".into(), offset: "0".into(), flip: false }));
+                self.stage = 0;
+            }
+            CmdKind::Measure => {
+                if self.measure.len() >= 2 {
+                    self.measure.clear();
+                }
+                self.measure.push(hit);
+                self.measure_res = Some(compute_measure(app, &st, &self.measure));
+            }
+            CmdKind::Section => {
+                if let Some((p, n)) = plane_of_pick(app, &st, hit.pick) {
+                    // keep the half that faces away from the picked plane's normal
+                    app.section = Some(crate::app::SectionView { normal: n, origin: p, offset: 0.0 });
+                }
+            }
             CmdKind::Move if self.stage == 1 && self.fid.is_some() => {
                 // rotation axis
                 let axis = match hit.pick {
@@ -976,6 +1609,55 @@ impl Command {
     fn handles(&self, app: &mut App, view: &View) -> Vec<Handle> {
         let mut out = Vec::new();
         match self.kind {
+            CmdKind::Section => {
+                if let Some(sv) = app.section {
+                    let n = sv.normal.normalize_or_zero();
+                    let o = sv.origin;
+                    let tip = o + n * sv.offset;
+                    let px = px_at(app, view, tip);
+                    out.push(Handle {
+                        id: 0,
+                        kind: GKind::Linear { origin: o, dir: n, base: tip, tip: tip + n * px * 60.0 },
+                        value: sv.offset as f64,
+                        color: HANDLE_BLUE,
+                        label: None,
+                    });
+                }
+            }
+            CmdKind::Plane => {
+                let Some(fid) = self.fid else { return out };
+                let Some(FeatureKind::Plane(p)) = self.feature(app).cloned() else { return out };
+                let st = app.model.current(&app.doc);
+                let Some(fr) = st.planes.get(&fid).copied() else { return out };
+                let d = app.model.params.eval(if p.offset.trim().is_empty() { "0" } else { &p.offset }).unwrap_or(0.0);
+                let (o, n) = ((fr.origin - fr.n * d).as_vec3(), fr.n.as_vec3());
+                let tip = fr.origin.as_vec3();
+                let shown = (d as f32).abs().max(px_at(app, view, tip) * 30.0) * if d < 0.0 { -1.0 } else { 1.0 };
+                out.push(Handle {
+                    id: 0,
+                    kind: GKind::Linear { origin: o, dir: n, base: o, tip: o + n * shown },
+                    value: d,
+                    color: HANDLE_BLUE,
+                    label: Some(format!("{} mm", lusion_core::expr::fmt_num(d))),
+                });
+            }
+            CmdKind::Joint => {
+                let Some(FeatureKind::Joint(j)) = self.feature(app).cloned() else { return out };
+                let st = self.pre_state(app);
+                let Some(fb) = lusion_core::model::joint_frame(st, &j.b) else { return out };
+                let ev = |e: &str| app.model.params.eval(if e.trim().is_empty() { "0" } else { e }).unwrap_or(0.0);
+                let (ang, off) = (ev(&j.angle), ev(&j.offset));
+                let n = fb.n.as_vec3();
+                let c = (fb.origin + fb.n * off).as_vec3();
+                let px = px_at(app, view, c);
+                if j.kind != JointKind::Slider {
+                    out.push(Handle { id: 1, kind: GKind::Ring { center: c, normal: n, radius: px * 70.0 }, value: ang, color: [1.0, 0.62, 0.25, 1.0], label: None });
+                }
+                if j.kind != JointKind::Revolute {
+                    let o = fb.origin.as_vec3();
+                    out.push(Handle { id: 2, kind: GKind::Linear { origin: o, dir: n, base: c, tip: c + n * px * 60.0 }, value: off, color: HANDLE_BLUE, label: None });
+                }
+            }
             CmdKind::Extrude => {
                 if let Some((anchor, n, d)) = self.extrude_axis(app) {
                     let (o, dir) = (anchor.as_vec3(), n.as_vec3());
@@ -1054,7 +1736,21 @@ impl Command {
 
     fn set_handle(&mut self, app: &mut App, id: u8, v: f64) {
         let txt = lusion_core::expr::fmt_num(v);
+        if self.kind == CmdKind::Section {
+            if let Some(sv) = app.section.as_mut() {
+                sv.offset = v as f32;
+            }
+            return;
+        }
         match self.feature_mut(app) {
+            Some(FeatureKind::Plane(p)) => p.offset = txt,
+            Some(FeatureKind::Joint(j)) => {
+                if id == 1 {
+                    j.angle = txt;
+                } else {
+                    j.offset = txt;
+                }
+            }
             Some(FeatureKind::Extrude(ex)) => {
                 if ex.distance != txt {
                     ex.distance = txt;
@@ -1220,6 +1916,7 @@ impl Command {
                 }
             }
         }
+        self.draw_extras(app, scene, view);
         if self.kind == CmdKind::Move && !handles.is_empty() {
             if let GKind::Ring { center, .. } = handles[3].kind {
                 scene.points.push(crate::render::PointInst { p: center.to_array(), color: [1.0, 1.0, 1.0, 1.0], size: 9.0 });
@@ -1227,12 +1924,76 @@ impl Command {
         }
     }
 
+    /// Command-specific scene decorations (hole markers, measurements, section plane).
+    fn draw_extras(&self, app: &mut App, scene: &mut Scene, view: &View) {
+        match self.kind {
+            CmdKind::Hole => {
+                let Some(FeatureKind::Hole(h)) = self.feature(app).cloned() else { return };
+                let st = self.pre_state(app).clone();
+                let Some(face) = face_pick(&st, &h.face) else { return };
+                let Pick::Face { body, face } = face else { return };
+                let Some(info) = st.bodies.get(&body).and_then(|b| b.shape.faces().get(face as usize).and_then(|f| f.face_info().ok())) else { return };
+                let frame = lusion_core::model::face_frame(info.origin, info.normal);
+                for p in &h.points {
+                    let w = frame.to3(glam::DVec2::from_array(*p)).as_vec3();
+                    scene.points.push(crate::render::PointInst { p: w.to_array(), color: [1.0, 0.75, 0.25, 1.0], size: 9.0 });
+                }
+            }
+            CmdKind::Measure => {
+                for h in &self.measure {
+                    scene.points.push(crate::render::PointInst { p: h.point.to_array(), color: [1.0, 0.85, 0.3, 1.0], size: 8.0 });
+                }
+                if let Some(m) = measure_two(app, self) {
+                    if let Some((a, b)) = m.points {
+                        push_line(&mut scene.overlay_lines, a, b, [1.0, 0.85, 0.3, 1.0], 2.5);
+                        for p in [a, b] {
+                            scene.points.push(crate::render::PointInst { p: p.to_array(), color: [1.0, 1.0, 1.0, 1.0], size: 7.0 });
+                        }
+                    }
+                }
+            }
+            CmdKind::Section => {
+                let Some(sv) = app.section else { return };
+                let n = sv.normal.normalize_or_zero();
+                let c = sv.origin + n * sv.offset;
+                let size = app.scene_bounds().map(|(a, b)| (b - a).length() * 0.6).unwrap_or(50.0);
+                let u = n.any_orthonormal_vector();
+                let w = n.cross(u);
+                let corners = [c + (u + w) * size, c + (u - w) * size, c + (-u - w) * size, c + (-u + w) * size];
+                let col = [0.35, 0.65, 1.0, 0.10];
+                for t in [[0, 1, 2], [0, 2, 3]] {
+                    for k in t {
+                        scene.fills.push(crate::render::FillVert { p: corners[k].to_array(), color: col });
+                    }
+                }
+                let mut ring = corners.to_vec();
+                ring.push(corners[0]);
+                push_polyline(&mut scene.lines, &ring, [0.45, 0.72, 1.0, 0.8], 1.5);
+                let _ = view;
+            }
+            _ => {}
+        }
+    }
+
     pub fn overlay(&mut self, app: &mut App, ui: &egui::Ui, view: &View) {
+        if self.kind == CmdKind::Measure {
+            if let Some(m) = measure_two(app, self) {
+                if let Some((a, b)) = m.points {
+                    if let Some(p) = app.cam.project((a + b) * 0.5, view.size) {
+                        let pos = view.to_screen(p + Vec2::new(10.0, -10.0));
+                        let galley = ui.painter().layout_no_wrap(format!("{} mm", lusion_core::expr::fmt_num(m.distance)), egui::FontId::proportional(14.0), Color32::WHITE);
+                        let r = egui::Rect::from_min_size(pos - egui::vec2(4.0, galley.size().y + 2.0), galley.size() + egui::vec2(8.0, 4.0));
+                        ui.painter().rect_filled(r, 4.0, Color32::from_rgba_unmultiplied(60, 45, 10, 230));
+                        ui.painter().galley(r.min + egui::vec2(4.0, 2.0), galley, Color32::WHITE);
+                    }
+                }
+            }
+        }
         let handles = self.handles(app, view);
         for h in &handles {
             let text = match (&h.label, self.gdrag) {
                 (Some(l), _) => Some(l.clone()),
-                (None, Some(g)) if g.id == h.id => Some(if h.id >= 3 { format!("{}°", lusion_core::expr::fmt_num(h.value)) } else { format!("{} mm", lusion_core::expr::fmt_num(h.value)) }),
+                (None, Some(g)) if g.id == h.id => Some(if matches!(h.kind, GKind::Ring { .. }) { format!("{}°", lusion_core::expr::fmt_num(h.value)) } else { format!("{} mm", lusion_core::expr::fmt_num(h.value)) }),
                 _ => None,
             };
             let Some(text) = text else { continue };
@@ -1339,6 +2100,12 @@ pub fn command_panel(app: &mut App, ui: &mut egui::Ui) {
         }
         ui.add_space(10.0);
         ui.horizontal(|ui| {
+            if c.kind.is_tool() {
+                if ui.add(egui::Button::new(format!("{} Close", ic::X)).min_size(egui::vec2(90.0, 28.0))).clicked() {
+                    finish = Some(false);
+                }
+                return;
+            }
             let can_ok = c.fid.is_some();
             if ui.add_enabled(can_ok, egui::Button::new(RichText::new(format!("{} OK", ic::CHECK)).strong()).min_size(egui::vec2(90.0, 28.0))).clicked() {
                 finish = Some(true);
@@ -1347,7 +2114,9 @@ pub fn command_panel(app: &mut App, ui: &mut egui::Ui) {
                 finish = Some(false);
             }
         });
-        ui.label(RichText::new("Enter = OK · Esc = Cancel").small().color(theme::TEXT_DIM));
+        if !c.kind.is_tool() {
+            ui.label(RichText::new("Enter = OK · Esc = Cancel").small().color(theme::TEXT_DIM));
+        }
     }));
     let wants_kb = ui.ctx().egui_wants_keyboard_input();
     ui.input(|i| {
@@ -1527,16 +2296,371 @@ fn dialog_body(c: &mut Command, app: &mut App, ui: &mut egui::Ui) -> Option<Stri
             Some("Click faces of one body to remove them.".into())
         }
         CmdKind::Plane => {
-            let Some(fid) = fid else { return Some("Select a plane or planar face to offset from.".into()) };
+            if fid.is_none() {
+                ui.horizontal(|ui| {
+                    ui.add_sized([92.0, 22.0], egui::Label::new("Type"));
+                    egui::ComboBox::from_id_salt("plane_kind")
+                        .selected_text(match c.plane_kind {
+                            PlaneKind::Offset => "Offset",
+                            PlaneKind::Angle => "At angle",
+                            PlaneKind::Midplane => "Midplane",
+                            PlaneKind::NormalToEdge => "Normal to edge",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut c.plane_kind, PlaneKind::Offset, "Offset");
+                            ui.selectable_value(&mut c.plane_kind, PlaneKind::Angle, "At angle");
+                            ui.selectable_value(&mut c.plane_kind, PlaneKind::Midplane, "Midplane");
+                            ui.selectable_value(&mut c.plane_kind, PlaneKind::NormalToEdge, "Normal to edge");
+                        });
+                });
+                return Some(
+                    match c.plane_kind {
+                        PlaneKind::Offset => "Select a plane or planar face to offset from.",
+                        PlaneKind::Angle => "Pick the hinge line: an edge, sketch line or axis (then optionally a reference plane).",
+                        PlaneKind::Midplane => "Pick two planes or planar faces.",
+                        PlaneKind::NormalToEdge => "Pick an edge; the plane is perpendicular to it.",
+                    }
+                    .into(),
+                );
+            }
+            let fid = fid.unwrap();
             let Some(FeatureKind::Plane(p)) = app.doc.feature(fid).map(|f| &f.kind) else { return None };
             let mut p = p.clone();
+            let hint = match &mut p.mode {
+                PlaneMode::Offset => "Click another plane/face to change the base. Drag the arrow to offset.",
+                PlaneMode::Angle { angle, .. } => {
+                    expr_field(ui, app, "Angle", angle, "deg");
+                    "Click a line/edge/axis for the hinge, a plane/face for the reference."
+                }
+                PlaneMode::Midplane { .. } => {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([92.0, 22.0], egui::Label::new("Picking"));
+                        if ui.selectable_label(c.stage == 0, "First").clicked() {
+                            c.stage = 0;
+                        }
+                        if ui.selectable_label(c.stage == 1, "Second").clicked() {
+                            c.stage = 1;
+                        }
+                    });
+                    "Pick the two planes or faces (parallel: halfway, angled: bisector)."
+                }
+                PlaneMode::NormalToEdge { at, .. } => {
+                    expr_field(ui, app, "Position", at, "%");
+                    "Position along the edge, 0 to 100 %."
+                }
+            };
             expr_field(ui, app, "Offset", &mut p.offset, "mm");
             if let Some(FeatureKind::Plane(x)) = app.doc.feature_mut(fid).map(|f| &mut f.kind) {
                 if *x != p {
                     *x = p;
                 }
             }
-            None
+            Some(hint.into())
+        }
+        CmdKind::Split => {
+            let Some(fid) = fid else { return Some("Select the bodies to split.".into()) };
+            let Some(FeatureKind::Split(sp)) = app.doc.feature(fid).map(|f| &f.kind) else { return None };
+            let mut sp = sp.clone();
+            ui.horizontal(|ui| {
+                ui.add_sized([92.0, 22.0], egui::Label::new("Bodies"));
+                if ui.selectable_label(c.stage == 0, format!("{} selected", sp.bodies.len())).clicked() {
+                    c.stage = 0;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add_sized([92.0, 22.0], egui::Label::new("Cut with"));
+                let label = match &sp.tool {
+                    PlaneRef::Origin(OriginPlane::XY) => "XY plane",
+                    PlaneRef::Origin(OriginPlane::XZ) => "XZ plane",
+                    PlaneRef::Origin(OriginPlane::YZ) => "YZ plane",
+                    PlaneRef::Plane(_) => "Plane",
+                    PlaneRef::Face(_) => "Face",
+                };
+                if ui.selectable_label(c.stage == 1, label).on_hover_text("Click, then pick a plane or planar face").clicked() {
+                    c.stage = 1;
+                }
+                for (l, o) in [("XY", OriginPlane::XY), ("XZ", OriginPlane::XZ), ("YZ", OriginPlane::YZ)] {
+                    if ui.small_button(l).clicked() {
+                        sp.tool = PlaneRef::Origin(o);
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add_sized([92.0, 22.0], egui::Label::new("Keep"));
+                ui.selectable_value(&mut sp.keep, SplitKeep::Both, "Both");
+                ui.selectable_value(&mut sp.keep, SplitKeep::Front, "Front side");
+                ui.selectable_value(&mut sp.keep, SplitKeep::Back, "Back side");
+            });
+            if let Some(FeatureKind::Split(x)) = app.doc.feature_mut(fid).map(|f| &mut f.kind) {
+                if *x != sp {
+                    *x = sp;
+                }
+            }
+            Some(if c.stage == 0 { "Click bodies to add/remove." } else { "Pick the cutting plane (a construction plane or planar face). Tip: make a Plane (Offset) for any height." }.into())
+        }
+        CmdKind::Hole => {
+            let Some(fid) = fid else { return Some("Click on a planar face where the hole goes (snaps to circle centres).".into()) };
+            let Some(FeatureKind::Hole(h)) = app.doc.feature(fid).map(|f| &f.kind) else { return None };
+            let mut h = h.clone();
+            ui.horizontal(|ui| {
+                ui.add_sized([92.0, 22.0], egui::Label::new("Preset"));
+                egui::ComboBox::from_id_salt("hole_preset").selected_text("Choose…").height(320.0).show_ui(ui, |ui| {
+                    for (label, kind, d, cd, x) in hole_presets() {
+                        if ui.selectable_label(false, &label).clicked() {
+                            let fmt = lusion_core::expr::fmt_num;
+                            h.kind = kind;
+                            h.diameter = fmt(d);
+                            match kind {
+                                HoleKind::Counterbore => {
+                                    h.cb_diameter = fmt(cd);
+                                    h.cb_depth = fmt(x);
+                                }
+                                HoleKind::Countersink => {
+                                    h.cs_diameter = fmt(cd);
+                                    h.cs_angle = fmt(x);
+                                }
+                                HoleKind::Simple => {
+                                    if x > 0.0 {
+                                        h.through = false;
+                                        h.depth = fmt(x);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.add_sized([92.0, 22.0], egui::Label::new("Type"));
+                ui.selectable_value(&mut h.kind, HoleKind::Simple, "Simple");
+                ui.selectable_value(&mut h.kind, HoleKind::Counterbore, "Counterbore");
+                ui.selectable_value(&mut h.kind, HoleKind::Countersink, "Countersink");
+            });
+            expr_field(ui, app, "Diameter", &mut h.diameter, "mm");
+            ui.horizontal(|ui| {
+                ui.add_space(96.0);
+                ui.checkbox(&mut h.through, "Through all");
+                if !h.through {
+                    ui.checkbox(&mut h.drill_point, "Drill point");
+                }
+            });
+            if !h.through {
+                expr_field(ui, app, "Depth", &mut h.depth, "mm");
+            }
+            match h.kind {
+                HoleKind::Counterbore => {
+                    expr_field(ui, app, "Bore Ø", &mut h.cb_diameter, "mm");
+                    expr_field(ui, app, "Bore depth", &mut h.cb_depth, "mm");
+                }
+                HoleKind::Countersink => {
+                    expr_field(ui, app, "Sink Ø", &mut h.cs_diameter, "mm");
+                    expr_field(ui, app, "Sink angle", &mut h.cs_angle, "deg");
+                }
+                HoleKind::Simple => {}
+            }
+            ui.horizontal(|ui| {
+                ui.add_sized([92.0, 22.0], egui::Label::new("Positions"));
+                ui.label(RichText::new(format!("{} clicked", h.points.len())).strong());
+                if !h.points.is_empty() && ui.small_button(ic::X).on_hover_text("Clear").clicked() {
+                    h.points.clear();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add_sized([92.0, 22.0], egui::Label::new("Sketch points"));
+                let st = app.model.current(&app.doc);
+                let sketches: Vec<(FeatureId, String)> = app
+                    .doc
+                    .features
+                    .iter()
+                    .filter(|f| matches!(f.kind, FeatureKind::Sketch(_)) && st.sketches.contains_key(&f.id))
+                    .map(|f| (f.id, f.name.clone()))
+                    .collect();
+                let cur = h.sketch.and_then(|s| sketches.iter().find(|x| x.0 == s)).map(|x| x.1.clone()).unwrap_or_else(|| "None".into());
+                egui::ComboBox::from_id_salt("hole_sketch").selected_text(cur).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut h.sketch, None, "None");
+                    for (id, name) in &sketches {
+                        ui.selectable_value(&mut h.sketch, Some(*id), name);
+                    }
+                })
+                .response
+                .on_hover_text("Drill at every standalone point of a sketch (fully parametric placement)");
+            });
+            if let Some(FeatureKind::Hole(x)) = app.doc.feature_mut(fid).map(|f| &mut f.kind) {
+                if *x != h {
+                    *x = h;
+                }
+            }
+            Some("Click the face to add holes (click a hole again to remove it).".into())
+        }
+        CmdKind::Thread => {
+            let Some(fid) = fid else { return Some("Select a cylindrical face: a rod (external) or a hole (internal).".into()) };
+            let Some(FeatureKind::Thread(t)) = app.doc.feature(fid).map(|f| &f.kind) else { return None };
+            let mut t = t.clone();
+            ui.horizontal(|ui| {
+                ui.add_sized([92.0, 22.0], egui::Label::new("Size"));
+                let cur = app.model.params.eval(&t.size).ok();
+                let label = cur.map(|d| format!("M{}", lusion_core::expr::fmt_num(d))).unwrap_or_else(|| "custom".into());
+                egui::ComboBox::from_id_salt("thread_size").selected_text(label).height(300.0).show_ui(ui, |ui| {
+                    for (d, p) in ISO_COARSE {
+                        if ui.selectable_label(cur == Some(d), format!("M{} × {}", lusion_core::expr::fmt_num(d), lusion_core::expr::fmt_num(p))).clicked() {
+                            t.size = lusion_core::expr::fmt_num(d);
+                            t.pitch = lusion_core::expr::fmt_num(p);
+                        }
+                    }
+                });
+            });
+            expr_field(ui, app, "Diameter", &mut t.size, "mm");
+            expr_field(ui, app, "Pitch", &mut t.pitch, "mm");
+            expr_field(ui, app, "Length", &mut t.length, "mm");
+            expr_field(ui, app, "Clearance", &mut t.clearance, "mm");
+            ui.horizontal(|ui| {
+                ui.add_space(96.0);
+                ui.checkbox(&mut t.left, "Left-hand");
+                ui.checkbox(&mut t.flip, "Start at other end");
+            });
+            if let Some(FeatureKind::Thread(x)) = app.doc.feature_mut(fid).map(|f| &mut f.kind) {
+                if *x != t {
+                    *x = t;
+                }
+            }
+            Some("Modelled ISO thread, printable. Empty length = whole face. Clearance loosens the fit for printing (0.1–0.2 mm). For tapped holes use a Hole with the tap-drill preset.".into())
+        }
+        CmdKind::Sweep => {
+            let Some(fid) = fid else { return Some("Select the profile to sweep.".into()) };
+            let Some(FeatureKind::Sweep(sw)) = app.doc.feature(fid).map(|f| &f.kind) else { return None };
+            let mut sw = sw.clone();
+            ui.horizontal(|ui| {
+                ui.add_sized([92.0, 22.0], egui::Label::new("Profiles"));
+                if ui.selectable_label(c.stage == 0, format!("{} selected", sw.profiles.len())).clicked() {
+                    c.stage = 0;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add_sized([92.0, 22.0], egui::Label::new("Path"));
+                if ui.selectable_label(c.stage == 1, format!("{} curves", sw.path.len())).on_hover_text("Click, then pick sketch curves or edges in order").clicked() {
+                    c.stage = 1;
+                }
+                if !sw.path.is_empty() && ui.small_button(ic::X).on_hover_text("Clear path").clicked() {
+                    sw.path.clear();
+                }
+            });
+            ui.checkbox(&mut sw.frenet, "Frenet frame (for helical paths)");
+            op_selector(ui, &mut sw.op);
+            if let Some(FeatureKind::Sweep(x)) = app.doc.feature_mut(fid).map(|f| &mut f.kind) {
+                if *x != sw {
+                    *x = sw;
+                }
+            }
+            Some(if c.stage == 0 { "Click profiles to add/remove." } else { "Pick the path: connected sketch curves or edges." }.into())
+        }
+        CmdKind::Loft => {
+            let Some(fid) = fid else { return Some("Select the first profile.".into()) };
+            let Some(FeatureKind::Loft(l)) = app.doc.feature(fid).map(|f| &f.kind) else { return None };
+            let mut l = l.clone();
+            ui.horizontal(|ui| {
+                ui.add_sized([92.0, 22.0], egui::Label::new("Sections"));
+                ui.label(RichText::new(format!("{} in order", l.profiles.len())).strong());
+                if l.profiles.len() > 1 && ui.small_button(ic::ARROWS_DOWN_UP).on_hover_text("Reverse order").clicked() {
+                    l.profiles.reverse();
+                }
+            });
+            ui.checkbox(&mut l.ruled, "Straight sections (ruled)");
+            op_selector(ui, &mut l.op);
+            if let Some(FeatureKind::Loft(x)) = app.doc.feature_mut(fid).map(|f| &mut f.kind) {
+                if *x != l {
+                    *x = l;
+                }
+            }
+            Some("Click profiles in order (one per sketch or plane). Click again to remove.".into())
+        }
+        CmdKind::Joint => {
+            let Some(fid) = fid else {
+                return Some(if c.joint_a.is_none() { "1/2: pick a face or edge on the part that moves." } else { "2/2: pick where it attaches (face or edge on another part)." }.into());
+            };
+            let Some(FeatureKind::Joint(j)) = app.doc.feature(fid).map(|f| &f.kind) else { return None };
+            let mut j = j.clone();
+            ui.horizontal(|ui| {
+                ui.add_sized([92.0, 22.0], egui::Label::new("Moving part"));
+                ui.label(RichText::new(app.doc.component(j.moving).map(|c| c.name.clone()).unwrap_or_default()).strong());
+            });
+            ui.horizontal(|ui| {
+                ui.add_sized([92.0, 22.0], egui::Label::new("Re-pick"));
+                if ui.selectable_label(c.stage == 0, "Moving").clicked() {
+                    c.stage = 0;
+                }
+                if ui.selectable_label(c.stage == 1, "Target").clicked() {
+                    c.stage = 1;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add_sized([92.0, 22.0], egui::Label::new("Motion"));
+                ui.selectable_value(&mut j.kind, JointKind::Rigid, "Rigid");
+                ui.selectable_value(&mut j.kind, JointKind::Revolute, "Revolute");
+                ui.selectable_value(&mut j.kind, JointKind::Slider, "Slider");
+            });
+            expr_field(ui, app, "Angle", &mut j.angle, "deg");
+            expr_field(ui, app, "Offset", &mut j.offset, "mm");
+            ui.horizontal(|ui| {
+                ui.add_space(96.0);
+                ui.checkbox(&mut j.flip, "Flip");
+            });
+            if let Some(FeatureKind::Joint(x)) = app.doc.feature_mut(fid).map(|f| &mut f.kind) {
+                if *x != j {
+                    *x = j;
+                }
+            }
+            Some("Faces mate face to face; circular edges line up their centres. Drag the ring to rotate, the arrow to slide.".into())
+        }
+        CmdKind::Measure => {
+            match &c.measure_res {
+                Some(m) if !m.rows.is_empty() => {
+                    egui::Grid::new("measure").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                        for (k, v) in &m.rows {
+                            ui.label(RichText::new(k).color(theme::TEXT_DIM));
+                            let r = ui.label(RichText::new(v).strong().monospace());
+                            if r.on_hover_text("Click to copy").clicked() {
+                                ui.ctx().copy_text(v.clone());
+                            }
+                            ui.end_row();
+                        }
+                    });
+                }
+                _ => {
+                    ui.label(RichText::new("Nothing measured yet").color(theme::TEXT_DIM));
+                }
+            }
+            if !c.measure.is_empty() && ui.small_button(format!("{} Clear", ic::X)).clicked() {
+                c.measure.clear();
+                c.measure_res = None;
+            }
+            Some("Click a face, edge or body for its size; click a second one for distance and angle.".into())
+        }
+        CmdKind::Section => {
+            let mut off = false;
+            if let Some(sv) = app.section.as_mut() {
+                ui.horizontal(|ui| {
+                    ui.add_sized([92.0, 22.0], egui::Label::new("Cut normal"));
+                    for (l, n) in [("X", Vec3::X), ("Y", Vec3::Y), ("Z", Vec3::Z)] {
+                        if ui.selectable_label(sv.normal.abs().abs_diff_eq(n, 1e-4), l).clicked() {
+                            sv.normal = n;
+                            sv.offset = 0.0;
+                        }
+                    }
+                    if ui.small_button(format!("{} Flip", ic::ARROWS_DOWN_UP)).clicked() {
+                        sv.normal = -sv.normal;
+                        sv.offset = -sv.offset;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.add_sized([92.0, 22.0], egui::Label::new("Offset"));
+                    ui.add(egui::DragValue::new(&mut sv.offset).speed(0.25).suffix(" mm"));
+                });
+                off = ui.button(format!("{} Turn section off", ic::EYE)).clicked();
+            }
+            if off {
+                app.section = None;
+            }
+            Some("Drag the arrow to move the cut. Pick a plane or planar face to cut along it. The section stays on after closing.".into())
         }
         CmdKind::Combine => {
             let Some(fid) = fid else { return Some("Select the target body.".into()) };
