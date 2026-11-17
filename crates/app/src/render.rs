@@ -509,7 +509,8 @@ impl Renderer {
         for b in &scene.bodies {
             let key = Arc::as_ptr(&b.mesh) as usize;
             if b.color[3] < 0.999 {
-                let d = push(b.color, [1.0, 0.0, 1.0, 0.0]);
+                // slight bias: translucent overlays (previews) win over coincident opaque faces
+                let d = push(b.color, [1.0, 0.0006, 1.0, 0.0]);
                 plan.push(Cmd::Mesh { key, draw: d, range: None, overlay: true });
             }
         }

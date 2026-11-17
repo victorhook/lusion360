@@ -579,8 +579,22 @@ fn build_scene(app: &mut App, view: &View) -> Scene {
     // selection + hover highlights (model mode and commands)
     if !in_sketch {
         let mut sel = app.selection.clone();
+        // extrude/revolve preview: tint the tool volume (blue = new/join, red = cut, green = intersect)
+        let tool = app.cmd.as_ref().and_then(|c| c.fid).and_then(|fid| st.tools.get(&fid).cloned());
+        if let Some((shape, op)) = &tool {
+            if let Some(m) = app.meshes.get_shape(shape) {
+                let (fill, edge) = match op {
+                    Operation::Cut => ([0.95, 0.30, 0.28, 0.32], [1.0, 0.45, 0.40, 0.9]),
+                    Operation::Intersect => ([0.35, 0.85, 0.45, 0.30], [0.45, 0.95, 0.55, 0.9]),
+                    _ => ([0.30, 0.62, 1.0, 0.28], [0.45, 0.75, 1.0, 0.9]),
+                };
+                scene.bodies.push(BodyDraw { mesh: m, color: fill, edge_color: edge, show_edges: true, face_hl: vec![], edge_hl: vec![] });
+            }
+        }
         if let Some(c) = &app.cmd {
-            sel.extend(c.selected_picks(app));
+            // once the tool exists the profile highlight would only z-fight with it
+            let picks = c.selected_picks(app);
+            sel.extend(picks.into_iter().filter(|p| !(tool.is_some() && matches!(p, Pick::Profile { .. } | Pick::Face { .. }))));
         }
         for p in sel {
             if !matches!(p, Pick::Body(_)) {

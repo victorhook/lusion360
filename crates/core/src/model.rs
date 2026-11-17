@@ -78,6 +78,8 @@ pub struct ModelState {
     pub bodies: BTreeMap<BodyId, Body>,
     pub sketches: HashMap<FeatureId, Arc<SolvedSketch>>,
     pub planes: HashMap<FeatureId, Frame>,
+    /// tool solid of extrude/revolve features (for previews), with its operation
+    pub tools: HashMap<FeatureId, (Shape, Operation)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -641,6 +643,7 @@ impl Ctx<'_> {
         }
         let op = k::prism(&profile, n * len).map_err(|e| e.0)?;
         let tool = self.name_sweep(f.id, &op, &profile, &edge_names);
+        st.tools.insert(f.id, (tool.shape.clone(), e.op));
         self.apply_tool(f, e.op, &e.targets, prof.default_target, tool, st)
     }
 
@@ -805,6 +808,7 @@ impl Ctx<'_> {
         let profile = if prof.faces.len() == 1 { prof.faces[0].clone() } else { Shape::compound(&prof.faces) };
         let op = k::revolve(&profile, o, dir, ang.to_radians()).map_err(|e| e.0)?;
         let tool = self.name_sweep(f.id, &op, &profile, &prof.edge_names);
+        st.tools.insert(f.id, (tool.shape.clone(), r.op));
         self.apply_tool(f, r.op, &r.targets, prof.default_target, tool, st)
     }
 

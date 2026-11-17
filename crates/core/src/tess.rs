@@ -208,6 +208,22 @@ impl MeshCache {
         Some(m)
     }
 
+    /// Display mesh for an arbitrary shape (e.g. a preview tool), cached by identity.
+    pub fn get_shape(&mut self, shape: &Shape) -> Option<Arc<BodyMesh>> {
+        if shape.is_null() {
+            return None;
+        }
+        let key = shape.hash() ^ 0x5bd1_e995;
+        let g = self.generation;
+        if let Some((m, last)) = self.map.get_mut(&key) {
+            *last = g;
+            return Some(m.clone());
+        }
+        let m = Arc::new(BodyMesh::from_shape(shape).ok()?);
+        self.map.insert(key, (m.clone(), g));
+        Some(m)
+    }
+
     /// Call once per frame/update; drops meshes unused for a while.
     pub fn tick(&mut self) {
         self.generation += 1;
