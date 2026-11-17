@@ -6,6 +6,7 @@ mod commands;
 #[cfg(target_os = "linux")]
 mod dragout;
 mod dragdrop;
+mod dragicon;
 #[allow(dead_code)]
 mod icons;
 mod panels;

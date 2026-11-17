@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tiny XTest driver for GUI tests on a private Xvfb display ($DISPLAY).
 cmds: focus | focusdlg | move x y | click x y [btn] | dclick x y | down x y [btn] | up x y [btn]
-      drag x1 y1 x2 y2 btn | scroll x y n | key name (ctrl+z, shift+Delete, Escape...) | type text | sleep s"""
+      drag x1 y1 x2 y2 btn | scroll x y n | key name (ctrl+z, shift+Delete, Escape...) | keydown/keyup name (hold shift) | type text | sleep s"""
 import ctypes, ctypes.util, sys, time, subprocess, re
 X = ctypes.cdll.LoadLibrary(ctypes.util.find_library('X11'))
 T = ctypes.cdll.LoadLibrary(ctypes.util.find_library('Xtst'))
@@ -57,6 +57,8 @@ while i < len(a):
             for m in reversed(mods): key(m, False)
         else: key(k)
         time.sleep(0.05)
+    elif c in ('keydown', 'keyup'):
+        k = a[i]; i += 1; key(MODS.get(k, k), c == 'keydown')
     elif c == 'type':
         for ch in a[i]: key(NAMES.get(ch, ch))
         i += 1

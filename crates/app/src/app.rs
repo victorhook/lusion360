@@ -105,6 +105,7 @@ pub struct App {
     pub autosaved_doc: Option<Document>,
     pub recovery: Option<PathBuf>,
     pub drag_out: Option<crate::dragdrop::DragSession>,
+    pub drag_format: crate::dragdrop::DragFormat,
     #[cfg(target_os = "linux")]
     pub xdnd: Option<Option<crate::dragout::DragOut>>,
 }
@@ -184,6 +185,7 @@ impl App {
             autosaved_doc: None,
             recovery: find_orphan_autosave(),
             drag_out: None,
+            drag_format: cc.storage.and_then(|s| s.get_string("drag_format")).and_then(|s| crate::dragdrop::DragFormat::from_key(&s)).unwrap_or(crate::dragdrop::DragFormat::Stl),
             #[cfg(target_os = "linux")]
             xdnd: None,
             slicer_pref: cc.storage.and_then(|s| s.get_string("slicer")).filter(|s| !s.is_empty()),
@@ -753,6 +755,8 @@ impl eframe::App for App {
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title()));
         self.handle_close(&ctx);
         self.handle_dropped_files(&ctx);
+        // before the shortcuts: Esc cancels a drag-out instead of the current tool
+        crate::dragdrop::update(self, &ctx, frame);
         self.global_shortcuts(&ctx);
 
         crate::panels::top_bar(self, ui);
@@ -771,7 +775,6 @@ impl eframe::App for App {
         });
         crate::panels::dialogs(self, &ctx);
         crate::print::dialog(self, &ctx);
-        crate::dragdrop::update(self, &ctx, frame);
         crate::panels::toasts(self, &ctx);
     }
 
@@ -780,6 +783,7 @@ impl eframe::App for App {
         storage.set_string("recent", recent.join("\n"));
         storage.set_string("light_bg", if self.light_bg { "1" } else { "0" }.into());
         storage.set_string("slicer", self.slicer_pref.clone().unwrap_or_default());
+        storage.set_string("drag_format", self.drag_format.ext().into());
     }
 }
 

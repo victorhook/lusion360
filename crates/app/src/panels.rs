@@ -88,6 +88,15 @@ pub fn top_bar(app: &mut App, ui: &mut egui::Ui) {
                     crate::print::export_for_print(app);
                     ui.close();
                 }
+                ui.menu_button(format!("{}  Drag-out format: {}", ic::HAND_GRABBING, app.drag_format.label()), |ui| {
+                    ui.label(RichText::new("Used when dragging bodies onto other apps.\nShift / Ctrl while dragging picks another.").small().color(theme::TEXT_DIM));
+                    for f in crate::dragdrop::DragFormat::ALL {
+                        if ui.radio(app.drag_format == f, f.label()).clicked() {
+                            app.drag_format = f;
+                            ui.close();
+                        }
+                    }
+                });
                 ui.separator();
                 if ui.button(format!("{}  Quit", ic::SIGN_OUT)).clicked() {
                     app.request(PendingAction::Quit);
