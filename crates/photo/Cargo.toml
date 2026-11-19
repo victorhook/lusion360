@@ -1,0 +1,18 @@
+[package]
+name = "lusion-photo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Photogrammetry (photos/video -> mesh) via COLMAP + OpenMVS, and scan repair for 3D printing"
+
+[[bin]]
+name = "lusion-scan"
+path = "src/bin/lusion-scan.rs"
+
+[dependencies]
+lusion-meshio = { path = "../meshio" }
+anyhow.workspace = true
+glam.workspace = true
+log.workspace = true
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+rayon = "1.11"

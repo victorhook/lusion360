@@ -13,6 +13,7 @@ mod panels;
 mod pick;
 mod print;
 mod render;
+mod scan;
 mod sketch_mode;
 mod theme;
 mod viewport;
@@ -20,7 +21,14 @@ mod viewport;
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     app::install_panic_hook();
-    let initial = std::env::args().nth(1).map(std::path::PathBuf::from);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `lusion360 --scan <photos|folders|videos|mesh>…` opens the photogrammetry window
+    let initial = if args.first().map(|a| a == "--scan").unwrap_or(false) {
+        scan::set_startup(args[1..].iter().map(std::path::PathBuf::from).collect());
+        None
+    } else {
+        args.first().map(std::path::PathBuf::from)
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Lusion360")

@@ -131,10 +131,140 @@ pub struct App {
     pub last_autosave: Instant,
     pub autosaved_doc: Option<Document>,
     pub recovery: Option<PathBuf>,
+    /// Photogrammetry window (scan → printable mesh).
+    pub scan: Option<Box<crate::scan::ScanUi>>,
+    /// Which autosave file the active tab writes to.
+    pub autosave_id: u32,
+    /// Open designs. The active one lives in the fields above; its slot here is `None`.
+    pub tabs: Vec<Option<Box<DocTab>>>,
+    pub active_tab: usize,
+    next_autosave_id: u32,
+    /// last title sent to the window
+    window_title: String,
     pub drag_out: Option<crate::dragdrop::DragSession>,
     pub drag_format: crate::dragdrop::DragFormat,
     #[cfg(target_os = "linux")]
     pub xdnd: Option<Option<crate::dragout::DragOut>>,
+}
+
+/// A design open in a background tab: everything that belongs to one document.
+/// Switching tabs swaps these with the matching fields of [`App`], so the rest of the
+/// app only ever deals with "the" document.
+pub struct DocTab {
+    pub doc: Document,
+    pub xray: bool,
+    pub section: Option<SectionView>,
+    pub model: Model,
+    pub meshes: MeshCache,
+    pub picks: PickCache,
+    pub path: Option<PathBuf>,
+    pub saved_doc: Document,
+    pub undo: Vec<Document>,
+    pub redo: Vec<Document>,
+    pub cam: CameraCtl,
+    pub mode: Mode,
+    pub cmd: Option<Command>,
+    pub selection: Vec<Pick>,
+    pub hover: Option<Hit>,
+    pub active_comp: CompId,
+    pub timeline_sel: Option<FeatureId>,
+    pub rename: Option<(RenameTarget, String)>,
+    pub fit_pending: bool,
+    pub hover_anim: Option<(Pick, Instant)>,
+    pub autosaved_doc: Option<Document>,
+    pub print: Option<crate::print::PrintDialog>,
+    pub scan: Option<Box<crate::scan::ScanUi>>,
+    pub autosave_id: u32,
+}
+
+impl DocTab {
+    fn new(autosave_id: u32) -> Self {
+        DocTab {
+            doc: Document::default(),
+            xray: false,
+            section: None,
+            model: Model::new(),
+            meshes: MeshCache::default(),
+            picks: PickCache::default(),
+            path: None,
+            saved_doc: Document::default(),
+            undo: vec![],
+            redo: vec![],
+            cam: CameraCtl::new(),
+            mode: Mode::Model,
+            cmd: None,
+            selection: vec![],
+            hover: None,
+            active_comp: ROOT,
+            timeline_sel: None,
+            rename: None,
+            fit_pending: false,
+            hover_anim: None,
+            autosaved_doc: None,
+            print: None,
+            scan: None,
+            autosave_id,
+        }
+    }
+
+    pub fn dirty(&self) -> bool {
+        self.doc != self.saved_doc
+    }
+}
+
+/// Swap the active document's state with a stored tab.
+fn swap_tab(a: &mut App, t: &mut DocTab) {
+    use std::mem::swap;
+    swap(&mut a.doc, &mut t.doc);
+    swap(&mut a.xray, &mut t.xray);
+    swap(&mut a.section, &mut t.section);
+    swap(&mut a.model, &mut t.model);
+    swap(&mut a.meshes, &mut t.meshes);
+    swap(&mut a.picks, &mut t.picks);
+    swap(&mut a.path, &mut t.path);
+    swap(&mut a.saved_doc, &mut t.saved_doc);
+    swap(&mut a.undo, &mut t.undo);
+    swap(&mut a.redo, &mut t.redo);
+    swap(&mut a.cam, &mut t.cam);
+    swap(&mut a.mode, &mut t.mode);
+    swap(&mut a.cmd, &mut t.cmd);
+    swap(&mut a.selection, &mut t.selection);
+    swap(&mut a.hover, &mut t.hover);
+    swap(&mut a.active_comp, &mut t.active_comp);
+    swap(&mut a.timeline_sel, &mut t.timeline_sel);
+    swap(&mut a.rename, &mut t.rename);
+    swap(&mut a.fit_pending, &mut t.fit_pending);
+    swap(&mut a.hover_anim, &mut t.hover_anim);
+    swap(&mut a.autosaved_doc, &mut t.autosaved_doc);
+    swap(&mut a.print, &mut t.print);
+    swap(&mut a.scan, &mut t.scan);
+    swap(&mut a.autosave_id, &mut t.autosave_id);
+}
+
+/// What a tab shows in the tab strip.
+pub struct TabInfo {
+    pub name: String,
+    pub dirty: bool,
+    pub scanning: bool,
+    pub path: Option<PathBuf>,
+}
+
+fn tab_name(path: &Option<PathBuf>, doc: &Document) -> String {
+    match path {
+        Some(p) => p.file_stem().unwrap_or_default().to_string_lossy().to_string(),
+        None => {
+            // an imported mesh/STEP or a scan: name it after the source
+            let src = doc.features.iter().find_map(|f| match &f.kind {
+                FeatureKind::ImportMesh(m) => Some(m.source.clone()),
+                FeatureKind::ImportShape(m) => Some(m.source.clone()),
+                _ => None,
+            });
+            match src {
+                Some(s) if doc.features.len() == 1 => std::path::Path::new(&s).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or(s),
+                _ => "Untitled".into(),
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -154,6 +284,8 @@ pub enum RenameTarget {
 pub enum PendingAction {
     New,
     Open(Option<PathBuf>),
+    /// close the active tab
+    CloseTab,
     Quit,
 }
 
@@ -213,6 +345,12 @@ impl App {
             last_autosave: Instant::now(),
             autosaved_doc: None,
             recovery: find_orphan_autosave(),
+            scan: None,
+            autosave_id: 0,
+            tabs: vec![None],
+            active_tab: 0,
+            next_autosave_id: 1,
+            window_title: String::new(),
             drag_out: None,
             drag_format: cc.storage.and_then(|s| s.get_string("drag_format")).and_then(|s| crate::dragdrop::DragFormat::from_key(&s)).unwrap_or(crate::dragdrop::DragFormat::Stl),
             #[cfg(target_os = "linux")]
@@ -415,26 +553,125 @@ impl App {
         format!("{}{} — Lusion360", name, if self.dirty() { " •" } else { "" })
     }
 
-    pub fn request(&mut self, action: PendingAction) {
+    // ------------------------------------------------------------------ tabs
+
+    pub fn tab_info(&self) -> Vec<TabInfo> {
+        self.tabs
+            .iter()
+            .map(|t| match t {
+                Some(t) => TabInfo { name: tab_name(&t.path, &t.doc), dirty: t.dirty(), scanning: t.scan.as_ref().is_some_and(|s| s.running()), path: t.path.clone() },
+                None => TabInfo { name: tab_name(&self.path, &self.doc), dirty: self.dirty(), scanning: self.scan.as_ref().is_some_and(|s| s.running()), path: self.path.clone() },
+            })
+            .collect()
+    }
+
+    /// Any open design with unsaved changes?
+    pub fn any_dirty(&self) -> bool {
+        self.dirty() || self.tabs.iter().flatten().any(|t| t.dirty())
+    }
+
+    pub fn switch_tab(&mut self, i: usize) {
+        if i == self.active_tab || i >= self.tabs.len() {
+            return;
+        }
+        let Some(mut t) = self.tabs[i].take() else { return };
+        swap_tab(self, &mut t);
+        self.tabs[self.active_tab] = Some(t);
+        self.active_tab = i;
+        self.hover = None;
+        self.timeline_hover = None;
+        self.confirm_discard = None;
+        ACTIVE_AUTOSAVE.store(self.autosave_id, std::sync::atomic::Ordering::Relaxed);
+        crash_snapshot(&self.doc, self.dirty());
+    }
+
+    /// Open an empty design in a new tab and switch to it.
+    pub fn new_tab(&mut self) {
+        let id = self.next_autosave_id;
+        self.next_autosave_id += 1;
+        self.tabs.push(Some(Box::new(DocTab::new(id))));
+        self.switch_tab(self.tabs.len() - 1);
+    }
+
+    /// Untouched empty design (a file opened now can replace it).
+    fn pristine(&self) -> bool {
+        self.path.is_none() && self.doc.features.is_empty() && !self.dirty() && self.undo.is_empty() && self.scan.is_none() && self.cmd.is_none()
+    }
+
+    /// Close tab `i`, asking first if it has unsaved changes.
+    pub fn close_tab(&mut self, i: usize) {
+        self.switch_tab(i);
+        self.request(PendingAction::CloseTab);
+    }
+
+    /// Close the active tab without asking.
+    fn drop_active_tab(&mut self) {
+        self.end_interaction();
+        crate::scan::discard(self);
+        self.clear_autosave();
+        if self.tabs.len() == 1 {
+            self.new_doc();
+            self.section = None;
+            self.xray = false;
+            self.print = None;
+            self.fit_pending = false;
+            return;
+        }
+        let old = self.active_tab;
+        self.switch_tab(if old + 1 < self.tabs.len() { old + 1 } else { old - 1 });
+        self.tabs.remove(old);
+        if self.active_tab > old {
+            self.active_tab -= 1;
+        }
+    }
+
+    /// Quitting: resolve unsaved tabs one by one, then close the window.
+    fn quit_next(&mut self) {
+        if !self.dirty() {
+            if let Some(i) = self.tabs.iter().position(|t| t.as_ref().is_some_and(|t| t.dirty())) {
+                self.switch_tab(i);
+            }
+        }
         if self.dirty() {
-            self.confirm_discard = Some(action);
-        } else {
-            self.perform(action);
+            self.confirm_discard = Some(PendingAction::Quit);
+            return;
+        }
+        // nothing unsaved left
+        for i in 0..self.tabs.len() {
+            let id = match &self.tabs[i] {
+                Some(t) => t.autosave_id,
+                None => self.autosave_id,
+            };
+            if let Some(p) = autosave_path_for(id) {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+        self.allow_close = true;
+    }
+
+    pub fn request(&mut self, action: PendingAction) {
+        match action {
+            PendingAction::Quit => self.quit_next(),
+            PendingAction::CloseTab if self.dirty() => self.confirm_discard = Some(action),
+            // new and opened designs get their own tab: nothing is lost
+            _ => self.perform(action),
         }
     }
 
     pub fn perform(&mut self, action: PendingAction) {
         match action {
-            PendingAction::New => self.new_doc(),
+            PendingAction::New => self.new_tab(),
             PendingAction::Open(Some(p)) => self.open_path(p),
             PendingAction::Open(None) => {
                 if let Some(p) = open_dialog() {
                     self.open_path(p);
                 }
             }
+            PendingAction::CloseTab => self.drop_active_tab(),
             PendingAction::Quit => {
-                self.clear_autosave();
-                self.allow_close = true;
+                // this tab was saved or discarded: on to the next one
+                self.drop_active_tab();
+                self.quit_next();
             }
         }
     }
@@ -456,11 +693,23 @@ impl App {
 
     pub fn open_path(&mut self, p: PathBuf) {
         let t0 = Instant::now();
+        let native = io::ext_of(&p) == io::NATIVE_EXT;
+        if native {
+            // already open? just show it
+            let canon = |q: &std::path::Path| q.canonicalize().unwrap_or_else(|_| q.to_path_buf());
+            let want = canon(&p);
+            if let Some(i) = self.tab_info().iter().position(|t| t.path.as_deref().map(canon).as_ref() == Some(&want)) {
+                self.switch_tab(i);
+                return;
+            }
+        }
         match io::open_any(&p) {
             Ok(doc) => {
+                if !self.pristine() {
+                    self.new_tab();
+                }
                 self.cancel_command();
                 self.mode = Mode::Model;
-                let native = io::ext_of(&p) == io::NATIVE_EXT;
                 self.doc = doc;
                 self.model = Model::new();
                 self.undo.clear();
@@ -643,6 +892,8 @@ impl App {
 }
 
 static CRASH_DOC: std::sync::Mutex<Option<Document>> = std::sync::Mutex::new(None);
+/// Autosave slot of the active tab (the panic hook writes there).
+static ACTIVE_AUTOSAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Remember the latest document for the panic hook.
 pub fn crash_snapshot(doc: &Document, dirty: bool) {
@@ -668,14 +919,20 @@ pub fn install_panic_hook() {
     }));
 }
 
-/// Where crash-recovery snapshots go.
+/// Where crash-recovery snapshots of the active tab go.
 pub fn autosave_path() -> Option<PathBuf> {
+    autosave_path_for(ACTIVE_AUTOSAVE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Autosave file of one tab: `autosave-<pid>.l360` for the first, `autosave-<pid>-<n>.l360` after.
+pub fn autosave_path_for(id: u32) -> Option<PathBuf> {
     let base = if cfg!(windows) {
         std::env::var_os("APPDATA").map(PathBuf::from)
     } else {
         std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
     }?;
-    Some(base.join("lusion360").join(format!("autosave-{}.l360", std::process::id())))
+    let name = if id == 0 { format!("autosave-{}.l360", std::process::id()) } else { format!("autosave-{}-{id}.l360", std::process::id()) };
+    Some(base.join("lusion360").join(name))
 }
 
 /// An autosave left behind by an instance that is no longer running.
@@ -685,7 +942,7 @@ pub fn find_orphan_autosave() -> Option<PathBuf> {
     let mut found: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
     for e in std::fs::read_dir(&dir).ok()?.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
-        let Some(pid) = name.strip_prefix("autosave-").and_then(|r| r.strip_suffix(".l360")).and_then(|p| p.parse::<u32>().ok()) else {
+        let Some(pid) = name.strip_prefix("autosave-").and_then(|r| r.strip_suffix(".l360")).and_then(|r| r.split('-').next()).and_then(|p| p.parse::<u32>().ok()) else {
             continue;
         };
         if pid == me {
@@ -704,41 +961,48 @@ pub fn find_orphan_autosave() -> Option<PathBuf> {
 }
 
 impl App {
-    /// Snapshot unsaved work every 20 s (in a background thread).
+    /// Snapshot unsaved work of every tab every 20 s (in a background thread).
     fn autosave(&mut self) {
         if self.last_autosave.elapsed().as_secs() < 20 || self.recovery.is_some() {
             return;
         }
         self.last_autosave = Instant::now();
-        let Some(path) = autosave_path() else { return };
-        if !self.dirty() {
-            if self.autosaved_doc.is_some() {
-                let _ = std::fs::remove_file(&path);
-                self.autosaved_doc = None;
-            }
-            return;
+        autosave_one(&self.doc, &self.saved_doc, &mut self.autosaved_doc, self.autosave_id);
+        for t in self.tabs.iter_mut().flatten() {
+            autosave_one(&t.doc, &t.saved_doc, &mut t.autosaved_doc, t.autosave_id);
         }
-        if self.autosaved_doc.as_ref() == Some(&self.doc) {
-            return;
-        }
-        let doc = self.doc.clone();
-        self.autosaved_doc = Some(doc.clone());
-        std::thread::spawn(move || {
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if let Err(e) = io::save_native(&doc, &path) {
-                log::warn!("autosave failed: {e:#}");
-            }
-        });
     }
 
     pub fn clear_autosave(&mut self) {
-        if let Some(p) = autosave_path() {
+        if let Some(p) = autosave_path_for(self.autosave_id) {
             let _ = std::fs::remove_file(p);
         }
         self.autosaved_doc = None;
     }
+}
+
+fn autosave_one(doc: &Document, saved: &Document, autosaved: &mut Option<Document>, id: u32) {
+    let Some(path) = autosave_path_for(id) else { return };
+    if doc == saved {
+        if autosaved.is_some() {
+            let _ = std::fs::remove_file(&path);
+            *autosaved = None;
+        }
+        return;
+    }
+    if autosaved.as_ref() == Some(doc) {
+        return;
+    }
+    let doc = doc.clone();
+    *autosaved = Some(doc.clone());
+    std::thread::spawn(move || {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(e) = io::save_native(&doc, &path) {
+            log::warn!("autosave failed: {e:#}");
+        }
+    });
 }
 
 pub fn open_dialog() -> Option<PathBuf> {
@@ -789,7 +1053,12 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(30));
         }
 
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title()));
+        // only on change: every viewport command schedules another frame (idle CPU!)
+        let title = self.title();
+        if title != self.window_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.window_title = title;
+        }
         self.handle_close(&ctx);
         self.handle_dropped_files(&ctx);
         // before the shortcuts: Esc cancels a drag-out instead of the current tool
@@ -812,6 +1081,7 @@ impl eframe::App for App {
         });
         crate::panels::dialogs(self, &ctx);
         crate::print::dialog(self, &ctx);
+        crate::scan::ui(self, &ctx);
         crate::panels::toasts(self, &ctx);
     }
 
@@ -826,9 +1096,9 @@ impl eframe::App for App {
 
 impl App {
     fn handle_close(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && self.dirty() {
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && self.any_dirty() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.confirm_discard = Some(PendingAction::Quit);
+            self.request(PendingAction::Quit);
         }
         if self.allow_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -837,6 +1107,9 @@ impl App {
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
+        if !dropped.is_empty() && crate::scan::take_drop(self, &dropped) {
+            return;
+        }
         for p in dropped {
             if io::ext_of(&p) == io::NATIVE_EXT || self.doc.features.is_empty() {
                 self.request(PendingAction::Open(Some(p)));
@@ -876,8 +1149,17 @@ impl App {
         if fire(KS::new(M::COMMAND, Key::O)) {
             self.request(PendingAction::Open(None));
         }
-        if fire(KS::new(M::COMMAND, Key::N)) {
+        if fire(KS::new(M::COMMAND, Key::N)) || fire(KS::new(M::COMMAND, Key::T)) {
             self.request(PendingAction::New);
+        }
+        if fire(KS::new(M::COMMAND, Key::W)) {
+            self.close_tab(self.active_tab);
+        }
+        let n = self.tabs.len();
+        if fire(KS::new(M::COMMAND | M::SHIFT, Key::Tab)) || fire(KS::new(M::COMMAND, Key::PageUp)) {
+            self.switch_tab((self.active_tab + n - 1) % n);
+        } else if fire(KS::new(M::COMMAND, Key::Tab)) || fire(KS::new(M::COMMAND, Key::PageDown)) {
+            self.switch_tab((self.active_tab + 1) % n);
         }
         if fire(KS::new(M::COMMAND, Key::I)) {
             self.import_file();

@@ -1111,7 +1111,7 @@ fn view_controls(app: &mut App, ui: &mut egui::Ui, view: &View) {
 }
 
 fn welcome(app: &mut App, ui: &mut egui::Ui, view: &View) {
-    if !app.doc.features.is_empty() || app.cmd.is_some() || !matches!(app.mode, Mode::Model) {
+    if !app.doc.features.is_empty() || app.cmd.is_some() || !matches!(app.mode, Mode::Model) || app.scan.is_some() {
         return;
     }
     let pos = view.rect.center() - EVec2::new(170.0, 150.0);
@@ -1137,6 +1137,9 @@ fn welcome(app: &mut App, ui: &mut egui::Ui, view: &View) {
                 }
                 if big(ui, crate::icons::DOWNLOAD_SIMPLE, "Import STEP / STL / 3MF / OBJ…") {
                     app.import_file();
+                }
+                if big(ui, crate::icons::CAMERA, "Scan a real object from photos…") {
+                    crate::scan::open(app);
                 }
                 if !app.recent.is_empty() {
                     ui.add_space(8.0);

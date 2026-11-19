@@ -80,6 +80,10 @@ pub fn top_bar(app: &mut App, ui: &mut egui::Ui) {
                     app.import_file();
                     ui.close();
                 }
+                if ui.button(format!("{}  Scan object from photos…", ic::CAMERA)).clicked() {
+                    crate::scan::open(app);
+                    ui.close();
+                }
                 if ui.button(format!("{}  Export…                   Ctrl+E", ic::EXPORT)).clicked() {
                     app.export(None);
                     ui.close();
@@ -143,6 +147,10 @@ pub fn top_bar(app: &mut App, ui: &mut egui::Ui) {
                     ui.close();
                 }
             });
+            ui.add_space(14.0);
+            // room for undo/redo/Print/fps on the right
+            let w = (ui.available_width() - 210.0).max(80.0);
+            ui.allocate_ui(egui::vec2(w, ui.available_height()), |ui| tab_strip(app, ui));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(RichText::new(format!("{:.0} fps", 1000.0 / app.frame_ms.max(0.1))).small().color(theme::TEXT_DIM));
                 let pr = ui.add(egui::Button::new(RichText::new(format!("{} Print", ic::PRINTER))).fill(theme::ACCENT_DIM).sense(egui::Sense::click_and_drag())).on_hover_text("Export visible bodies as 3MF for Bambu Studio / PrusaSlicer / Orca.\nTip: drag this button (or a body) straight onto the slicer window.");
@@ -252,6 +260,9 @@ pub fn top_bar(app: &mut App, ui: &mut egui::Ui) {
             ui.label(RichText::new("INSERT").small().strong().color(theme::TEXT_DIM));
             if tool_button(ui, ic::DOWNLOAD_SIMPLE, "Import", "Insert STEP / STL / OBJ / 3MF … (Ctrl+I)").clicked() {
                 app.import_file();
+            }
+            if tool_button_active(ui, ic::CAMERA, "Scan", "Photogrammetry: turn photos or a video of a real object into a printable mesh", app.scan.is_some()).clicked() {
+                crate::scan::open(app);
             }
             if tool_button_active(ui, ic::FUNCTION, "Params", "User parameters", app.show_params).clicked() {
                 app.show_params = true;
@@ -982,6 +993,74 @@ fn project(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
+/// One tab per open design, plus "+" for a new one.
+fn tab_strip(app: &mut App, ui: &mut egui::Ui) {
+    let tabs = app.tab_info();
+    let mut switch = None;
+    let mut close = None;
+    egui::ScrollArea::horizontal().id_salt("doc_tabs").scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for (i, t) in tabs.iter().enumerate() {
+                let active = i == app.active_tab;
+                let mut name = t.name.clone();
+                if name.chars().count() > 24 {
+                    name = name.chars().take(22).collect::<String>() + "…";
+                }
+                let fill = if active { theme::PANEL2 } else { Color32::TRANSPARENT };
+                let stroke = if active { egui::Stroke::new(1.0, theme::ACCENT_DIM) } else { egui::Stroke::NONE };
+                let tip = match &t.path {
+                    Some(p) => p.display().to_string(),
+                    None => "Not saved yet".into(),
+                };
+                let tip = if t.scanning { format!("{tip}\nScan running") } else { tip };
+                egui::Frame::new().fill(fill).stroke(stroke).corner_radius(4.0).inner_margin(egui::Margin { left: 4, right: 3, top: 0, bottom: 0 }).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let col = if active { Color32::WHITE } else { theme::TEXT_DIM };
+                        let mut job = egui::text::LayoutJob::default();
+                        let (icon, icol) = if t.scanning { (ic::CAMERA, theme::ACCENT) } else { (ic::CUBE, col) };
+                        let font = egui::TextStyle::Button.resolve(ui.style());
+                        job.append(icon, 0.0, egui::TextFormat::simple(font.clone(), icol));
+                        job.append(&name, 6.0, egui::TextFormat::simple(font, col));
+                        let b = ui.add(egui::Button::new(job).frame(false));
+                        if b.clicked() {
+                            switch = Some(i);
+                        }
+                        if b.middle_clicked() {
+                            close = Some(i);
+                        }
+                        b.on_hover_text(tip);
+                        // unsaved: a dot that turns into × on hover (like code editors)
+                        let hovered = ui.rect_contains_pointer(ui.max_rect().expand(2.0));
+                        let (rect, x) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                        if t.dirty && !hovered {
+                            ui.painter().circle_filled(rect.center(), 3.5, theme::WARN);
+                        } else if hovered || active {
+                            let c = if x.hovered() { Color32::WHITE } else { theme::TEXT_DIM };
+                            if x.hovered() {
+                                ui.painter().rect_filled(rect.shrink(1.0), 3.0, theme::PANEL);
+                            }
+                            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, ic::X, egui::FontId::proportional(11.0), c);
+                        }
+                        if x.on_hover_text("Close (Ctrl+W)").clicked() {
+                            close = Some(i);
+                        }
+                    });
+                });
+            }
+            if ui.add(egui::Button::new(RichText::new(ic::PLUS).color(theme::TEXT_DIM)).frame(false)).on_hover_text("New design (Ctrl+N)\nCtrl+Tab switches tabs").clicked() {
+                app.request(PendingAction::New);
+            }
+        });
+    });
+    if let Some(i) = close {
+        app.close_tab(i);
+    } else if let Some(i) = switch {
+        app.switch_tab(i);
+    }
+}
+
 // ------------------------------------------------------------------ dialogs
 
 pub fn dialogs(app: &mut App, ctx: &egui::Context) {
@@ -998,6 +1077,9 @@ pub fn dialogs(app: &mut App, ctx: &egui::Context) {
                 if ui.button(RichText::new(format!("{} Recover", ic::ARROW_COUNTER_CLOCKWISE)).strong()).clicked() {
                     match lusion_core::io::load_native(&p) {
                         Ok(d) => {
+                            if !app.doc.features.is_empty() || app.path.is_some() || app.dirty() {
+                                app.new_tab();
+                            }
                             app.new_doc();
                             app.doc = d;
                             let _ = std::fs::remove_file(&p);
@@ -1015,33 +1097,35 @@ pub fn dialogs(app: &mut App, ctx: &egui::Context) {
             });
         });
         if done {
-            app.recovery = None;
+            // another tab of the crashed session may have left one too
+            app.recovery = crate::app::find_orphan_autosave();
         }
     }
     // unsaved changes
     if let Some(action) = app.confirm_discard.clone() {
-        let mut close = false;
+        // the choice is made after the window closes: performing it may ask about the next tab
+        let mut choice = None;
+        let name = app.tab_info().get(app.active_tab).map(|t| t.name.clone()).unwrap_or_default();
         egui::Window::new("Unsaved changes").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-            ui.label("The design has unsaved changes.");
+            ui.label(format!("“{name}” has unsaved changes."));
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button(format!("{} Save", ic::FLOPPY_DISK)).clicked() {
-                    close = true;
-                    if app.save(false) {
-                        app.perform(action.clone());
-                    }
+                    choice = Some(1);
                 }
                 if ui.button(RichText::new("Discard").color(theme::ERR)).clicked() {
-                    close = true;
-                    app.perform(action.clone());
+                    choice = Some(2);
                 }
                 if ui.button("Cancel").clicked() {
-                    close = true;
+                    choice = Some(0);
                 }
             });
         });
-        if close {
+        if let Some(c) = choice {
             app.confirm_discard = None;
+            if c == 2 || (c == 1 && app.save(false)) {
+                app.perform(action);
+            }
         }
     }
     // rename
