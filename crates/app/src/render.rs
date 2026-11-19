@@ -68,6 +68,8 @@ pub struct BodyDraw {
     pub face_hl: Vec<(u32, [f32; 4])>,
     /// (edge index, color)
     pub edge_hl: Vec<(u32, [f32; 4])>,
+    /// translucent: show only the surface nearest to the camera (no inner walls / far faces)
+    pub front_only: bool,
 }
 
 /// Everything the viewport shows in one frame.
@@ -110,6 +112,8 @@ struct GpuMesh {
     n_edges: u32,
     edge_ranges: Vec<Range<u32>>,
     last_used: u64,
+    /// keeps the source alive: the cache is keyed by its address, which must not be reused
+    _src: Arc<BodyMesh>,
 }
 
 struct DynBuf {
@@ -156,6 +160,7 @@ pub struct Renderer {
     bg: wgpu::RenderPipeline,
     mesh: wgpu::RenderPipeline,
     mesh_overlay: wgpu::RenderPipeline,
+    mesh_depth: wgpu::RenderPipeline,
     outline: wgpu::RenderPipeline,
     fill: wgpu::RenderPipeline,
     fill_top: wgpu::RenderPipeline,
@@ -183,6 +188,8 @@ pub struct Renderer {
 enum Cmd {
     Bg,
     Mesh { key: usize, draw: u32, range: Option<Range<u32>>, overlay: bool },
+    /// depth only (for front-only translucent bodies)
+    Depth { key: usize, draw: u32 },
     Outline { key: usize, draw: u32 },
     Edges { key: usize, draw: u32, range: Range<u32> },
     Fills { draw: u32, n: u32 },
@@ -247,7 +254,8 @@ impl Renderer {
                   buffers: &[Option<wgpu::VertexBufferLayout>],
                   topology: wgpu::PrimitiveTopology,
                   depth_write: bool,
-                  compare: wgpu::CompareFunction| {
+                  compare: wgpu::CompareFunction,
+                  writes: wgpu::ColorWrites| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&layout),
@@ -270,7 +278,7 @@ impl Renderer {
                     module: &shader,
                     entry_point: Some(fs),
                     compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState { format: target, blend, write_mask: wgpu::ColorWrites::ALL })],
+                    targets: &[Some(wgpu::ColorTargetState { format: target, blend, write_mask: writes })],
                 }),
                 multiview_mask: None,
                 cache: None,
@@ -298,10 +306,11 @@ impl Renderer {
         };
         use wgpu::CompareFunction as C;
         use wgpu::PrimitiveTopology as T;
-        let bg = mk("bg", "vs_bg", "fs_bg", &[], T::TriangleList, false, C::Always);
-        let mesh = mk("mesh", "vs_mesh", "fs_mesh", &[Some(mesh_layout.clone())], T::TriangleList, true, C::Less);
+        let bg = mk("bg", "vs_bg", "fs_bg", &[], T::TriangleList, false, C::Always, wgpu::ColorWrites::ALL);
+        let mesh = mk("mesh", "vs_mesh", "fs_mesh", &[Some(mesh_layout.clone())], T::TriangleList, true, C::Less, wgpu::ColorWrites::ALL);
+        let mesh_depth = mk("mesh depth", "vs_mesh", "fs_mesh", &[Some(mesh_layout.clone())], T::TriangleList, true, C::Less, wgpu::ColorWrites::empty());
         let mesh_overlay =
-            mk("mesh overlay", "vs_mesh", "fs_mesh", &[Some(mesh_layout.clone())], T::TriangleList, false, C::LessEqual);
+            mk("mesh overlay", "vs_mesh", "fs_mesh", &[Some(mesh_layout.clone())], T::TriangleList, false, C::LessEqual, wgpu::ColorWrites::ALL);
         let outline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("outline"),
             layout: Some(&layout),
@@ -324,17 +333,18 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
-        let fill = mk("fill", "vs_fill", "fs_fill", &[Some(fill_layout.clone())], T::TriangleList, false, C::LessEqual);
-        let fill_top = mk("fill top", "vs_fill", "fs_fill", &[Some(fill_layout)], T::TriangleList, false, C::Always);
-        let line = mk("line", "vs_line", "fs_line", &[Some(line_layout.clone())], T::TriangleList, false, C::LessEqual);
-        let line_top = mk("line top", "vs_line", "fs_line", &[Some(line_layout)], T::TriangleList, false, C::Always);
-        let point = mk("point", "vs_point", "fs_point", &[Some(point_layout)], T::TriangleList, false, C::Always);
+        let fill = mk("fill", "vs_fill", "fs_fill", &[Some(fill_layout.clone())], T::TriangleList, false, C::LessEqual, wgpu::ColorWrites::ALL);
+        let fill_top = mk("fill top", "vs_fill", "fs_fill", &[Some(fill_layout)], T::TriangleList, false, C::Always, wgpu::ColorWrites::ALL);
+        let line = mk("line", "vs_line", "fs_line", &[Some(line_layout.clone())], T::TriangleList, false, C::LessEqual, wgpu::ColorWrites::ALL);
+        let line_top = mk("line top", "vs_line", "fs_line", &[Some(line_layout)], T::TriangleList, false, C::Always, wgpu::ColorWrites::ALL);
+        let point = mk("point", "vs_point", "fs_point", &[Some(point_layout)], T::TriangleList, false, C::Always, wgpu::ColorWrites::ALL);
 
         let vb = wgpu::BufferUsages::VERTEX;
         Renderer {
             bg,
             mesh,
             mesh_overlay,
+            mesh_depth,
             outline,
             fill,
             fill_top,
@@ -381,7 +391,7 @@ impl Renderer {
         (buf, bg)
     }
 
-    fn upload_mesh(device: &wgpu::Device, m: &BodyMesh, frame: u64) -> GpuMesh {
+    fn upload_mesh(device: &wgpu::Device, m: &Arc<BodyMesh>, frame: u64) -> GpuMesh {
         let mut verts: Vec<f32> = Vec::with_capacity(m.positions.len() * 6);
         for (p, n) in m.positions.iter().zip(m.normals.iter()) {
             verts.extend_from_slice(p);
@@ -438,6 +448,7 @@ impl Renderer {
             n_edges: segs.len() as u32,
             edge_ranges,
             last_used: frame,
+            _src: m.clone(),
         }
     }
 
@@ -481,6 +492,21 @@ impl Renderer {
                 plan.push(Cmd::Mesh { key, draw: d, range: None, overlay: false });
             }
         }
+        // front-only translucent bodies: their profile fills first (the body blends
+        // over them), then their depth, so only the nearest surface shows below
+        let front_only = scene.bodies.iter().any(|b| b.front_only && b.color[3] < 0.999);
+        if front_only && !scene.fills.is_empty() {
+            self.fills.write(device, queue, bytemuck::cast_slice(&scene.fills));
+            let d = push([1.0; 4], [1.0, 0.001, 0.0, 0.0]);
+            plan.push(Cmd::Fills { draw: d, n: scene.fills.len() as u32 });
+        }
+        for b in &scene.bodies {
+            if b.front_only && b.color[3] < 0.999 {
+                let key = Arc::as_ptr(&b.mesh) as usize;
+                let d = push(b.color, [1.0, 0.0, 1.0, 1.0]);
+                plan.push(Cmd::Depth { key, draw: d });
+            }
+        }
         // face highlights
         for b in &scene.bodies {
             let key = Arc::as_ptr(&b.mesh) as usize;
@@ -520,7 +546,7 @@ impl Renderer {
                 plan.push(Cmd::Mesh { key, draw: d, range: None, overlay: true });
             }
         }
-        if !scene.fills.is_empty() {
+        if !front_only && !scene.fills.is_empty() {
             self.fills.write(device, queue, bytemuck::cast_slice(&scene.fills));
             let d = push([1.0; 4], [1.0, 0.001, 0.0, 0.0]);
             plan.push(Cmd::Fills { draw: d, n: scene.fills.len() as u32 });
@@ -584,6 +610,17 @@ impl Renderer {
                     rp.set_vertex_buffer(0, m.vbuf.slice(..));
                     rp.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                     rp.draw_indexed(range.clone().unwrap_or(0..m.n_idx), 0, 0..1);
+                }
+                Cmd::Depth { key, draw } => {
+                    let Some(m) = self.meshes.get(key) else { continue };
+                    if m.n_idx == 0 {
+                        continue;
+                    }
+                    rp.set_pipeline(&self.mesh_depth);
+                    rp.set_bind_group(1, &self.draws_bg, &[(*draw as u64 * DRAW_STRIDE) as u32]);
+                    rp.set_vertex_buffer(0, m.vbuf.slice(..));
+                    rp.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    rp.draw_indexed(0..m.n_idx, 0, 0..1);
                 }
                 Cmd::Outline { key, draw } => {
                     let Some(m) = self.meshes.get(key) else { continue };

@@ -123,6 +123,10 @@ struct JobOut {
     fingerprints: Vec<u64>,
     ids: Vec<FeatureId>,
     meshes: Vec<(Shape, crate::tess::BodyMesh, bool)>,
+    /// the deep copies the job started from: kept alive until installed, since
+    /// `originals` is keyed by their addresses (a freed copy's address could be
+    /// reused by a new shape, which would then be swapped for an old original)
+    copies: Vec<Shape>,
 }
 
 struct Job {
@@ -302,15 +306,16 @@ impl Model {
             b.shape = copy;
         }
         let copies: HashSet<u64> = originals.keys().copied().collect();
+        let keep: Vec<Shape> = base.bodies.values().filter(|b| !b.shape.is_null()).map(|b| b.shape.clone()).collect();
         let doc = doc.clone();
         let (tx, rx) = std::sync::mpsc::channel();
-        let input = SendBox((base, params.clone()));
+        let input = SendBox((base, params.clone(), keep));
         std::thread::Builder::new()
             .name("recompute".into())
             .spawn(move || {
                 let input = input;
-                let SendBox((base, params)) = input;
-                let mut out = JobOut { states: vec![], status: vec![], fingerprints: vec![], ids: vec![], meshes: vec![] };
+                let SendBox((base, params, keep)) = input;
+                let mut out = JobOut { states: vec![], status: vec![], fingerprints: vec![], ids: vec![], meshes: vec![], copies: keep };
                 let mut prev = base;
                 for f in &doc.features[start..end] {
                     let (st, status) = eval_feature(&doc, &params, f, &prev);

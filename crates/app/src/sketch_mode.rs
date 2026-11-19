@@ -90,9 +90,9 @@ impl SkTool {
     pub fn hint(self) -> &'static str {
         match self {
             SkTool::Select => "Click to select, drag to move. Double-click a dimension to edit it.",
-            SkTool::Line => "Click points to draw lines. Esc / right-click / Enter ends the chain.",
-            SkTool::Rect => "Click two opposite corners.",
-            SkTool::CenterRect => "Click the centre, then a corner.",
+            SkTool::Line => "Click points to draw lines. Esc / right-click / Enter ends the chain · D: dimension the last line · Ctrl: no snapping",
+            SkTool::Rect => "Click two opposite corners · R: draw from the centre instead · Ctrl: no snapping",
+            SkTool::CenterRect => "Click the centre, then a corner · R: draw from a corner instead · Ctrl: no snapping",
             SkTool::Circle => "Click the centre, then a point on the circle.",
             SkTool::Arc => "Click start, end, then a point the arc passes through.",
             SkTool::Spline => "Click points the curve passes through. Click the first point to close; double-click, Enter or right-click to finish.",
@@ -166,6 +166,16 @@ pub struct SketchSession {
     proj_hover: Option<crate::app::Pick>,
     /// text being edited: (id, text, height, newly created, original text, original height)
     text_edit: Option<(u32, String, String, bool, String, String)>,
+    /// world units per pixel at the view centre (stable scale for the grid)
+    grid_px: f64,
+    /// alignment guides shown while snapping: (aligned-to point, cursor)
+    guides: Vec<(DVec2, DVec2)>,
+    /// the cursor sits on a grid point
+    on_grid: bool,
+    /// grid snapping enabled (mirrors the persisted setting, for drawing)
+    grid_on: bool,
+    /// curve made by the last drawing click (D dimensions it)
+    last_curve: Option<CId>,
 }
 
 // ------------------------------------------------------------------ enter / leave
@@ -208,6 +218,11 @@ pub fn enter_with_before(app: &mut App, fid: FeatureId, before: Document, create
         hover: None,
         cursor: None,
         snap: None,
+        grid_px: 0.0,
+        guides: vec![],
+        on_grid: false,
+        grid_on: true,
+        last_curve: None,
         hv_hint: None,
         drag: None,
         report: SolveReport::default(),
@@ -717,6 +732,114 @@ fn compute_snap(sk: &Sketch, p: DVec2, px: f64, exclude: &[PId]) -> (DVec2, Opti
     (p, None)
 }
 
+/// Sketch grid spacing for a scale (world units per pixel): a 1-2-5 step at
+/// least ~20 px apart, and how many steps make a major line.
+pub fn grid_step(px: f64) -> (f64, i64) {
+    let target = (px * 20.0).max(1e-9);
+    let e = 10f64.powf(target.log10().floor());
+    let m = target / e;
+    let (mant, major) = if m <= 1.0 + 1e-9 {
+        (1.0, 10)
+    } else if m <= 2.0 {
+        (2.0, 5)
+    } else if m <= 5.0 {
+        (5.0, 10)
+    } else {
+        (10.0, 10)
+    };
+    (mant * e, major)
+}
+
+/// Grid snapping on/off (remembered across runs).
+pub fn grid_snap_on(ctx: &egui::Context) -> bool {
+    ctx.data_mut(|d| *d.get_persisted_mut_or(egui::Id::new("sketch_grid_snap"), true))
+}
+
+pub fn set_grid_snap(ctx: &egui::Context, on: bool) {
+    ctx.data_mut(|d| d.insert_persisted(egui::Id::new("sketch_grid_snap"), on));
+}
+
+struct Inferred {
+    p: DVec2,
+    guides: Vec<(DVec2, DVec2)>,
+    /// horizontal (true) / vertical (false) relative to `anchor`
+    hv: Option<bool>,
+    on_grid: bool,
+}
+
+/// Inference for a free cursor position: horizontal/vertical from `anchor`
+/// (the previous click), alignment with other points (dashed guides), then the
+/// grid for whatever coordinate is still free.
+fn infer(p: DVec2, px: f64, anchor: Option<DVec2>, cands: &[DVec2], grid: Option<f64>) -> Inferred {
+    let tol = px * 7.0;
+    let mut q = p;
+    let (mut fx, mut fy) = (false, false);
+    let mut hv = None;
+    let mut guides = vec![];
+    if let Some(a) = anchor {
+        let d = p - a;
+        if d.length() > px * 4.0 {
+            if d.y.abs() < tol {
+                q.y = a.y;
+                fy = true;
+                hv = Some(true);
+            } else if d.x.abs() < tol {
+                q.x = a.x;
+                fx = true;
+                hv = Some(false);
+            }
+        }
+    }
+    // closest alignment per axis (ties: the nearer point)
+    let pick = |coord: fn(DVec2) -> f64| -> Option<DVec2> {
+        cands
+            .iter()
+            .filter(|c| (coord(**c) - coord(p)).abs() < tol && (**c - p).length() > px * 3.0)
+            .min_by(|a, b| {
+                let da = (coord(**a) - coord(p)).abs() + (**a - p).length() * 1e-3;
+                let db = (coord(**b) - coord(p)).abs() + (**b - p).length() * 1e-3;
+                da.total_cmp(&db)
+            })
+            .copied()
+    };
+    let gx = if fx { None } else { pick(|v| v.x) };
+    let gy = if fy { None } else { pick(|v| v.y) };
+    if let Some(c) = gx {
+        q.x = c.x;
+        fx = true;
+    }
+    if let Some(c) = gy {
+        q.y = c.y;
+        fy = true;
+    }
+    let mut on_grid = false;
+    if let Some(g) = grid.filter(|g| *g > 0.0) {
+        if !fx {
+            q.x = (q.x / g).round() * g;
+        }
+        if !fy {
+            q.y = (q.y / g).round() * g;
+        }
+        on_grid = !fx || !fy;
+    }
+    for c in [gx, gy].into_iter().flatten() {
+        guides.push((c, q));
+    }
+    if let (Some(a), Some(_)) = (anchor, hv) {
+        guides.push((a, q));
+    }
+    Inferred { p: q, guides, hv, on_grid }
+}
+
+/// Points worth aligning to: sketch points, the origin, model points near the cursor.
+fn align_candidates(sk: &Sketch, refs: &[DVec2], chain: &[(DVec2, Option<PId>)], p: DVec2, px: f64, exclude: &[PId]) -> Vec<DVec2> {
+    let mut v: Vec<DVec2> = sk.points.iter().filter(|q| !exclude.contains(&q.id)).map(|q| q.pos()).collect();
+    v.push(DVec2::ZERO);
+    v.extend(chain.iter().map(|c| c.0));
+    v.extend(refs.iter().filter(|r| (**r - p).length() < px * 250.0).copied());
+    v
+}
+
 fn dim_anchor(sk: &Sketch, kind: &DimKind) -> (DVec2, DVec2) {
     // (anchor point, default offset direction)
     match *kind {
@@ -864,10 +987,23 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
         },
         None => (None, 0.1),
     };
+    // scale at the view centre: the grid must not change with the cursor
+    let grid_px = {
+        let r = app.cam.ray(view.size * 0.5, view.size);
+        match r.plane(frame.origin.as_vec3(), frame.n.as_vec3()) {
+            Some(t) if t > 0.0 && !app.cam.cam.ortho => (2.0 * t * (app.cam.cam.fov_y * 0.5).tan() / view.size.y.max(1.0)) as f64,
+            _ if app.cam.cam.ortho => app.cam.cam.px_size(view.size.y) as f64,
+            _ => px,
+        }
+    };
+    let free = ui.input(|i| i.modifiers.ctrl);
+    let grid = (grid_snap_on(ui.ctx()) && !free).then(|| grid_step(grid_px).0);
     let Some(sk) = sketch(app, fid).cloned() else { return };
     let refs = model_refs(app, fid, &frame);
     let s = session(app).unwrap();
     s.px = px;
+    s.grid_px = grid_px;
+    s.grid_on = grid_snap_on(ui.ctx());
     let tool = s.tool;
     let navigating = resp.dragged_by(PointerButton::Middle) || resp.dragged_by(PointerButton::Secondary);
 
@@ -875,7 +1011,7 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
     let (cursor, snap) = match p2 {
         Some(p) if !navigating => {
             let exclude: Vec<PId> = s.drag.as_ref().map(|d| d.points.iter().map(|x| x.0).collect()).unwrap_or_default();
-            if matches!(tool, SkTool::Select | SkTool::Dimension | SkTool::Trim | SkTool::Fillet | SkTool::Offset | SkTool::Project | SkTool::Con(_)) {
+            if matches!(tool, SkTool::Select | SkTool::Dimension | SkTool::Trim | SkTool::Fillet | SkTool::Offset | SkTool::Project | SkTool::Con(_)) || free {
                 (p, None)
             } else {
                 let (q, sn) = compute_snap(&sk, p, px, &exclude);
@@ -893,21 +1029,34 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
         }
         _ => (p2.unwrap_or_default(), None),
     };
-    // H/V inference relative to the last chain point
+    // inference: H/V from the previous click, alignment guides, grid (Ctrl = none)
     let mut cursor = cursor;
     s.hv_hint = None;
-    if snap.is_none() && matches!(tool, SkTool::Line) {
-        if let Some((last, _)) = s.chain.last() {
-            let d = cursor - *last;
-            if d.length() > px * 4.0 {
-                if d.y.abs() < px * 6.0 {
-                    cursor.y = last.y;
-                    s.hv_hint = Some(true);
-                } else if d.x.abs() < px * 6.0 {
-                    cursor.x = last.x;
-                    s.hv_hint = Some(false);
-                }
+    s.guides.clear();
+    s.on_grid = false;
+    let draws = matches!(tool, SkTool::Line | SkTool::Rect | SkTool::CenterRect | SkTool::Circle | SkTool::Arc | SkTool::Spline | SkTool::Point | SkTool::Text);
+    if snap.is_none() && draws && !free && p2.is_some() && !navigating {
+        if tool == SkTool::Circle && s.chain.len() == 1 {
+            // radius in grid steps
+            let c = s.chain[0].0;
+            let d = cursor - c;
+            if let (Some(g), true) = (grid, d.length() > 1e-12) {
+                let r = ((d.length() / g).round() * g).max(g);
+                cursor = c + d.normalize() * r;
+                s.on_grid = true;
             }
+        } else {
+            let anchor = match tool {
+                SkTool::Line | SkTool::Spline | SkTool::Arc => s.chain.last().map(|c| c.0),
+                _ => None,
+            };
+            let cands = align_candidates(&sk, &refs, &s.chain, cursor, px, &[]);
+            let inf = infer(cursor, px, anchor, &cands, grid);
+            cursor = inf.p;
+            // only lines get an H/V constraint; elsewhere it is just alignment
+            s.hv_hint = if tool == SkTool::Line { inf.hv } else { None };
+            s.guides = inf.guides;
+            s.on_grid = inf.on_grid;
         }
     }
     s.cursor = p2.map(|_| cursor);
@@ -991,7 +1140,33 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
             if let (Some(p), Some(drag)) = (p2, session(app).and_then(|s| s.drag.take())) {
                 let mut drag = drag;
                 drag.moved = true;
-                let delta = p - drag.start;
+                let mut delta = p - drag.start;
+                if let Some(s) = session(app) {
+                    s.guides.clear();
+                    s.on_grid = false;
+                }
+                if !free && drag.label.is_none() && drag.radius.is_none() {
+                    // snap the grabbed point (the rest moves along)
+                    if let Some(&(pid0, orig0)) = drag.points.first() {
+                        let ex: Vec<PId> = drag.points.iter().map(|x| x.0).collect();
+                        let target = orig0 + delta;
+                        let snapped = nearest_point(&sk, target, px * 10.0, &ex).map(|q| sk.pos(q));
+                        let _ = pid0;
+                        let q = match snapped {
+                            Some(q) => q,
+                            None => {
+                                let cands = align_candidates(&sk, &refs, &[], target, px, &ex);
+                                let inf = infer(target, px, None, &cands, grid);
+                                if let Some(s) = session(app) {
+                                    s.guides = inf.guides;
+                                    s.on_grid = inf.on_grid;
+                                }
+                                inf.p
+                            }
+                        };
+                        delta = q - orig0;
+                    }
+                }
                 if let Some(sk) = sketch_mut(app, fid) {
                     if let Some((kid, off)) = drag.label {
                         if let Some(k) = sk.constraints.iter_mut().find(|k| k.id == kid) {
@@ -1005,7 +1180,10 @@ pub fn input(app: &mut App, ui: &egui::Ui, resp: &egui::Response, view: &View, r
                             _ => None,
                         });
                         if let Some(cc) = center {
-                            let r = (p - sk.pos(cc)).length();
+                            let mut r = (p - sk.pos(cc)).length();
+                            if let (Some(g), false) = (grid, free) {
+                                r = ((r / g).round() * g).max(g);
+                            }
                             if let Some(x) = sk.curves.iter_mut().find(|x| x.id == cid) {
                                 if let CurveGeom::Circle { r: rr, .. } = &mut x.geom {
                                     *rr = r.max(1e-6);
@@ -1208,13 +1386,11 @@ fn keyboard(app: &mut App, ui: &egui::Ui) {
     let pressed = |k: Key| ui.input(|i| i.key_pressed(k) && i.modifiers.is_none());
     let tool_keys = [
         (Key::L, SkTool::Line),
-        (Key::R, SkTool::Rect),
         (Key::C, SkTool::Circle),
         (Key::A, SkTool::Arc),
         (Key::B, SkTool::Spline),
         (Key::P, SkTool::Project),
         (Key::O, SkTool::Offset),
-        (Key::D, SkTool::Dimension),
         (Key::T, SkTool::Trim),
         (Key::G, SkTool::Fillet),
     ];
@@ -1222,6 +1398,19 @@ fn keyboard(app: &mut App, ui: &egui::Ui) {
         if pressed(k) {
             set_tool(app, t);
         }
+    }
+    if pressed(Key::R) {
+        // R again flips between corner and centre rectangles (also mid-draw)
+        let s = session(app).unwrap();
+        match s.tool {
+            SkTool::Rect => s.tool = SkTool::CenterRect,
+            SkTool::CenterRect => s.tool = SkTool::Rect,
+            _ => set_tool(app, SkTool::Rect),
+        }
+    }
+    if pressed(Key::D) {
+        quick_dim(app);
+        return;
     }
     if pressed(Key::Escape) && finish_spline(app) {
         return;
@@ -1369,6 +1558,7 @@ fn draw_click(app: &mut App, fid: FeatureId, p: DVec2, snap: Option<Snap>) {
     let chain = s.chain.clone();
     let px = s.px;
     let before = app.doc.clone();
+    let last_before = sketch(app, fid).and_then(|k| k.curves.last().map(|c| c.id));
     let mut done = false;
     let mut cons: Vec<Constraint> = Vec::new();
     let Some(sk) = sketch_mut(app, fid) else { return };
@@ -1514,8 +1704,12 @@ fn draw_click(app: &mut App, fid: FeatureId, p: DVec2, snap: Option<Snap>) {
     }
     solve(app, &[], true);
     commit(app, before);
-    if done {
-        if let Some(s) = session(app) {
+    let last_after = sketch(app, fid).and_then(|k| k.curves.last().map(|c| c.id));
+    if let Some(s) = session(app) {
+        if last_after != last_before {
+            s.last_curve = last_after;
+        }
+        if done {
             s.chain.clear();
         }
     }
@@ -1890,6 +2084,86 @@ fn dim_click(app: &mut App, fid: FeatureId, hover: Option<SkEnt>, p: DVec2) {
     s.picks = picks;
     let Some((kind, at)) = result else { return };
     s.picks.clear();
+    add_dim(app, fid, kind, at);
+}
+
+/// The dimension D adds for a selection (no placement click needed).
+fn dim_kind_for(sk: &Sketch, ents: &[SkEnt]) -> Option<DimKind> {
+    Some(match ents {
+        [SkEnt::Curve(c)] => match curve_kind(sk, *c)? {
+            CurveGeom::Circle { .. } => DimKind::Diameter(*c),
+            CurveGeom::Arc { .. } => DimKind::Radius(*c),
+            CurveGeom::Line { .. } => DimKind::Length(*c),
+        },
+        [SkEnt::Point(a), SkEnt::Point(b)] => {
+            let d = sk.pos(*b) - sk.pos(*a);
+            if d.y.abs() < 1e-9 {
+                DimKind::HDistance(*a, *b)
+            } else if d.x.abs() < 1e-9 {
+                DimKind::VDistance(*a, *b)
+            } else {
+                DimKind::Distance(*a, *b)
+            }
+        }
+        [SkEnt::Point(p), SkEnt::Curve(c)] | [SkEnt::Curve(c), SkEnt::Point(p)] => {
+            sk.line_pts(*c)?;
+            DimKind::PointLine(*p, *c)
+        }
+        [SkEnt::Curve(a), SkEnt::Curve(b)] => {
+            let ((a0, a1), (b0, b1)) = (sk.line_pts(*a)?, sk.line_pts(*b)?);
+            let par = (a1 - a0).normalize_or_zero().perp_dot((b1 - b0).normalize_or_zero()).abs() < 1e-6;
+            if par {
+                match curve_kind(sk, *b)? {
+                    CurveGeom::Line { a: pb, .. } => DimKind::PointLine(pb, *a),
+                    _ => return None,
+                }
+            } else {
+                DimKind::Angle(*a, *b)
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// D: dimension the selection (or what is under the cursor, or the curve just
+/// drawn) right away and open its value box; otherwise pick the Dimension tool.
+fn quick_dim(app: &mut App) {
+    let Some(s) = session(app) else { return };
+    let fid = s.fid;
+    let mut ents = s.selection.clone();
+    if ents.is_empty() {
+        ents.extend(s.hover);
+    }
+    let drawing = matches!(s.tool, SkTool::Line | SkTool::Rect | SkTool::CenterRect | SkTool::Circle | SkTool::Arc);
+    if ents.is_empty() && drawing {
+        ents.extend(s.last_curve.map(SkEnt::Curve));
+    }
+    if let [SkEnt::Con(kid)] = ents[..] {
+        start_dim_edit(app, kid);
+        return;
+    }
+    let Some(sk) = sketch(app, fid).cloned() else { return };
+    // the curve just drawn may have been deleted / trimmed since
+    ents.retain(|e| match e {
+        SkEnt::Curve(c) => sk.curve(*c).is_some(),
+        SkEnt::Point(p) => sk.point(*p).is_some(),
+        _ => false,
+    });
+    if let Some(kind) = dim_kind_for(&sk, &ents) {
+        if let Some(s) = session(app) {
+            s.selection.clear();
+            s.picks.clear();
+        }
+        add_dim(app, fid, kind, None);
+        return;
+    }
+    set_tool(app, SkTool::Dimension);
+}
+
+/// Add a driving dimension at its current value and open the value box.
+fn add_dim(app: &mut App, fid: FeatureId, kind: DimKind, at: Option<DVec2>) {
+    let Some(sk) = sketch(app, fid).cloned() else { return };
+    let Some(s) = session(app) else { return };
     let px = s.px;
     let value = sk.measure(&kind);
     let (anchor, _) = dim_anchor(&sk, &kind);
@@ -1969,31 +2243,37 @@ fn sk_color(s: &SketchSession, ent: SkEnt, fixed: bool, construction: bool, fail
 }
 
 pub fn draw(app: &mut App, scene: &mut Scene, view: &View) {
-    let _ = view;
     let Mode::Sketch(s) = &app.mode else { return };
     let fid = s.fid;
     let Some(sk) = sketch(app, fid) else { return };
     let Some(ss) = app.display_state().sketches.get(&fid).cloned() else { return };
     let f = ss.frame;
     let tol = s.px * 0.5;
-    // grid on the sketch plane
+    // grid on the sketch plane (the same steps the cursor snaps to)
     let d = app.cam.cam.distance.max(1e-3);
-    let step = 10f64.powf((d as f64 / 6.0).log10().floor());
-    let n = 30;
+    let gpx = if s.grid_px > 0.0 { s.grid_px } else { d as f64 / 900.0 };
+    let (step, major_every) = grid_step(gpx);
+    let n = ((view.size.length() as f64 * 0.5 * gpx / step).ceil() as i32 + 2).clamp(10, 90);
     let t = f.to2(app.cam.cam.target.as_dvec3());
-    let (cx, cy) = ((t.x / (step * 10.0)).round() * step * 10.0, (t.y / (step * 10.0)).round() * step * 10.0);
+    let (cx, cy) = ((t.x / step).round() * step, (t.y / step).round() * step);
+    let alpha = if s.grid_on { 1.0 } else { 0.6 };
     for i in -n..=n {
-        let major = ((cx / step).round() as i64 + i as i64) % 10 == 0;
-        let a = if major { 0.16 } else { 0.06 };
         let fade = 1.0 - (i as f32 / n as f32).powi(2);
-        let col = [0.65, 0.72, 0.82, a * fade];
+        let ix = (cx / step).round() as i64 + i as i64;
+        let a = if ix.rem_euclid(major_every) == 0 { 0.16 } else { 0.065 };
+        let col = [0.65, 0.72, 0.82, a * fade * alpha];
         let x = cx + i as f64 * step;
         push_line(&mut scene.lines, f.to3(DVec2::new(x, cy - n as f64 * step)).as_vec3(), f.to3(DVec2::new(x, cy + n as f64 * step)).as_vec3(), col, 1.0);
-        let majory = ((cy / step).round() as i64 + i as i64) % 10 == 0;
-        let a = if majory { 0.16 } else { 0.06 };
-        let col = [0.65, 0.72, 0.82, a * fade];
+        let iy = (cy / step).round() as i64 + i as i64;
+        let a = if iy.rem_euclid(major_every) == 0 { 0.16 } else { 0.065 };
+        let col = [0.65, 0.72, 0.82, a * fade * alpha];
         let y = cy + i as f64 * step;
         push_line(&mut scene.lines, f.to3(DVec2::new(cx - n as f64 * step, y)).as_vec3(), f.to3(DVec2::new(cx + n as f64 * step, y)).as_vec3(), col, 1.0);
+    }
+    // alignment guides
+    for (from, to) in &s.guides {
+        let pts = [f.to3(*from).as_vec3(), f.to3(*to).as_vec3()];
+        push_dashed(&mut scene.overlay_lines, &pts, [1.0, 0.72, 0.3, 0.85], 1.2, (s.px * 5.0) as f32);
     }
     // sketch axes
     let ax = (d * 0.3) as f64;
@@ -2150,7 +2430,14 @@ pub fn draw(app: &mut App, scene: &mut Scene, view: &View) {
             };
             scene.points.push(PointInst { p: to3(cur).to_array(), color: col, size: 11.0 });
         } else if matches!(s.tool, SkTool::Line | SkTool::Rect | SkTool::CenterRect | SkTool::Circle | SkTool::Arc | SkTool::Spline | SkTool::Point) {
-            scene.points.push(PointInst { p: to3(cur).to_array(), color: [0.9, 0.95, 1.0, 0.9], size: 6.0 });
+            let (col, size) = if !s.guides.is_empty() {
+                ([1.0, 0.72, 0.3, 1.0], 8.0)
+            } else if s.on_grid {
+                ([0.55, 0.8, 1.0, 1.0], 7.0)
+            } else {
+                ([0.9, 0.95, 1.0, 0.9], 6.0)
+            };
+            scene.points.push(PointInst { p: to3(cur).to_array(), color: col, size });
         }
     }
 }
@@ -2986,14 +3273,14 @@ pub fn toolbar(app: &mut App, ui: &mut egui::Ui) {
     };
     tool_btn(ui, SkTool::Select, ic::CURSOR, "Select / drag (Esc)");
     tool_btn(ui, SkTool::Line, ic::LINE_SEGMENT, "Line (L)");
-    tool_btn(ui, SkTool::Rect, ic::RECTANGLE, "Rectangle (R)");
-    tool_btn(ui, SkTool::CenterRect, ic::SQUARE_HALF, "Center rectangle");
+    tool_btn(ui, SkTool::Rect, ic::RECTANGLE, "Rectangle from a corner (R; R again: from the centre)");
+    tool_btn(ui, SkTool::CenterRect, ic::SQUARE_HALF, "Rectangle from the centre (R twice)");
     tool_btn(ui, SkTool::Circle, ic::CIRCLE, "Circle (C)");
     tool_btn(ui, SkTool::Arc, ic::CIRCLE_HALF, "3-point arc (A)");
     tool_btn(ui, SkTool::Spline, ic::WAVE_SINE, "Spline: smooth curve through points (B)");
     tool_btn(ui, SkTool::Point, ic::DOT_OUTLINE, "Point (P)");
     ui.separator();
-    tool_btn(ui, SkTool::Dimension, ic::RULER, "Dimension (D)");
+    tool_btn(ui, SkTool::Dimension, ic::RULER, "Dimension (D). With something selected, D dimensions it right away");
     tool_btn(ui, SkTool::Trim, ic::SCISSORS, "Trim (T)");
     tool_btn(ui, SkTool::Fillet, ic::BEZIER_CURVE, "Sketch fillet: round a corner (G)");
     tool_btn(ui, SkTool::Text, ic::TEXT_T, "Text — for embossed / engraved labels");
@@ -3012,6 +3299,15 @@ pub fn toolbar(app: &mut App, ui: &mut egui::Ui) {
     }
     if ui.add(egui::Button::new(RichText::new(ic::SELECTION_FOREGROUND).size(18.0)).min_size(egui::vec2(32.0, 30.0))).on_hover_text("Project the outline of the face this sketch is on").clicked() {
         project_face_edges(app);
+    }
+    ui.separator();
+    let on = grid_snap_on(ui.ctx());
+    if ui
+        .add(egui::Button::selectable(on, RichText::new(ic::GRID_FOUR).size(18.0)).min_size(egui::vec2(32.0, 30.0)))
+        .on_hover_text("Snap to the grid. Points, midpoints and horizontal/vertical alignment always snap; hold Ctrl to place freely")
+        .clicked()
+    {
+        set_grid_snap(ui.ctx(), !on);
     }
 }
 

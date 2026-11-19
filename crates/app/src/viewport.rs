@@ -548,14 +548,19 @@ fn build_scene(app: &mut App, view: &View) -> Scene {
         } else if hov_body {
             color = tint(color, theme::HOVER, 0.25);
         }
+        // sketching: ghost bodies, but only their nearest surface (inner walls and
+        // far faces seen through it look like a mismatched, smaller copy)
+        let mut front_only = false;
         if in_sketch {
             color[3] = 0.55;
+            front_only = true;
         }
         if app.xray || props.ghost == Some(true) {
             color[3] = color[3].min(0.28);
+            front_only = false;
         }
         let edge_color = if app.light_bg { [0.1, 0.1, 0.12, 1.0] } else { theme::BODY_EDGE };
-        scene.bodies.push(BodyDraw { mesh: vb.mesh.clone(), color, edge_color, show_edges: app.show_edges, face_hl: vec![], edge_hl: vec![] });
+        scene.bodies.push(BodyDraw { mesh: vb.mesh.clone(), color, edge_color, show_edges: app.show_edges, face_hl: vec![], edge_hl: vec![], front_only });
     }
     // soft contact shadow on the ground plane
     if let Some((lo, hi)) = bounds {
@@ -641,7 +646,7 @@ fn build_scene(app: &mut App, view: &View) -> Scene {
                     Operation::Intersect => ([0.35, 0.85, 0.45, 0.30], [0.45, 0.95, 0.55, 0.9]),
                     _ => ([0.30, 0.62, 1.0, 0.28], [0.45, 0.75, 1.0, 0.9]),
                 };
-                scene.bodies.push(BodyDraw { mesh: m, color: fill, edge_color: edge, show_edges: true, face_hl: vec![], edge_hl: vec![] });
+                scene.bodies.push(BodyDraw { mesh: m, color: fill, edge_color: edge, show_edges: true, face_hl: vec![], edge_hl: vec![], front_only: false });
             }
         }
         if let Some(c) = &app.cmd {

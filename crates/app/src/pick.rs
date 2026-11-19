@@ -141,7 +141,8 @@ pub fn ray_tri(o: Vec3, d: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
 /// BVH cache keyed by mesh identity.
 #[derive(Default)]
 pub struct PickCache {
-    bvh: HashMap<usize, (Arc<Bvh>, u64)>,
+    /// keyed by mesh address; the entry keeps the mesh alive so the address is not reused
+    bvh: HashMap<usize, (Arc<Bvh>, u64, Arc<BodyMesh>)>,
     frame: u64,
 }
 
@@ -149,19 +150,19 @@ impl PickCache {
     pub fn bvh(&mut self, m: &Arc<BodyMesh>) -> Arc<Bvh> {
         let key = Arc::as_ptr(m) as usize;
         let f = self.frame;
-        if let Some((b, last)) = self.bvh.get_mut(&key) {
+        if let Some((b, last, _)) = self.bvh.get_mut(&key) {
             *last = f;
             return b.clone();
         }
         let b = Arc::new(Bvh::build(m));
-        self.bvh.insert(key, (b.clone(), f));
+        self.bvh.insert(key, (b.clone(), f, m.clone()));
         b
     }
     pub fn tick(&mut self) {
         self.frame += 1;
         let f = self.frame;
         if self.bvh.len() > 64 {
-            self.bvh.retain(|_, (_, l)| f - *l < 600);
+            self.bvh.retain(|_, (_, l, _)| f - *l < 600);
         }
     }
 }

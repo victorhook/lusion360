@@ -389,28 +389,55 @@ pub fn timeline(app: &mut App, ui: &mut egui::Ui) {
             let n = app.doc.features.len();
             let editing = app.cmd.is_some() || matches!(app.mode, Mode::Sketch(_));
             let mut set_marker: Option<usize> = None;
+            // per-component view: the active component's features (and its
+            // sub-components'); the top-level design shows everything
+            let scope = app.active_comp;
+            let filtered = scope != ROOT && app.doc.component(scope).is_some();
+            let shown: Vec<usize> = (0..n).filter(|&i| !filtered || app.doc.is_ancestor(scope, app.doc.features[i].component)).collect();
+            let marker = app.doc.marker;
+            let prev = shown.iter().rev().find(|&&i| i < marker).copied();
+            let next = shown.iter().find(|&&i| i >= marker).copied();
             if ui.add_enabled(!editing, egui::Button::new(ic::SKIP_BACK).frame(false)).on_hover_text("Roll back to start").clicked() {
                 set_marker = Some(0);
             }
-            if ui.add_enabled(!editing && app.doc.marker > 0, egui::Button::new(ic::CARET_LEFT).frame(false)).on_hover_text("Step back").clicked() {
-                set_marker = Some(app.doc.marker - 1);
+            if ui.add_enabled(!editing && prev.is_some(), egui::Button::new(ic::CARET_LEFT).frame(false)).on_hover_text("Step back").clicked() {
+                set_marker = prev;
             }
-            if ui.add_enabled(!editing && app.doc.marker < n, egui::Button::new(ic::CARET_RIGHT).frame(false)).on_hover_text("Step forward").clicked() {
-                set_marker = Some(app.doc.marker + 1);
+            if ui.add_enabled(!editing && next.is_some(), egui::Button::new(ic::CARET_RIGHT).frame(false)).on_hover_text("Step forward").clicked() {
+                set_marker = next.map(|i| i + 1);
             }
             if ui.add_enabled(!editing, egui::Button::new(ic::SKIP_FORWARD).frame(false)).on_hover_text("Roll to end").clicked() {
                 set_marker = Some(n);
             }
             ui.separator();
+            if filtered {
+                let name = app.doc.component(scope).map(|c| c.name.clone()).unwrap_or_default();
+                let hidden = n - shown.len();
+                let chip = egui::Button::new(RichText::new(format!("{} {name}  {}", ic::PUZZLE_PIECE, ic::X)).size(12.5).color(theme::ACCENT))
+                    .fill(theme::ACCENT.gamma_multiply(0.12))
+                    .min_size(egui::vec2(0.0, 26.0));
+                if ui
+                    .add(chip)
+                    .on_hover_text(format!("Timeline of {name} only ({hidden} other feature{} hidden).\nClick to show the whole design.", if hidden == 1 { "" } else { "s" }))
+                    .clicked()
+                {
+                    app.active_comp = ROOT;
+                }
+            }
             egui::ScrollArea::horizontal().id_salt("tl_scroll").show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let marker = app.doc.marker;
                     let mut action: Option<(FeatureId, &str)> = None;
-                    let mut rects: Vec<egui::Rect> = Vec::new();
+                    // (feature index, button rect) of the shown features
+                    let mut rects: Vec<(usize, egui::Rect)> = Vec::new();
                     let mut marker_resp: Option<egui::Response> = None;
+                    let mut marker_drawn = false;
                     for (i, f) in app.doc.features.clone().iter().enumerate() {
-                        if i == marker {
+                        if !shown.contains(&i) {
+                            continue;
+                        }
+                        if !marker_drawn && i >= marker {
                             marker_resp = Some(marker_bar(ui, editing));
+                            marker_drawn = true;
                         }
                         let status = app.model.feature_status(i).cloned();
                         let rolled = i >= marker;
@@ -433,7 +460,7 @@ pub fn timeline(app: &mut App, ui: &mut egui::Ui) {
                             b = b.stroke(egui::Stroke::new(1.5, theme::ACCENT));
                         }
                         let r = ui.add(b);
-                        rects.push(r.rect);
+                        rects.push((i, r.rect));
                         let mut tip = format!("{} ({})", f.name, f.kind.type_name());
                         if let Some(s) = &status {
                             if let Some(e) = &s.error {
@@ -492,14 +519,18 @@ pub fn timeline(app: &mut App, ui: &mut egui::Ui) {
                             }
                         });
                     }
-                    if marker >= app.doc.features.len() {
+                    if !marker_drawn {
                         marker_resp = Some(marker_bar(ui, editing));
+                    }
+                    if filtered && shown.is_empty() {
+                        ui.label(RichText::new("No features in this component yet. New features go here while it is active.").small().color(theme::TEXT_DIM));
                     }
                     // drag the marker to roll the timeline back/forward
                     if let Some(mr) = marker_resp {
                         if mr.dragged() {
                             if let Some(p) = ui.ctx().pointer_interact_pos() {
-                                let idx = rects.iter().filter(|r| r.center().x < p.x).count();
+                                // just after the last shown feature left of the pointer
+                                let idx = rects.iter().filter(|(_, r)| r.center().x < p.x).map(|(i, _)| i + 1).max().or(rects.first().map(|(i, _)| *i)).unwrap_or(0);
                                 if idx != app.doc.marker {
                                     set_marker = Some(idx);
                                 }
